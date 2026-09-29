@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- #182：补 CSP meta，消除 Electron "Insecure Content-Security-Policy" 警告
+         - script-src 'self'：仅允许同源脚本（Vite 打包后内联脚本注入被禁，但生产无内联）
+         - 'unsafe-inline'：保留给 Tailwind/Vite 注入的 inline <style>（去除会破坏样式）
+         - 'unsafe-eval'：不启用（消除警告根因）
+         - connect-src 'self' + http://127.0.0.1:8765：API 调用本地后端
+         - style-src 'self' 'unsafe-inline'：同上，inline style 由 Tailwind 注入
+         - #184：img-src 加抖音/字节图床域名通配（cover_url / avatar 来自抖音 API，
+         域名通配是 p3/p11/p26-sign.douyinpic.com、aweme.douyinpic.com 等；通配 *.douyinpic.com 一并覆盖）
+         - *.byteimg.com：字节跳动 image CDN 备用
+         - http://127.0.0.1:8765：fileUrl() 走 /api/files/<path> 取素材/头像/封面，
+         renderer origin 是 file://，需显式列后端域
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http://127.0.0.1:8765 https://*.douyinpic.com https://*.byteimg.com; media-src 'self' data: http://127.0.0.1:8765 blob:; connect-src 'self' http://127.0.0.1:8765; font-src 'self' data:;"
+    />
+    <title>短视频工具</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/renderer/src/main.tsx"></script>
+  </body>
+</html>

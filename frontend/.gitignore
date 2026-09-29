@@ -1,0 +1,14 @@
+node_modules/
+dist/
+release/
+*.log
+# ============ 调试残留 ============
+/publish_progress.png
+/task_queue_progress.png
+/electron-run.log
+/sh.exe.stackdump
+/test_382_logic.js
+# TS 增量编译缓存
+tsconfig.node.tsbuildinfo
+tsconfig.tsbuildinfo
+tsconfig.renderer.tsbuildinfo

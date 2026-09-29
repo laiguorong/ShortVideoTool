@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 主题变量：浅色底 + 品牌蓝 + 状态色（UI-5：绿正常/蓝进行/黄预警/红失败） */
+:root {
+  --color-background: 246 247 249;
+  --color-background-elev: 255 255 255;
+  --color-foreground: 24 26 32;
+  --color-muted: 240 241 244;
+  --color-muted-foreground: 120 126 138;
+  --color-border: 226 229 235;
+  --color-accent: 37 99 235;
+  --color-accent-hover: 29 78 216;
+  --color-ok: 22 163 74;
+  --color-warn: 217 119 6;
+  --color-danger: 220 38 38;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif;
+  @apply bg-background text-foreground antialiased;
+}
+
+/* 表格表头固定（#79）：滚动容器内的表头不随内容滚动而滚出视野。
+   只作用于「滚动容器的直接子表格」，页面级滚动（如 <main> 内嵌套布局）不受影响；
+   表头补上不透明底色，避免下方行内容透过表头显示。 */
+.overflow-auto > table > thead th,
+.overflow-y-auto > table > thead th {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background-color: rgb(var(--color-background-elev));
+  box-shadow: inset 0 -1px 0 rgb(var(--color-border));
+}
+
+/* 滚动条细化 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded bg-border;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 帮助图标：选项右侧 ⓘ 问号（#112）
+   圆形灰底 + hover 蓝，鼠标变 help，键盘可聚焦 */
+.help-icon {
+  @apply ml-1 inline-flex h-4 w-4 cursor-help select-none items-center justify-center rounded-full bg-gray-100 text-[10px] leading-none text-gray-500 transition-colors;
+}
+.help-icon:hover,
+.help-icon:focus-visible {
+  @apply bg-blue-100 text-blue-600 outline-none;
+}

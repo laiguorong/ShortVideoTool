@@ -1,0 +1,45 @@
+# ShortVideoTool 后端依赖（Python 3.12.10）
+# 2026-09-14 P0 安全升级：fastapi/uvicorn/starlette/httpx/aiofiles/APScheduler/cryptography/python-multipart
+# 检测链路锁链未动：numpy<2 + onnxruntime<1.20 + mediapipe==0.10.14
+# curl_cffi 0.16.3 已是 PyPI 最新，无需再升
+# 2026-09-14 路径B（rf-mediapipe）验证失败：rf-mediapipe 0.10.14 wheel 实际未真正适配 numpy 2.x
+# （import 即 SegFault），继续锁定 numpy<2 + mediapipe 0.10.14。备份在
+# requirements.txt.bak.pre_numpy2。
+fastapi>=0.141.0
+uvicorn[standard]>=0.52.0
+pydantic>=2.5.0
+python-multipart>=0.0.32
+aiofiles>=25.0.0
+# 定时任务调度（选品拉取 / 视频拉取 / 登录态检测 / 数据同步）
+APScheduler>=3.11.0
+# 抖音接口交互（真实实现骨架用；curl_cffi 提供 TLS 指纹伪装）
+httpx>=0.28.0
+curl_cffi>=0.5.0
+# 浏览器模拟（B 方案：绕过 JS 签名墙，选品/搜索走真实 Chromium 拦截）
+playwright>=1.50.0
+# Cookie 加密存储
+cryptography>=50.0.0
+# Excel 导出
+openpyxl>=3.1.0
+# 日志
+loguru>=0.7.0
+# 视频内容检测（拉取条件：字幕 OCR + 主播人脸检测；依赖缺失时检测模块默认放行，不影响主流程）
+# OCR 选 rapidocr-onnxruntime（纯 ONNX，无 torch 依赖），避开 easyocr 的 c10.dll 问题
+# 版本锁：numpy<2 + opencv-python-headless<5（5.0 移除了 Haar cascade xml）+ onnxruntime<1.20
+# （1.20+ 与 numpy 1.x 的 DLL 初始化在 Windows 上 SegFault）
+numpy<2.0
+opencv-python-headless>=4.8.0,<5.0
+rapidocr-onnxruntime>=1.3.0
+onnxruntime>=1.18.0,<1.20
+# MediaPipe 人脸检测（任务 #48 → 1.x：MediaPipe Tasks API，路径 A）
+# 1.0.1：Google 当前唯一稳定 Tasks API 版本；保守路径保留 numpy 1.26.4 + onnxruntime<1.20。
+# 模型 .tflite 内置于 app/core/models/face/（脚本下载见 scripts/download_face_models.py）。
+mediapipe==1.0.1
+protobuf>=4.25.0,<5.0    # mediapipe 1.0.1 隐式约束，显式锁定
+# 帧间相似度对比（任务 #127）：均匀抽帧后用 pHash 合并相邻相似帧
+# imagehash 4.x 自带 Pillow 依赖，显式锁 Pillow 与 numpy<2 兼容
+imagehash>=4.3.0
+Pillow>=10.0.0,<11.0
+# 进程级 CPU 监控（任务 #42：ffmpeg 死循环兜底，自动 kill 高占用子进程）
+# 仅 Windows 平台用作子进程 CPU 读取，Linux/macOS 自带 /proc 不强制依赖
+psutil>=5.9.0,<6.0; sys_platform == "win32"

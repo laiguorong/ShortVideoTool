@@ -1,0 +1,1838 @@
+# -*- coding: utf-8 -*-
+"""素材库服务（F-03）：分类树、视频拉取任务、分享链接导入、文件上传、素材列表/维护。
+
+入库三渠道统一管道：去重校验（视频ID / MD5）→ 文件落位 data/material → ffprobe 探测 → 入库。
+"""
+
+import hashlib
+import json
+import re
+import shutil
+import time
+from pathlib import Path
+
+from loguru import logger
+
+from app.core import task_scheduler, notifier
+from app.core.douyin import get_douyin_client, DouyinClientError, LoginInvalidError, RiskControlError, SearchBlockedError
+from app.core.ffmpeg import probe_media, extract_media_info
+from app.db import get_db
+from app.db.utils import now_str
+from app.services import account_service
+from app.services.task_service import task_service, raise_for_cancel, _fmt_hms, interruptible_sleep
+from app.services.setting_service import get_data_dir
+
+_JOB_PREFIX = "video_pull:"
+# #96：跨调用去重 set——同一 (pattern, error) 已打过 WARNING 就跳过，
+# 防止 1000+ 视频每条都因同一条 re.error 刷屏
+_RE_ERR_LOGGED: set[tuple[str, str]] = set()
+
+# 固定"未分类"分类 ID（不落库，list API 注入虚拟节点；删除分类时素材 category_id 直接置为该值）
+UNCATEGORIZED_ID = "-"
+
+# 阶梯式翻页预算（每轮最多翻多少页 = max(MIN_PAGES, BASE - STEP * 已完成轮数)）。
+# BASE 来自系统设置 pull_base_pages（默认 100，系统设置页可调），STEP/MIN 硬编码
+# —— 改这两个风险大，开放给用户容易触发反爬/资源耗尽。
+# 达 max_count 自动停用时不清零；用户点"重新启用"才重置 round 与 total_pulled。
+_STEP_PULL_PAGES = 10
+_MIN_PULL_PAGES = 10
+# 基础页数下限保护：配置非法（≤0/None/字符串）时回退默认 100；过小（< MIN）也夹到 MIN。
+# 防止用户把 BASE 调成 1 让阶梯失效。
+_PULL_BASE_FLOOR = 10
+
+
+def _get_pull_base_pages() -> int:
+    """从系统设置读阶梯基础页数；非法值回退默认 100，过小夹到下限。"""
+    from app.services.setting_service import load_settings
+    raw = load_settings().get("pull_base_pages", 100)
+    try:
+        base = int(raw)
+    except (TypeError, ValueError):
+        return 100
+    return max(_PULL_BASE_FLOOR, base)
+
+
+
+def compute_round_pages(pull_round: int) -> int:
+    """按已完成轮数算本轮最大页数（线性递减，MIN 兜底，BASE 从设置读）。
+
+    参数:
+        pull_round: 已完成的轮数（0 = 即将跑第 1 轮；负数/None/字符串均按 0 容错）
+    返回:
+        本轮预算页数
+    """
+    # 负数回退到 0（避免 pages 超过 BASE 导致阶梯失效）
+    round_no = max(0, int(pull_round or 0))
+    pages = _get_pull_base_pages() - _STEP_PULL_PAGES * round_no
+    return max(_MIN_PULL_PAGES, pages)
+
+
+def migrate_empty_category_to_uncategorized(d) -> int:
+    """启动时一次性迁移：历史 category_id='' 的素材 → UNCATEGORIZED_ID。
+
+    旧数据中"未分类"用空串隐式表达，重构后统一为固定 ID '-'。
+    返回迁移条数。
+    """
+    return d.execute(
+        "UPDATE material SET category_id=? WHERE category_id='' AND deleted=0",
+        (UNCATEGORIZED_ID,))
+
+# 文件类型白名单（F-03-R6）
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+MUSIC_EXTS = {".mp3", ".wav", ".aac", ".flac", ".m4a"}
+
+# 发布/时长档位常量（F-03 拉取条件增强）
+PUBLISH_RANGE_OPTIONS = {
+    "any": None,        # 不限
+    "1d": 1,            # 一天内
+    "7d": 7,            # 一周内
+    "180d": 180,        # 半年内
+}
+# 时长档位（毫秒）：max / min 为该侧阈值；max_eq / min_eq 决定是否包含边界
+# 语义：lt1m=< 1 分钟（不含 1 分钟），1to5m=[1 分钟, 5 分钟]，gt5m=> 5 分钟（不含 5 分钟）
+DURATION_RANGE_OPTIONS = {
+    "any":    {"max": None, "min": None, "max_eq": True,  "min_eq": True},
+    "lt1m":   {"max": 60_000,  "min": None, "max_eq": False, "min_eq": True},
+    "1to5m":  {"max": 300_000, "min": 60_000,  "max_eq": True,  "min_eq": True},
+    "gt5m":   {"max": None, "min": 300_000, "max_eq": True,  "min_eq": False},
+}
+
+
+# ---------- 分类树（F-03.1） ----------
+
+def list_categories(material_type: str, orientation: str = "") -> list[dict]:
+    """分类树列表（含素材计数），按 sort_order 排序返回平铺列表（前端组树）。
+
+    "未分类"是虚拟节点（id='-'，不落库），始终在返回列表最前；count = 该 type 下 category_id='-' 素材数。
+
+    #441：按 orientation（'vertical' / 'horizontal'）过滤每个分类的素材计数，
+    与 list_materials 过滤一致（orientation=?）。orientation 空 = 不过滤。
+    """
+    d = get_db()
+    # orientation 过滤子句：空 = 不过滤；非空 = orientation=?（与 list_materials 一致）
+    ori_clause = " AND orientation=?" if orientation else ""
+    ori_params = (orientation,) if orientation else ()
+    rows = d.query_all(
+        f"""SELECT c.*,
+                   (SELECT COUNT(*) FROM material m WHERE m.category_id=c.id AND m.deleted=0{ori_clause}) AS direct_count
+            FROM material_category c WHERE c.type=? AND c.deleted=0
+            ORDER BY c.sort_order, c.create_time""",
+        (*ori_params, material_type))
+    # 计算含子孙的累计计数
+    children: dict[str, list] = {}
+    for r in rows:
+        children.setdefault(r["parent_id"], []).append(r)
+
+    def subtree_count(node: dict) -> int:
+        total = node["direct_count"]
+        for ch in children.get(node["id"], []):
+            total += subtree_count(ch)
+        return total
+
+    for r in rows:
+        r["count"] = subtree_count(r)
+    # 注入虚拟"未分类"节点（不存库）
+    empty_count = d.query_one(
+        f"SELECT COUNT(*) AS c FROM material WHERE category_id=? AND deleted=0 AND type=?{ori_clause}",
+        (UNCATEGORIZED_ID, material_type, *ori_params))["c"]
+    uncategorized = {
+        "id": UNCATEGORIZED_ID,
+        "parent_id": "",
+        "name": "未分类",
+        "type": material_type,
+        "sort_order": -1,
+        "direct_count": empty_count,
+        "count": empty_count,
+    }
+    return [uncategorized] + rows
+
+
+def create_category(name: str, material_type: str, parent_id: str = "") -> dict:
+    """新增分类（层级上限 4 级；不允许在系统分类「未分类」下创建子分类）。"""
+    d = get_db()
+    if material_type not in ("video", "music"):
+        raise ValueError("类型非法")
+    if parent_id == UNCATEGORIZED_ID:
+        raise ValueError("系统分类「未分类」下不可新增子分类")
+    depth = 0
+    pid = parent_id
+    while pid:
+        row = d.query_one("SELECT parent_id FROM material_category WHERE id=? AND deleted=0", (pid,))
+        if not row:
+            raise ValueError("父分类不存在")
+        pid = row["parent_id"]
+        depth += 1
+        if depth >= 4:
+            raise ValueError("分类层级上限 4 级")
+    # 同 parent 下取当前 max(sort_order) + 1；"未分类"为虚拟节点不占位
+    order_row = d.query_one(
+        """SELECT COALESCE(MAX(sort_order), 0) AS m FROM material_category
+           WHERE parent_id=? AND deleted=0""",
+        (parent_id,))
+    order = (order_row["m"] if order_row else 0) + 1
+    cat_id = d.insert("material_category", {
+        "name": name, "type": material_type, "parent_id": parent_id, "sort_order": order})
+    return d.query_one("SELECT * FROM material_category WHERE id=?", (cat_id,))
+
+
+def rename_category(category_id: str, name: str) -> None:
+    """重命名分类。"""
+    if category_id == UNCATEGORIZED_ID:
+        raise ValueError("系统分类「未分类」不可重命名")
+    get_db().update_by_id("material_category", category_id, {"name": name})
+
+
+def move_category(category_id: str, new_parent_id: str, sort_order: int = 0) -> None:
+    """移动分类（换父级/排序）；不允许把自己移到自己子孙下。"""
+    if category_id == UNCATEGORIZED_ID:
+        raise ValueError("系统分类「未分类」不可移动")
+    # 「未分类」是虚拟节点（无 DB 记录），不能作为其他分类的父级
+    if new_parent_id == UNCATEGORIZED_ID:
+        raise ValueError("「未分类」下不可放置子分类")
+    d = get_db()
+    if new_parent_id == category_id:
+        raise ValueError("不能移动到自身下")
+    # 祖先环检测
+    pid = new_parent_id
+    while pid:
+        if pid == category_id:
+            raise ValueError("不能移动到自己的子孙分类下")
+        row = d.query_one("SELECT parent_id FROM material_category WHERE id=?", (pid,))
+        pid = row["parent_id"] if row else ""
+    d.update_by_id("material_category", category_id, {"parent_id": new_parent_id, "sort_order": sort_order})
+
+
+def delete_category(category_id: str, strategy: str = "to_parent") -> None:
+    """删除分类（需无子分类；素材按策略处置：to_parent 移入父分类 / must_empty 强制清空）。"""
+    if category_id == UNCATEGORIZED_ID:
+        raise ValueError("系统分类「未分类」不可删除")
+    d = get_db()
+    row = d.query_one("SELECT * FROM material_category WHERE id=? AND deleted=0", (category_id,))
+    if not row:
+        raise ValueError("分类不存在")
+    if d.query_one("SELECT COUNT(*) AS c FROM material_category WHERE parent_id=? AND deleted=0",
+                   (category_id,))["c"] > 0:
+        raise ValueError("请先删除或移出子分类")
+    material_count = d.query_one(
+        "SELECT COUNT(*) AS c FROM material WHERE category_id=? AND deleted=0", (category_id,))["c"]
+    if material_count > 0:
+        if strategy != "to_parent":
+            raise ValueError(f"分类下有 {material_count} 个素材，请先迁移")
+        # 顶级分类（parent_id 为空）时素材迁入"未分类"虚拟分类（id='-'）；其他迁入父分类
+        new_cat = row["parent_id"] or UNCATEGORIZED_ID
+        d.execute("UPDATE material SET category_id=? WHERE category_id=?", (new_cat, category_id))
+    # 根节点不可删（parent_id 空串为类型根占位，实际不建根记录，此处防御）
+    d.soft_delete_by_id("material_category", category_id)
+
+
+# ---------- 统一入库管道 ----------
+
+def _build_material_path(material_type: str, category_id: str, material_id: str, title: str, ext: str) -> Path:
+    """按目录规范生成存储路径（#364）：material/{type}/{yyyyMMdd}/{id}/{id}.{ext}。
+
+    每个素材独占一层 id/ 子目录，下面放视频 / 封面 / 头像三个文件：
+        material/<type>/<date>/<id>/<id>.<ext>            —— 视频/音频本体
+        material/<type>/<date>/<id>/<id>_cover.<ext>      —— 封面
+        material/<type>/<date>/<id>/<id>_avatar.<ext>     —— 头像
+
+    不带分类层级（分类与目录解耦，改分类无需搬文件）；文件名只用素材 ID（标题改存 DB，
+    避免特殊字符/超长截断问题）。title 参数保留以兼容既有调用签名，实际不参与路径。
+    """
+    date = now_str()[:10].replace("-", "")
+    rel = Path(material_type) / date / material_id / f"{material_id}{ext}"
+    return get_data_dir() / "material" / rel
+
+
+def _build_material_cover_path(material_type: str, material_id: str, ext: str,
+                               date: str | None = None) -> str:
+    """#364：素材封面相对路径。`date` 留空用今日；指定时用于历史素材补缓存。"""
+    d = (date or now_str()[:10]).replace("-", "")
+    return f"material/{material_type}/{d}/{material_id}/{material_id}_cover{ext}"
+
+
+def _build_material_avatar_path(material_type: str, material_id: str, ext: str,
+                                date: str | None = None) -> str:
+    """#364：素材头像相对路径。"""
+    d = (date or now_str()[:10]).replace("-", "")
+    return f"material/{material_type}/{d}/{material_id}/{material_id}_avatar{ext}"
+
+
+def _md5_of_file(path: Path) -> str:
+    """文件内容 MD5。"""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _infer_image_ext(url: str, default: str = ".webp") -> str:
+    """#364：从 URL 推断图片后缀（取查询参数前的路径段），无则回退默认。"""
+    if not url:
+        return default
+    path_part = url.split("?", 1)[0]
+    ext = Path(path_part).suffix.lower()
+    if ext and ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        return ext
+    return default
+
+
+def _probe_and_save(material_id: str, title: str, material_type: str, category_id: str,
+                    file_path: Path, source_type: str, source_ref: str | None,
+                    raw_link: str | None, md5: str) -> dict:
+    """落位文件 + ffprobe 探测 + 入库（供三渠道共用）。"""
+    d = get_db()
+    duration_ms = None
+    resolution = None
+    orientation = None
+    if material_type == "video":
+        info = extract_media_info(probe_media(str(file_path)))
+        duration_ms = info["duration_ms"] or None
+        if info["width"] and info["height"]:
+            resolution = f"{info['width']}x{info['height']}"
+        orientation = info["orientation"]
+    elif material_type == "music":
+        # 音频也探时长（ffprobe 对 mp3/m4a 通用；失败保持 None，详情显示 -）
+        info = extract_media_info(probe_media(str(file_path)))
+        duration_ms = info["duration_ms"] or None
+    rel_path = str(file_path.relative_to(get_data_dir())).replace("\\", "/")
+    d.insert("material", {
+        "id": material_id,
+        "title": title,
+        "author_title": title,
+        "type": material_type,
+        "category_id": category_id,
+        "duration_ms": duration_ms,
+        "file_size": file_path.stat().st_size,
+        "source_type": source_type,
+        "source_ref": source_ref,
+        "file_md5": md5,
+        "resolution": resolution,
+        "orientation": orientation,
+        "file_path": rel_path,
+        "raw_link": raw_link,
+    })
+    return d.query_one("SELECT * FROM material WHERE id=?", (material_id,))
+
+
+def _duplicate_check(source_ref: str | None, md5: str) -> dict | None:
+    """去重：拉取/分享按来源视频 ID，上传按 MD5；返回已存在素材或 None。"""
+    d = get_db()
+    if source_ref:
+        row = d.query_one("SELECT * FROM material WHERE source_ref=? AND deleted=0", (source_ref,))
+        if row:
+            return row
+    return d.query_one("SELECT * FROM material WHERE file_md5=? AND deleted=0", (md5,))
+
+
+# ---------- 视频拉取任务（F-03.2 / F-03.7） ----------
+
+def create_pull_task(task_name: str, conditions: dict, account_id: str,
+                     category_id: str, interval_config: dict) -> dict:
+    """创建视频拉取任务（定时）。"""
+    interval_json = json.dumps(interval_config, ensure_ascii=False)
+    task_scheduler.parse_interval_config(interval_json)
+    d = get_db()
+    if not d.query_one("SELECT id FROM account WHERE id=? AND deleted=0", (account_id,)):
+        raise ValueError("拉取账号不存在")
+    # 允许 UNCATEGORIZED_ID 作为入库目标（虚拟分类）；其他必须存在且为视频类型
+    if category_id != UNCATEGORIZED_ID and not d.query_one(
+            "SELECT id FROM material_category WHERE id=? AND type='video' AND deleted=0",
+            (category_id,)):
+        raise ValueError("入库分类必须为视频类型分类")
+    task_id = d.insert("video_pull_task", {
+        "task_name": task_name,
+        "conditions_json": json.dumps(conditions, ensure_ascii=False),
+        "account_id": account_id,
+        "category_id": category_id,
+        "interval_config": interval_json,
+        "status": "enabled",
+    })
+    d.update_by_id("video_pull_task", task_id, {
+        "next_run_time": task_scheduler.compute_next_run_time(interval_json)})
+    register_task_job(d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,)))
+    return d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,))
+
+
+def update_pull_task(task_id: str, task_name: str | None, conditions: dict | None,
+                     account_id: str | None, category_id: str | None,
+                     interval_config: dict | None) -> dict:
+    """编辑视频拉取任务（下一轮生效）。"""
+    d = get_db()
+    if not d.query_one("SELECT id FROM video_pull_task WHERE id=? AND deleted=0", (task_id,)):
+        raise ValueError("任务不存在")
+    fields: dict = {}
+    if task_name is not None:
+        fields["task_name"] = task_name
+    if conditions is not None:
+        fields["conditions_json"] = json.dumps(conditions, ensure_ascii=False)
+    if account_id is not None:
+        fields["account_id"] = account_id
+    if category_id is not None:
+        fields["category_id"] = category_id
+    if interval_config is not None:
+        interval_json = json.dumps(interval_config, ensure_ascii=False)
+        task_scheduler.parse_interval_config(interval_json)
+        fields["interval_config"] = interval_json
+    d.update_by_id("video_pull_task", task_id, fields)
+    updated = d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,))
+    if updated["status"] == "enabled":
+        register_task_job(updated)
+    return updated
+
+
+def toggle_pull_task(task_id: str, enabled: bool) -> dict:
+    """视频拉取任务启停（保留阶梯进度，不重置 round / total_pulled）。
+
+    v23 联动 stop_reason：手动停用 → 'manual'；手动启用 → 清回 null。
+    自动达 max_count 停用时由 _run_pull_round 写 'auto_max'，toggle 不覆盖，
+    保证"重新启用"按钮只在自动停用下出现。
+
+    阶梯重置语义：达 max_count 自动停用 → 用户主动点"重新启用"按钮（调
+    restart_pull_task）才清零 round 与 total_pulled；普通 toggle 不清零，
+    阶梯进度跨启用/停用保留。
+    """
+    d = get_db()
+    fields: dict = {"status": "enabled" if enabled else "disabled"}
+    if enabled:
+        # 手动启用：清掉 'manual'/'auto_max' 标记（auto_max 在 restart 路径会被 restart_pull_task 清）
+        fields["stop_reason"] = None
+        d.update_by_id("video_pull_task", task_id, fields)
+        register_task_job(d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,)))
+    else:
+        # 手动停用：标记 manual（不覆盖 auto_max）
+        cur = d.query_one("SELECT stop_reason FROM video_pull_task WHERE id=?", (task_id,))
+        if cur and cur.get("stop_reason") != "auto_max":
+            fields["stop_reason"] = "manual"
+        d.update_by_id("video_pull_task", task_id, fields)
+        task_scheduler.remove_job(_JOB_PREFIX + task_id)
+        d.update_by_id("video_pull_task", task_id, {"next_run_time": None})
+    return d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,))
+
+
+def restart_pull_task(task_id: str) -> dict:
+    """v22 阶梯重置 + v23 标记清理：清零 pull_round + total_pulled + stop_reason，
+    重新启用任务。
+
+    用途：达 max_count 自动停用后，前端任务列表操作列展示"重新启用"按钮，
+    用户点击调此端点。下次调度按第 1 轮 100 页跑起。
+
+    边界：仅对 status='disabled' 生效（避免误清零正在跑的进度）；
+    启用前重新计算 next_run_time 并注册调度。
+    """
+    d = get_db()
+    task = d.query_one("SELECT * FROM video_pull_task WHERE id=? AND deleted=0", (task_id,))
+    if not task:
+        raise ValueError("任务不存在")
+    if task["status"] != "disabled":
+        raise ValueError(f"任务当前状态为 {task['status']}，仅停用任务可重新启用")
+    d.update_by_id("video_pull_task", task_id, {
+        "status": "enabled",
+        "pull_round": 0,
+        "total_pulled": 0,
+        "stop_reason": None,
+        "next_run_time": task_scheduler.compute_next_run_time(task["interval_config"]),
+    })
+    register_task_job(d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,)))
+    return d.query_one("SELECT * FROM video_pull_task WHERE id=?", (task_id,))
+
+
+def delete_pull_task(task_id: str) -> None:
+    """删除视频拉取任务（已入库素材保留）。
+
+    任务 #133：删除前先取消 in-flight worker。读 bg_task_id（_run_pull_round 启
+    动时写入的 task_service UUID），调 request_cancel 让 worker 在下一次 page
+    边界 raise_for_cancel 处退出循环，避免已飞轮次继续入库。
+    """
+    d = get_db()
+    if not d.query_one("SELECT id FROM video_pull_task WHERE id=? AND deleted=0", (task_id,)):
+        raise ValueError("任务不存在")
+    # 1) 取消 in-flight worker（如果有）。request_cancel 对已完成/不存在任务返 False，幂等。
+    bg_task_id = d.query_one(
+        "SELECT bg_task_id FROM video_pull_task WHERE id=?", (task_id,))
+    if bg_task_id and bg_task_id.get("bg_task_id"):
+        try:
+            cancelled = task_service.request_cancel(bg_task_id["bg_task_id"])
+            logger.info(
+                "[拉取任务] 删除时取消 in-flight worker task_id={} bg_task_id={} ok={}",
+                task_id, bg_task_id["bg_task_id"], cancelled,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[拉取任务] 取消 bg_task_id 异常：{}", e)
+    # 2) 移除 APScheduler 注册
+    task_scheduler.remove_job(_JOB_PREFIX + task_id)
+    # 3) 软删除配置 + 清日志
+    d.soft_delete_by_id("video_pull_task", task_id)
+    d.execute("DELETE FROM video_pull_log WHERE task_id=?", (task_id,))
+
+
+def list_pull_tasks(page: int = 1, page_size: int = 20) -> dict:
+    """视频拉取任务列表。
+
+    每行附加 current_run 字段（来自 task_service 内存实例），便于任务队列
+    列表展示正在执行的进度（bg_task_id 命中 running/waiting 时填 status/
+    progress/message，否则 null）。
+    """
+    from app.services.task_service import task_service
+    d = get_db()
+    page_result = d.query_page(
+        """SELECT t.*, a.nickname AS account_nickname, c.name AS category_name
+           FROM video_pull_task t
+           LEFT JOIN account a ON t.account_id=a.id
+           LEFT JOIN material_category c ON t.category_id=c.id
+           WHERE t.deleted=0 ORDER BY t.create_time DESC""",
+        (), page, page_size)
+    # 注入当前执行进度（bg_task_id → task_service 内存实例）
+    for row in page_result.get("list", []):
+        bg_id = row.get("bg_task_id")
+        run_info = task_service.get_task(bg_id) if bg_id else None
+        if run_info and run_info.get("status") in ("waiting", "running"):
+            row["current_run"] = {
+                "status": run_info["status"],
+                "progress": run_info.get("progress", ""),
+                "message": run_info.get("message", ""),
+            }
+        else:
+            row["current_run"] = None
+    return page_result
+
+
+def delete_pull_log(log_id: str) -> None:
+    """删除单条视频拉取执行日志（#351：聚合列表批量删除）。"""
+    d = get_db()
+    row = d.query_one("SELECT id FROM video_pull_log WHERE id=?", (log_id,))
+    if not row:
+        raise ValueError("日志不存在")
+    d.execute("DELETE FROM video_pull_log WHERE id=?", (log_id,))
+
+
+def list_pull_logs(task_id: str | None = None, page: int = 1, page_size: int = 20) -> dict:
+    """视频拉取任务执行日志列表。
+
+    task_id 为空时聚合所有任务的执行日志（按时间倒序，含任务名）。
+    """
+    if task_id:
+        return get_db().query_page(
+            """SELECT id, run_time, new_count, skip_count, fail_reason
+               FROM video_pull_log
+               WHERE task_id=? ORDER BY run_time DESC""",
+            (task_id,), page, page_size)
+    return get_db().query_page(
+        """SELECT l.id, l.task_id, l.run_time, l.new_count, l.skip_count, l.fail_reason,
+                  t.task_name
+           FROM video_pull_log l
+           LEFT JOIN video_pull_task t ON l.task_id=t.id
+           ORDER BY l.run_time DESC""",
+        (), page, page_size)
+
+
+def register_task_job(task_row: dict) -> None:
+    """注册调度（main.py 启动恢复调用同名函数）。"""
+    def _on_fire(tid=task_row["id"]):
+        # 任务 #133：把 task_service 提交的 UUID 写回 task 行，删除时可取消。
+        # PR2 #55：type 从 pull 拆为 video_pull。
+        # 任务 #59 P1 #4：每次 fire 重新查 task_name（闭包快照会被旧值锁住，编辑任务名后无效）
+        row = get_db().query_one("SELECT task_name FROM video_pull_task WHERE id=?", (tid,))
+        tname = row["task_name"] if row else "未命名任务"
+        bg_task_id = task_service.submit(
+            "video_pull", tname, lambda info: _run_pull_round(tid, info))
+        try:
+            get_db().execute(
+                "UPDATE video_pull_task SET bg_task_id=? WHERE id=?",
+                (bg_task_id, tid))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[拉取任务] 写 bg_task_id 失败 {}：{}", tid, e)
+    task_scheduler.register_interval_job(
+        _JOB_PREFIX + task_row["id"], task_row["interval_config"], _on_fire)
+
+
+def _run_pull_round(task_id: str, info) -> str:
+    """执行一轮视频拉取：搜索 → 逐条条件校验 → 下载入库。
+
+    单轮入库数量达到 `conditions.max_count`（默认 100，上限 1000）后自动停用任务：
+    - 调度器移除该任务的下一次执行（remove_job）
+    - 数据库 status 置为 disabled / next_run_time 清空
+    - 用户可手动重新启用并按需调整 max_count
+
+    日志规范（v126 增强）：
+    - 拦截跳过：标题/描述/作者 + 首个拦截原因
+    - 重复跳过：已存在素材标题
+    - 入库成功：素材 ID + 标题/作者
+    """
+    d = get_db()
+    task = d.query_one("SELECT * FROM video_pull_task WHERE id=? AND deleted=0", (task_id,))
+    if not task:
+        return "任务已删除，跳过"
+    task_scheduler.touch_last_run("video_pull_task", task_id)
+    conditions = json.loads(task["conditions_json"])
+    # #95：摘要过滤条件 INFO（含 title_regex pattern），让用户/运维一眼看出
+    # 实际生效的过滤规则——之前正则配错 _match_conditions 静默 pass，
+    # 一轮跑完才发现"为什么所有 title_regex 都没生效"。
+    logger.info(
+        "[拉取任务] 过滤条件 title_regex={!r} orientation={!r} publish_range={!r} duration_range={!r}",
+        conditions.get("title_regex") or "",
+        conditions.get("orientation") or "",
+        conditions.get("publish_range") or "",
+        conditions.get("duration_range") or "",
+    )
+    # max_count 边界：Pydantic 已限制 1-1000；防御性 clamp
+    try:
+        max_count = int(conditions.get("max_count") or 100)
+    except (TypeError, ValueError):
+        max_count = 100
+    max_count = max(1, min(1000, max_count))
+    account = d.query_one("SELECT * FROM account WHERE id=? AND deleted=0", (task["account_id"],))
+    if not account or account["status"] in ("invalid", "disabled"):
+        _write_pull_log(task_id, 0, 0, "账号登录态失效，跳过本轮")
+        return "账号登录态失效，跳过本轮"
+
+    client = get_douyin_client()
+    cookie = account_service.get_cookie(account["id"])
+    # #506：素材搜索改走浏览器持久化会话（和发布视频一致），
+    # 旧版 curl_cffi 裸 cookie 被搜索接口 2483 风控。
+    # #P0-9：search_session 仅用于当页 search_videos，处理详情前必须 close——
+    # Playwright sync_api 一个线程只能有一个 running loop，search_session 的
+    # dispatcher loop 在跑时 BrowserActor._ensure_browser 调第二次 sync_playwright
+    # 会抛 "inside the asyncio loop"。每页 close+重建避免持久化登录态丢失
+    # （profile 持久化由 launch_persistent_context 负责，重建只是订阅登录上下文，不丢登录）。
+    from app.core.douyin.search_api import BrowserSearchSession
+    from app.services.douyin_account import get_profile_dir
+    profile_dir = get_profile_dir(account["id"])
+    new_count = skip_count = intercept_count = 0
+    fail_reason = ""
+    reached_limit = False
+    # 任务 #66：统一用 task_service 注入的 start_ts（替代原 round_start，
+    # 这样阶梯多轮翻页时 progress 用时 = 整个 worker 周期，而非单轮）
+    round_start = info.start_ts or time.time()
+    # v22 阶梯式翻页：按已完成轮数算本轮预算页数（第 1 轮 100、第 2 轮 90 ... 10 兜底）。
+    # 用户决策：达 max_count 自动停用不清零；手动"重新启用"按钮才重置 round + total_pulled。
+    pull_round = int(task.get("pull_round") or 0)
+    page_budget = compute_round_pages(pull_round)
+    page = 1
+    # 抖音搜索要求同一会话复用 search_id 才能正确翻页（探针 D 实测：
+    # 不同 search_id 服务端按新一轮会话处理，翻页立刻失败）。在 while 外
+    # 生成一次，整轮翻页复用。
+    # #506 浏览器会话无 search_id 概念，保留此变量仅为兼容 client.search_videos
+    # 签名占位（实际不参与 XHR 参数构造）。
+    import uuid
+    search_id = uuid.uuid4().hex
+
+    def _process_page_videos(videos: list) -> None:
+        """处理一页视频：客户端兜底 → 内容过滤 → 下载入库。
+
+        修改闭包内 new_count / skip_count / reached_limit。
+        """
+        nonlocal new_count, skip_count, intercept_count, reached_limit
+        for video in videos:
+            # #P1-2：单视频循环顶部检查取消——单页 12 条可能耗时数十秒，
+            # 不查取消用户点取消后要等整页跑完才生效
+            raise_for_cancel(info)
+            # v126 拉取日志：每条视频进入处理流程前先打印关键字段
+            duration_s = (video.get("duration_ms") or 0) / 1000
+            logger.info(
+                "[拉取候选] 视频 {} | url={} | 标题={!r} | 描述={!r} | 发布时间={} | 时长={:.1f}s",
+                video.get("video_id"),
+                video.get("share_url") or "",
+                (video.get("title") or "")[:50],
+                (video.get("desc") or "")[:100],
+                (video.get("publish_time") or "-"),
+                duration_s,
+            )
+            # 任务 #130/#131：单视频处理收敛到 _process_single_video 公共函数
+            single = _process_single_video(
+                video, task["category_id"], client,
+                source="pull", conditions=conditions, cookie=cookie,
+                account_id=account["id"],   # 此作用域内只有 `account` 字典，无 `account_id` 变量
+            )
+            action = single["action"]
+            if action == "filtered":
+                # 字幕/人脸/时长等过滤命中 → 拦截(从 skip_count 单拆出来便于进度展示)
+                intercept_count += 1
+                skip_count += 1
+                logger.info(
+                    "[拉取拦截] 视频 {} | 拦截原因：{} | 标题={!r} | 作者={}",
+                    video.get("video_id"), single.get("reason"),
+                    (video.get("title") or "")[:50],
+                    video.get("author_nickname") or "-",
+                )
+            elif action in ("duplicate", "failed"):
+                skip_count += 1
+                logger.info(
+                    "[拉取跳过] 视频 {} | 拦截原因：{} | 标题={!r} | 作者={}",
+                    video.get("video_id"), single.get("reason"),
+                    (video.get("title") or "")[:50],
+                    video.get("author_nickname") or "-",
+                )
+            elif action == "new":
+                new_count += 1
+                logger.info(
+                    "[拉取成功] 视频 {} → 素材 {} | 标题={!r} | 作者={}",
+                    video.get("video_id"), single["material_id"],
+                    (video.get("title") or "")[:50],
+                    video.get("author_nickname") or "-",
+                )
+            # 单轮达到 max_count 上限，停止翻页与下载
+            if new_count >= max_count:
+                reached_limit = True
+                break
+
+    try:
+        empty_pages = 0  # 任务 #134：连续空页计数（数据源异常信号）
+        while True:
+            raise_for_cancel(info)
+            # #P0-9：每页 search 前重建 BrowserSearchSession，处理详情前
+            # close 释放 playwright runtime，避免与 BrowserActor 二次 sync_playwright 冲突
+            # #审查修复：search_session = None 兜底构造异常时的资源泄露
+            search_session = None
+            try:
+                search_session = BrowserSearchSession(profile_dir)
+                result = client.search_videos(
+                    profile_dir, conditions, page, search_id,
+                    _session=search_session,
+                )
+            finally:
+                if search_session is not None:
+                    search_session.close()
+            page_videos = result.get("videos", [])
+            # 任务 #134：搜索返回 0 视频但 page > 1 → 当页数据源全空（非首页不算风控）
+            # 连续多页 0 视频 → 数据源异常，记到 fail_reason 便于用户事后看到
+            if not page_videos and page > 1 and not result.get("has_next"):
+                empty_pages += 1
+                if empty_pages >= 2:
+                    fail_reason = f"数据源异常：连续 {empty_pages} 页返回 0 条视频"
+                    break
+            _process_page_videos(page_videos)
+            # v22+#365：每页完成更新后台任务进度(状态栏实时可见)
+            # PR3 #56：progress 模板统一（中文逗号→英文逗号）
+            elapsed_s = int(time.time() - round_start)
+            info.progress = (
+                f"拉取第 {page}/{page_budget} 页，已入库 {new_count}，"
+                f"跳过 {intercept_count}，用时 {_fmt_hms(elapsed_s)}"
+            )
+            if reached_limit:
+                break
+            # v22 A：早退重试扛瞬时风控
+            # 抖音 has_more=0 但 new_count=0 + 未达 max_count → 等 30s/45s 重试本页
+            # 重试后若仍 has_more=0 走 B fail_reason；中途拿到新素材则跳出
+            if not result.get("has_next") and new_count == 0:
+                retried_with_data = False
+                for retry in range(2):
+                    wait_sec = 30 + retry * 15
+                    logger.warning(
+                        "[拉取重试] page={} has_more=0 但 new_count=0,{}s 后第{}次重试",
+                        page, wait_sec, retry + 1,
+                    )
+                    # #P1-3：早退重试 sleep 期间需响应取消（原 time.sleep 阻塞最长 45s）
+                    interruptible_sleep(wait_sec, info)
+                    raise_for_cancel(info)
+                    # #P0-9：每页重建 session，同上避免与 detail 路径冲突
+                    # #审查修复：search_session = None 兜底构造异常时的资源泄露
+                    search_session = None
+                    try:
+                        search_session = BrowserSearchSession(profile_dir)
+                        result = client.search_videos(
+                            profile_dir, conditions, page, search_id,
+                            _session=search_session,
+                        )
+                    finally:
+                        if search_session is not None:
+                            search_session.close()
+                    page_videos = result.get("videos", [])
+                    _process_page_videos(page_videos)
+                    if reached_limit or result.get("has_next") or new_count > 0:
+                        retried_with_data = True
+                        break
+                if not retried_with_data and not result.get("has_next") and new_count == 0:
+                    # v22 B：早退写 fail_reason 提示
+                    fail_reason = (
+                        f"仅获取 {len(page_videos)} 条候选且全部被过滤/重复,"
+                        f"抖音 has_more=0——建议放宽过滤或重新启用任务"
+                    )
+                break
+            if not result.get("has_next"):
+                # 抖音返回 has_more=0：本轮数据已拉完（不是 page_budget 触发的早退）
+                if not fail_reason:
+                    fail_reason = (
+                        f"抖音接口返回 has_more=0，本轮已无更多数据 "
+                        f"（共 {page} 页 / 入库 {new_count} 条）"
+                    )
+                break
+            page += 1
+            # v22 阶梯式翻页：本轮预算页数（线性递减，MIN 兜底）。
+            if page > page_budget:
+                fail_reason = f"已达本轮预算 {page_budget} 页（阶梯第 {pull_round + 1} 轮）"
+                break
+    except LoginInvalidError:
+        fail_reason = "登录态失效，跳过本轮"
+        d.update_by_id("account", account["id"], {"status": "invalid"})
+        notifier.notify("warn", "task", f"视频任务「{task['task_name']}」账号失效",
+                        "本轮跳过", action=f"relogin:{account['id']}")
+    except RiskControlError as e:
+        fail_reason = f"风控拦截：{e}"
+    except SearchBlockedError as e:
+        # #审查修复：搜索风控带 page/keyword 上下文，便于排查
+        kw = conditions.get("keyword", "") if isinstance(conditions, dict) else ""
+        fail_reason = f"搜索接口风控（page={page}, keyword={kw}）：{e}"
+        logger.warning("[拉取任务] 任务「{}」搜索风控 page={} keyword={} reason={}",
+                       task["task_name"], page, kw, e)
+    except Exception as e:  # noqa: BLE001
+        fail_reason = str(e)
+    finally:
+        # #P0-9：每页 search_videos 已经在 try-finally 内 close session，
+        # 此处不重复 close（避免对已 close 的 playwright runtime 二次 stop 抛噪声）。
+        # 异常路径（search_videos 抛异常未进入 finally）下，search_session 可能残留；
+        # 兜底用 hasattr 检查 _pw/._ctx，但 BrowserSearchSession.close() 内部已 try/except 吞所有异常，
+        # 二次调用安全短路。保留此处以防异常路径漏关。
+        try:
+            if 'search_session' in locals() and search_session is not None:
+                search_session.close()
+        except Exception:
+            pass
+        # 任务 #133：无论 round 成功/异常，bg_task_id 必清，
+        # 避免删除任务时 request_cancel 命中已结束的 UUID。
+        try:
+            d.execute("UPDATE video_pull_task SET bg_task_id=NULL WHERE id=?", (task_id,))
+        except Exception as e:  # noqa: BLE001 #91 finally 静默改为 debug
+            logger.debug("[拉取任务] finally 清 bg_task_id 失败 task_id={} err={}", task_id, e)
+        # v22 阶梯式翻页：任何退出（达限 / has_more=0 / empty_pages / 风控 / 异常）都 +1 round
+        # 并累加 total_pulled。用户决策：达 max_count 不清零；手动"重新启用"才重置。
+        # 重置走 restart_pull_task，避免本页逻辑耦合太多状态分支。
+        try:
+            d.execute(
+                "UPDATE video_pull_task "
+                "SET pull_round = COALESCE(pull_round, 0) + 1, "
+                "    total_pulled = COALESCE(total_pulled, 0) + ? "
+                "WHERE id=? AND deleted=0",
+                (new_count, task_id),
+            )
+        except Exception as e:  # noqa: BLE001 #91 finally 静默改为 debug
+            logger.debug("[拉取任务] finally 累加 pull_round 失败 task_id={} err={}", task_id, e)
+
+    # 达到 max_count 上限：自动停用任务（移除调度 + 改状态）
+    if reached_limit and not fail_reason:
+        task_scheduler.remove_job(_JOB_PREFIX + task_id)
+        d.update_by_id("video_pull_task", task_id, {
+            "status": "disabled",
+            "next_run_time": None,
+            "stop_reason": "auto_max",  # v23：前端列表据此显示"重新启用"按钮
+        })
+        fail_reason = f"已达单轮上限 {max_count} 条，任务自动停用"
+
+    _write_pull_log(task_id, new_count, skip_count, fail_reason)
+    # PR3 #56：实时即终态，最后一次循环内的 info.progress 即为终态（删除"总页数 ..."覆写）
+    logger.info(
+        "[拉取完成] 任务「{}」第{}页 结束 | 新增={} 跳过={} 状态={}",
+        task["task_name"], page, new_count, skip_count,
+        fail_reason or "成功",
+    )
+    # 任务 #367：信息列直接显示抓取详情(fail_reason),task_service 保留 info.message
+    info.message = fail_reason or ""
+    return "partial" if fail_reason else "success"
+
+
+def _extract_local_cover(video_path: Path, material_id: str,
+                         material_type: str = "video") -> str:
+    """从本地视频抽取首秒帧作为封面（分辨率=视频原生分辨率；#364 落 material/<type>/<date>/<id>/）。
+
+    返回相对 data 根的路径（material/<type>/<date>/<id>/<id>_cover.jpg）；
+    失败返回空串，调用方回退 CDN 封面。
+    """
+    from app.core.ffmpeg import extract_frame
+    rel = _build_material_cover_path(material_type, material_id, ".jpg")
+    abs_path = get_data_dir() / rel
+    try:
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.debug("[封面] 缓存目录创建失败 material_id={} err={}", material_id, e)
+        return ""
+    if extract_frame(str(video_path), str(abs_path), seek_seconds=1.0):
+        return rel
+    logger.debug("[封面] 本地抽帧失败 material_id={} video={} → 回退 CDN 封面",
+                 material_id, video_path.name)
+    return ""
+
+
+def _match_conditions(video: dict, conditions: dict) -> bool:
+    """客户端条件兜底：标题正则 / 画面方向 / 发布时间档位 / 视频时长档位。
+
+    抖音搜索接口只支持 keyword + offset，其余条件必须在客户端按搜索返回字段二次过滤。
+    不支持的旧字段（topics/desc_keywords/location/shop_name）仅作兼容读取，不做硬过滤（抖音 API 未返回结构化字段）。
+    """
+    pattern = conditions.get("title_regex", "").strip()
+    if pattern:
+        try:
+            # v126 扩展：title / desc / topics 三字段或匹配，任一命中即放行
+            # title 是 desc 第一行截 50 字，可能与 desc 重叠；topics 是 "#话题1#话题2" 拼接
+            text_pool = "\n".join(filter(None, [
+                video.get("title", "") or "",
+                video.get("desc", "") or "",
+                video.get("topics", "") or "",
+            ]))
+            if text_pool and not re.search(pattern, text_pool):
+                return False
+        except re.error as e:  # noqa: PERF203 #96 silent → warning + set 防刷屏
+            key = (pattern, str(e))
+            if key not in _RE_ERR_LOGGED:
+                _RE_ERR_LOGGED.add(key)
+                logger.warning(
+                    "[过滤条件] title_regex 编译失败 pattern={!r} err={}（该条视频按未匹配处理）",
+                    pattern, e,
+                )
+    orientation = conditions.get("orientation", "")
+    if orientation:
+        # 任务 #133 复盘修复误拉横屏：
+        # 优先用 orientation 字段；缺失时（_parse_search_item 三源全无 width/height
+        # 才返回 None）按 width/height 二次判定。双重校验避免 dimension 缺失的
+        # 横屏视频被 _parse_search_item 误标 vertical 入库。
+        vo = video.get("orientation")
+        if vo is None:
+            w, h = int(video.get("width") or 0), int(video.get("height") or 0)
+            if w and h:
+                vo = "horizontal" if w >= h else "vertical"
+        if vo and vo != orientation:
+            return False
+    # 发布时间档位（相对当前时间）：publish_time 为毫秒时间戳或 ISO 字符串
+    pr = conditions.get("publish_range") or "any"
+    days = PUBLISH_RANGE_OPTIONS.get(pr)
+    if days is not None:
+        ts = _parse_publish_ts(video.get("publish_time"))
+        if ts is not None and not _within_days(ts, days):
+            return False
+    # 时长档位（max/min 阈值；max_eq/min_eq 决定边界是否包含）
+    dr = conditions.get("duration_range") or "any"
+    bounds = DURATION_RANGE_OPTIONS.get(dr) or DURATION_RANGE_OPTIONS["any"]
+    max_ms = bounds["max"]
+    min_ms = bounds["min"]
+    if max_ms is not None or min_ms is not None:
+        dms = _parse_duration_ms(video.get("duration_ms"))
+        if dms is None:
+            # 时长未知 + 档位过滤严格 → 放行（与「检测失败默认放行」一致）
+            pass
+        else:
+            if max_ms is not None:
+                if bounds["max_eq"]:
+                    if dms > max_ms:
+                        return False
+                else:
+                    if dms >= max_ms:
+                        return False
+            if min_ms is not None:
+                if bounds["min_eq"]:
+                    if dms < min_ms:
+                        return False
+                else:
+                    if dms <= min_ms:
+                        return False
+    return True
+
+
+def _which_blocked(video: dict, conditions: dict) -> str:
+    """诊断视频被哪个客户端兜底条件拦截（v126 拉取日志用）。
+
+    与 `_match_conditions` 逻辑保持一致：按 title_regex / orientation /
+    publish_range / duration_range 顺序检查，返回首个不满足条件的可读字符串。
+    未拦截返回空串。
+
+    返回示例：
+        "title_regex(= '探店|测评')"
+        "orientation(需要 vertical, 实际 horizontal)"
+        "publish_range(需要 1d, 实际 2024-08-01 12:34)"
+        "duration_range(需要 lt1m, 时长 90.0s)"
+    """
+    pattern = conditions.get("title_regex", "").strip()
+    if pattern:
+        try:
+            text_pool = "\n".join(filter(None, [
+                video.get("title", "") or "",
+                video.get("desc", "") or "",
+                video.get("topics", "") or "",
+            ]))
+            if text_pool and not re.search(pattern, text_pool):
+                return f"title_regex(= {pattern!r})"
+        except re.error as e:  # noqa: PERF203 #96 silent → warning + set 防刷屏（同一 pattern 首处已记）
+            key = (pattern, str(e))
+            if key not in _RE_ERR_LOGGED:
+                _RE_ERR_LOGGED.add(key)
+                logger.warning(
+                    "[过滤条件] title_regex 编译失败 pattern={!r} err={}",
+                    pattern, e,
+                )
+    orientation = conditions.get("orientation", "")
+    if orientation:
+        vo = video.get("orientation")
+        if vo is None:
+            w, h = int(video.get("width") or 0), int(video.get("height") or 0)
+            if w and h:
+                vo = "horizontal" if w >= h else "vertical"
+        if vo and vo != orientation:
+            return f"orientation(需要 {orientation}, 实际 {vo})"
+    pr = conditions.get("publish_range") or "any"
+    days = PUBLISH_RANGE_OPTIONS.get(pr)
+    if days is not None:
+        ts = _parse_publish_ts(video.get("publish_time"))
+        if ts is not None and not _within_days(ts, days):
+            from datetime import datetime
+            try:
+                actual = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, OSError):
+                actual = str(ts)
+            return f"publish_range(需要 {pr}={days}天内, 实际 {actual})"
+    dr = conditions.get("duration_range") or "any"
+    bounds = DURATION_RANGE_OPTIONS.get(dr) or DURATION_RANGE_OPTIONS["any"]
+    if bounds["max"] is not None or bounds["min"] is not None:
+        dms = _parse_duration_ms(video.get("duration_ms"))
+        if dms is not None:
+            if bounds["max"] is not None:
+                over = (bounds["max_eq"] and dms > bounds["max"]) or (
+                    not bounds["max_eq"] and dms >= bounds["max"]
+                )
+                if over:
+                    return f"duration_range(需要 {dr}, 时长 {dms / 1000:.1f}s)"
+            if bounds["min"] is not None:
+                under = (bounds["min_eq"] and dms < bounds["min"]) or (
+                    not bounds["min_eq"] and dms <= bounds["min"]
+                )
+                if under:
+                    return f"duration_range(需要 {dr}, 时长 {dms / 1000:.1f}s)"
+    return ""
+
+
+def _parse_publish_ts(value) -> int | None:
+    """解析 publish_time 字段为毫秒时间戳；接受秒整数 / 毫秒整数 / ISO 字符串，失败返回 None。
+
+    抖音 create_time 接口统一为秒（实测），但保留毫秒兼容（> 10^12 视为毫秒）。
+    字符串纯数字走同样的秒/毫秒判定。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        n = int(value)
+        return n if n > 10**12 else n * 1000
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            from datetime import datetime
+            # ISO 字符串（抖音接口常见格式：2024-01-01 12:00:00 或 2024-01-01T12:00:00）
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+                try:
+                    return int(datetime.strptime(s[:19], fmt).timestamp() * 1000)
+                except ValueError:
+                    continue
+        except Exception:  # noqa: BLE001
+            return None
+        # 字符串纯数字：抖音默认秒，> 10^12 视为毫秒
+        try:
+            n = int(float(s))
+            return n if n > 10**12 else n * 1000
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _within_days(ts_ms: int, days: int) -> bool:
+    """发布时间是否在距今 N 天内（含 N 天边界）。"""
+    import time as _time
+    now_ms = int(_time.time() * 1000)
+    return ts_ms >= now_ms - days * 24 * 3600 * 1000
+
+
+def _parse_duration_ms(value) -> int | None:
+    """解析 duration_ms 字段（毫秒整数）；失败返回 None。"""
+    if value is None:
+        return None
+    try:
+        n = int(value)
+        return n if n > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
+    """视频入库后同步拉取其背景音轨入音乐库（未分类）。
+
+    仅下载抖音 music 节点的 play_url 直链（纯 BGM 源文件，不含作者人声）；
+    版权受限曲目无直链 → 直接跳过。同一首原声多视频共用 music.mid，按其去重。
+    任何失败只记日志，不影响视频入库结果。
+    """
+    m = video.get("music") or {}
+    url = m.get("download_url") or ""
+    if not url:
+        return
+    from app.db.utils import new_id
+    d = get_db()
+    music_id = m.get("music_id") or ""
+    # 按原声 ID 去重：同一首原声已入过库则跳过
+    if music_id and d.query_one(
+            "SELECT id FROM material WHERE source_ref=? AND deleted=0", (music_id,)):
+        return
+    material_id = new_id()
+    # 扩展名从直链提取，取不到默认 mp3
+    ext = ".mp3"
+    low = url.split("?")[0].lower()
+    for e in (".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"):
+        if low.endswith(e):
+            ext = e
+            break
+    save_path = _build_material_path("music", "", material_id, "", ext)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        client.download_video(url, str(save_path))
+    except BaseException:
+        # #P1-1：下载失败清理残文件，避免磁盘垃圾
+        save_path.unlink(missing_ok=True)
+        raise
+    md5 = _md5_of_file(save_path)
+    # MD5 兜底去重（music_id 缺失时同一文件可能重复入库）
+    if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
+        save_path.unlink(missing_ok=True)
+        return
+    # ffprobe 探测时长（失败回退接口给的 duration）
+    probe = extract_media_info(probe_media(str(save_path))) \
+        if save_path.stat().st_size > 1024 else {}
+    # 封面：#364 下载到 material/music/<date>/<id>/<id>_cover.<ext>
+    cover_url = m.get("cover_url") or ""
+    cover_ext = _infer_image_ext(cover_url, default=".webp")
+    cover_rel = ""
+    if cover_url:
+        from app.core.douyin.avatar_cache import download_to
+        cover_rel = download_to(cover_url, _build_material_cover_path("music", material_id, cover_ext))
+    d.insert("material", {
+        "id": material_id,
+        "title": m.get("title") or "未知原声",
+        "author_title": m.get("title"),
+        "type": "music",
+        "category_id": UNCATEGORIZED_ID,  # 入「未分类」虚拟分类
+        "file_size": save_path.stat().st_size,
+        "source_type": source_type,
+        "source_ref": music_id or None,
+        "file_md5": md5,
+        "file_path": str(save_path.relative_to(get_data_dir())).replace("\\", "/"),
+        "duration_ms": probe.get("duration_ms") or m.get("duration_ms") or None,
+        "author_nickname": m.get("author") or None,
+        # 音频直链落库（详情溯源展示；带签名会过期）
+        "download_url": url,
+        # 原声聚合页链接（#45：mid 拼接）
+        "share_url": m.get("share_url") or None,
+        # 音乐封面本地缓存相对路径（#43/#44）
+        "cover_url": cover_rel or None,
+    })
+    logger.info("[BGM] 已入库音轨「{}」（来源视频 {}）", m.get("title"), video.get("video_id"))
+
+
+# ---------- 单音乐统一处理（任务 #132：分享音乐链接入库）----------
+
+def _process_single_music(
+    music: dict,
+    category_id: str,
+    client,
+    *,
+    source: str = "share",
+) -> dict:
+    """单音乐统一处理：去重 → 下载音频 → 入音乐库（任务 #132）。
+
+    分享链接 `/music/{mid}` 解析后走此函数。music 字段来自 `_parse_music_info`：
+    - music_id / title / author / author_id / author_handle
+    - duration_ms / download_url / share_url / cover_url
+
+    返回:
+        {"action": "new"/"duplicate"/"failed", "material_id", "title", "reason"}
+    """
+    music_id = music.get("music_id") or ""
+    title = music.get("title") or "未知原声"
+
+    # 1) 去重（按 music_id；同一首原声已入过库则跳过）
+    if music_id:
+        d = get_db()
+        existing = d.query_one(
+            "SELECT id, title FROM material WHERE source_ref=? AND deleted=0", (music_id,))
+        if existing:
+            return {
+                "action": "duplicate",
+                "material_id": existing["id"],
+                "title": existing.get("title") or title,
+                "reason": f"已存在（素材：{existing['title']}）",
+            }
+
+    # 2) 下载音频 + 入库
+    try:
+        material_id = _download_music_ingest(music, category_id, client, source_type=source)
+    except DouyinClientError as e:
+        return {
+            "action": "failed",
+            "material_id": None,
+            "title": title,
+            "reason": f"抖音接口异常：{e}",
+        }
+    if not material_id:
+        return {
+            "action": "failed",
+            "material_id": None,
+            "title": title,
+            "reason": "音乐下载失败或入库异常",
+        }
+    return {
+        "action": "new",
+        "material_id": material_id,
+        "title": title,
+        "reason": None,
+    }
+
+
+def _download_music_ingest(music: dict, category_id: str, client,
+                          *, source_type: str = "share") -> str:
+    """下载音频并入音乐库（任务 #132）。
+
+    与 `_download_bgm` 的差异：
+    - 用途：分享链接直接入音乐库（非视频附属 BGM）
+    - 入库字段：author_nickname 用音乐作者（music.author）而非视频作者
+    - share_url 必填（原声聚合页链接）
+    """
+    from app.db.utils import new_id
+    from app.core.douyin.avatar_cache import cache_cover
+
+    music_id = music.get("music_id") or ""
+    title = music.get("title") or "未知原声"
+    download_url = music.get("download_url") or ""
+    if not download_url:
+        raise DouyinClientError("音乐直链为空，版权受限曲目无法下载")
+
+    # 扩展名从直链提取
+    ext = ".mp3"
+    low = download_url.split("?")[0].lower()
+    for e in (".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"):
+        if low.endswith(e):
+            ext = e
+            break
+
+    material_id = new_id()
+    save_path = _build_material_path("music", category_id, material_id, title, ext)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    # 复用 client.download_video（纯 HTTP UA+Referer，与 BGM 一致）
+    try:
+        client.download_video(download_url, str(save_path))
+    except BaseException:
+        # #P1-1：下载失败清理残文件
+        save_path.unlink(missing_ok=True)
+        raise
+
+    md5 = _md5_of_file(save_path)
+    # MD5 兜底去重
+    d = get_db()
+    if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
+        save_path.unlink(missing_ok=True)
+        return ""
+
+    # ffprobe 探测时长（失败回退接口给的 duration）
+    probe = extract_media_info(probe_media(str(save_path))) \
+        if save_path.stat().st_size > 1024 else {}
+
+    # 封面本地缓存（#364：下载到 material/music/<date>/<id>/<id>_cover.<ext>）
+    cover_url = music.get("cover_url") or ""
+    cover_rel = ""
+    if cover_url:
+        cover_ext = _infer_image_ext(cover_url, default=".webp")
+        from app.core.douyin.avatar_cache import download_to
+        cover_rel = download_to(cover_url, _build_material_cover_path("music", material_id, cover_ext))
+
+    d.insert("material", {
+        "id": material_id,
+        "title": title,
+        "author_title": title,
+        "type": "music",
+        "category_id": category_id,
+        "file_size": save_path.stat().st_size,
+        "source_type": source_type,
+        "source_ref": music_id or None,
+        "file_md5": md5,
+        "file_path": str(save_path.relative_to(get_data_dir())).replace("\\", "/"),
+        "duration_ms": probe.get("duration_ms") or music.get("duration_ms") or None,
+        # 任务 #132：音乐作者（非视频作者）
+        "author_nickname": music.get("author") or None,
+        "author_douyin_id": music.get("author_handle") or None,
+        # 音乐直链落库
+        "download_url": download_url,
+        # 原声聚合页链接
+        "share_url": music.get("share_url") or None,
+        # 音乐封面本地缓存
+        "cover_url": cover_rel or None,
+    })
+    logger.info("[音乐导入] 已入库音轨「{}」（music_id={}）", title, music_id)
+    return material_id
+
+
+def _download_and_ingest(video: dict, category_id: str, client,
+                         conditions: dict | None = None,
+                         source_type: str = "pull") -> str:
+    """下载视频并入库（拉取/分享共用）。
+
+    参数:
+        video: 统一视频字段 dict（client.search_videos / resolve_share 返回）
+        category_id: 入库分类
+        client: 抖音客户端
+        conditions: 拉取任务条件 dict（仅拉取任务传入，用于字幕/主播人脸过滤与 BGM 开关）；
+            分享导入场景传 None，跳过内容检测与 BGM。
+        source_type: 来源标记 pull（拉取任务）/ share（分享导入）
+    返回:
+        material_id；过滤命中时返回空串 ""（调用方据此计入 skip_count）。
+    """
+    from app.db.utils import new_id
+    from app.core.douyin.avatar_cache import cache_avatar, cache_cover
+    d = get_db()
+    material_id = new_id()
+    save_path = _build_material_path("video", category_id, material_id, video["title"], ".mp4")
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        client.download_video(video["download_url"], str(save_path))
+    except BaseException:
+        # #P1-1：下载失败清理残文件
+        save_path.unlink(missing_ok=True)
+        raise
+
+    # 内容检测（字幕/主播人脸）：下载后、入库前按需过滤；命中则清理下载文件后返回空串
+    need_subtitle = bool(conditions and conditions.get("filter_subtitle"))
+    need_face = bool(conditions and conditions.get("filter_face"))
+    if need_subtitle or need_face:
+        from app.core.media_inspect import inspect_video
+        try:
+            has_subtitle, has_face, sub_texts = inspect_video(
+                str(save_path), material_id,
+                need_subtitle=need_subtitle, need_face=need_face,
+            )
+            # v126 三态语义：
+            # - True  = 命中 → 拒绝入库
+            # - False = 未命中 → 放行
+            # - None  = 抽帧失败无法判定 → 严格拒绝（避免漏过滤）
+            if need_subtitle and has_subtitle is not False:
+                save_path.unlink(missing_ok=True)
+                reason = "命中字幕" if has_subtitle else "字幕检测抽帧失败"
+                if sub_texts:
+                    logger.info(
+                        "[过滤] 视频 {} {}，跳过入库 | 字幕内容: {}",
+                        video.get("video_id"), reason, sub_texts,
+                    )
+                else:
+                    logger.info("[过滤] 视频 {} {}，跳过入库", video.get("video_id"), reason)
+                return ""
+            if need_face and has_face is not False:
+                save_path.unlink(missing_ok=True)
+                reason = "命中主播人脸" if has_face else "人脸检测抽帧失败"
+                logger.info("[过滤] 视频 {} {}，跳过入库", video.get("video_id"), reason)
+                return ""
+        except Exception as e:  # noqa: BLE001
+            # 检测异常默认放行，不阻断主流程
+            logger.warning("[内容检测] 异常，默认放行：{}", e)
+
+    md5 = _md5_of_file(save_path)
+    # ffprobe 探测（失败字段置空，F-03-R2）
+    probe = extract_media_info(probe_media(str(save_path))) if save_path.stat().st_size > 1024 else {}
+    # 封面：优先本地抽帧（分辨率=视频原生分辨率，与预览一致）；CDN 封面作兜底
+    cover_rel = _extract_local_cover(save_path, material_id, "video")
+    if not cover_rel:
+        # #364：CDN 兜底封面下载到 material/video/<date>/<id>/<id>_cover.<ext>
+        from app.core.douyin.avatar_cache import download_to
+        cover_url = video.get("cover_url", "")
+        if cover_url:
+            cover_ext = _infer_image_ext(cover_url, default=".webp")
+            cover_rel = download_to(cover_url, _build_material_cover_path("video", material_id, cover_ext))
+    # #364：作者头像下载到 material/video/<date>/<id>/<id>_avatar.<ext>
+    avatar_url = video.get("author_avatar", "")
+    avatar_rel = ""
+    if avatar_url:
+        avatar_ext = _infer_image_ext(avatar_url, default=".webp")
+        from app.core.douyin.avatar_cache import download_to
+        avatar_rel = download_to(avatar_url, _build_material_avatar_path("video", material_id, avatar_ext))
+    d.insert("material", {
+        "id": material_id,
+        "title": video["title"],
+        "type": "video",
+        "category_id": category_id,
+        "file_size": save_path.stat().st_size,
+        "source_type": source_type,
+        "source_ref": video["video_id"],
+        "file_md5": md5,
+        "file_path": str(save_path.relative_to(get_data_dir())).replace("\\", "/"),
+        "duration_ms": probe.get("duration_ms") or video.get("duration_ms"),
+        "orientation": probe.get("orientation") or video.get("orientation"),
+        "resolution": probe.get("width") and probe.get("height")
+                      and f"{probe['width']}x{probe['height']}" or video.get("resolution"),
+        # 出处信息（详情展示：作者/原视频/下载直链/封面）
+        "author_nickname": video.get("author_nickname") or None,
+        "author_douyin_id": video.get("author_douyin_id") or None,
+        "author_title": video.get("author_title") or video.get("title") or None,
+        "share_url": video.get("share_url") or None,
+        "download_url": video.get("download_url") or None,
+        "cover_url": cover_rel or None,
+        # 出处补充（v6：头像 + 互动快照 + 发布时间）
+        "author_avatar": avatar_rel or None,
+        # 作者增强（v10：主页 sec_uid + 简介 + 粉丝/获赞）
+        "author_sec_uid": video.get("author_sec_uid") or None,
+        "author_signature": video.get("author_signature") or None,
+        "author_follower_count": video.get("author_follower_count") or 0,
+        "author_total_favorited": video.get("author_total_favorited") or 0,
+        "digg_count": video.get("digg_count") or 0,
+        "comment_count": video.get("comment_count") or 0,
+        "collect_count": video.get("collect_count") or 0,
+        "share_count": video.get("share_count") or 0,
+        "publish_time": video.get("publish_time") or None,
+    })
+    # 背景音轨同步入库：仅拉取任务且 fetch_bgm=True 时执行
+    fetch_bgm = bool(conditions.get("fetch_bgm")) if conditions else False
+    if fetch_bgm:
+        try:
+            _download_bgm(video, client, source_type)
+        except Exception as e:  # noqa: BLE001 BGM 属附加产物，任何失败静默降级
+            logger.warning("[BGM] 音轨拉取失败（视频 {}）：{}", video.get("video_id"), str(e)[:200])
+    return material_id
+
+
+def _write_pull_log(task_id: str, new_count: int, skip_count: int, fail_reason: str) -> None:
+    """视频拉取执行日志。"""
+    get_db().insert("video_pull_log", {
+        "task_id": task_id, "run_time": now_str(), "new_count": new_count,
+        "skip_count": skip_count, "fail_reason": fail_reason or None})
+
+
+# ---------- 单视频统一处理（任务 #130 / #131）----------
+
+def _process_single_video(
+    video: dict,
+    category_id: str,
+    client,
+    *,
+    source: str,
+    conditions: dict | None = None,
+    cookie: str = "",
+    account_id: str = "",   # #P0-8：拉取侧补抓详情走 storage_state 路径
+) -> dict:
+    """单视频统一处理：拉取侧补抓详情 → 客户端兜底过滤 → 去重 → 下载入库。
+
+    任务 #131：拉取/分享统一走浏览器抓 detail。
+    - 拉取（source='pull'）：video 来自搜索接口（_parse_search_item 输出，author 字段不全
+      无粉丝/获赞），客户端按 desc/title/topics 做初筛（title_regex/orientation/
+      publish_range/duration_range），通过后调 client._fetch_aweme_detail 重抓补全字段
+      （含 author.follower_count/total_favorited）。
+    - 分享（source='share'）：video 来自 _fetch_aweme_detail（已是完整 54 字段 author），
+      conditions=None 跳过所有过滤，直接下载入库。
+
+    参数:
+        video: 统一视频字段 dict
+        category_id: 入库分类 ID
+        client: 抖音客户端（提供 _fetch_aweme_detail 公共方法）
+        source: 'pull' / 'share'
+        conditions: 拉取条件 dict（仅拉取侧传入）
+        cookie: 拉取账号 cookie（拉取侧补抓详情用；分享侧用 _share_cookie 自取）
+    返回:
+        {"action": "new"/"filtered"/"duplicate"/"failed", "material_id", "title", "reason"}
+    """
+    # 1) 客户端兜底过滤（仅拉取侧；分享侧 conditions=None 跳过）
+    if conditions is not None and not _match_conditions(video, conditions):
+        return {
+            "action": "filtered",
+            "material_id": None,
+            "title": video.get("title", ""),
+            "reason": _which_blocked(video, conditions) or "客户端兜底",
+        }
+    # 2) 去重（用 video_id 直接判；detail 抓取前先短路，避免无谓开浏览器）
+    dup = _duplicate_check(video["video_id"], "")
+    if dup:
+        return {
+            "action": "duplicate",
+            "material_id": dup["id"],
+            "title": dup.get("title", ""),
+            "reason": f"已存在（素材：{dup['title']}）",
+        }
+    # 3) 任务 #131：拉取侧补抓详情（拿完整 author 字段 + 准确 download_url）。
+    #    分享侧 video 已是 detail 输出（含 _source='detail'），跳过。
+    # #P0-8：传 account_id 让 _fetch_aweme_detail 走 storage_state 路径
+    if source == "pull" and video.get("_source") != "detail":
+        try:
+            video = client._fetch_aweme_detail(video["video_id"], cookie, account_id=account_id)
+        except DouyinClientError as e:
+            return {
+                "action": "failed",
+                "material_id": None,
+                "title": video.get("title", ""),
+                "reason": f"详情抓取失败：{e}",
+            }
+    # 4) 下载 + 内容过滤 + 入库
+    try:
+        material_id = _download_and_ingest(
+            video, category_id, client, conditions, source_type=source)
+    except DouyinClientError as e:
+        return {
+            "action": "failed",
+            "material_id": None,
+            "title": video.get("title", ""),
+            "reason": f"抖音接口异常：{e}",
+        }
+    # _download_and_ingest 内部字幕/人脸命中或抽帧失败时返空串（计入过滤）
+    if not material_id:
+        return {
+            "action": "filtered",
+            "material_id": None,
+            "title": video.get("title", ""),
+            "reason": "内容过滤命中（字幕/主播人脸）或抽帧失败",
+        }
+    return {
+        "action": "new",
+        "material_id": material_id,
+        "title": video.get("title", ""),
+        "reason": None,
+    }
+
+
+def run_pull_task_now(task_id: str) -> str:
+    """手动触发一轮视频拉取。"""
+    # PR2 #55：type 改为 video_pull；name 取 video_pull_task.task_name（任务被删时回退"未命名任务"）。
+    row = get_db().query_one("SELECT task_name FROM video_pull_task WHERE id=?", (task_id,))
+    name = row["task_name"] if row else "未命名任务"
+    bg_task_id = task_service.submit(
+        "video_pull", name,
+        lambda info: _run_pull_round(task_id, info))
+    # 任务 #133：手动触发也写 bg_task_id，删除时可取消
+    try:
+        get_db().execute(
+            "UPDATE video_pull_task SET bg_task_id=? WHERE id=?",
+            (bg_task_id, task_id))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[拉取任务] 手动触发写 bg_task_id 失败 {}：{}", task_id, e)
+    return bg_task_id
+
+
+# ---------- 分享链接导入（F-03.3） ----------
+
+def import_share_links(share_texts: list[str], category_id: str) -> dict:
+    """批量解析分享链接入库（同步执行，逐条结果反馈）。
+
+    任务 #130：与异步分享导入共用 _process_single_video(source='share', conditions=None)，
+    行为完全对齐：跳过客户端兜底 + 字幕/人脸过滤 + BGM 同步。
+    任务 #132：分享链接兼容视频/音乐，按 _source 分流到 _process_single_video 或
+    _process_single_music。
+    任务 #111：按分类 type 分流——音乐分类下导入视频链接时，从 video.music 节点
+    提取 BGM 入音乐库。
+
+    返回:
+        {"results": [{"share_text", "ok", "message", "material_id"}], "success": n, "failed": n}
+    """
+    d = get_db()
+    # 允许 UNCATEGORIZED_ID 作为入库目标（虚拟分类）；其他必须存在且为视频/音乐
+    if category_id != UNCATEGORIZED_ID:
+        cat = d.query_one(
+            "SELECT id, type FROM material_category WHERE id=? AND deleted=0",
+            (category_id,))
+        if not cat:
+            raise ValueError("入库分类不存在")
+        if cat["type"] not in ("video", "music"):
+            raise ValueError("入库分类类型必须为视频或音乐")
+        category_type = cat["type"]
+    else:
+        # 未分类：根据 type 参数决定实体类型（material_service.import_share_links 没有 type 参数，
+        # 调用方应保证入参为 video/music；此处默认 video 兼容既有调用）
+        category_type = "video"
+    client = get_douyin_client()
+    results = []
+    for text in share_texts:
+        text = text.strip()
+        if not text:
+            continue
+        try:
+            resolved = client.resolve_share(text)
+            source = resolved.get("_source") or ""
+            # 任务 #111 + #132：按分类类型 × 实体类型组合分流
+            if category_type == "music" and source == "detail":
+                # 音乐分类 + 视频链接 → 提取视频 BGM 入音乐库
+                music = resolved.get("music") or {}
+                if not music.get("download_url"):
+                    raise DouyinClientError(
+                        "视频无可用背景音乐（版权受限或无 BGM），无法导入音乐分类")
+                result = _process_single_music(music, category_id, client, source="share")
+            elif source == "music_detail":
+                if category_type != "music":
+                    raise DouyinClientError(
+                        f"分类类型为 {category_type}，与音乐分享链接不匹配（应在音乐分类下导入）")
+                result = _process_single_music(resolved, category_id, client, source="share")
+            else:
+                if category_type != "video":
+                    raise DouyinClientError(
+                        f"分类类型为 {category_type}，与视频分享链接不匹配（应在视频分类下导入）")
+                result = _process_single_video(
+                    resolved, category_id, client,
+                    source="share", conditions=None,
+                )
+            action = result["action"]
+            if action == "new":
+                results.append({"share_text": text[:50], "ok": True,
+                                "message": result["title"], "material_id": result["material_id"]})
+            else:
+                # filtered / duplicate / failed → 全部归为 failed 给前端
+                results.append({"share_text": text[:50], "ok": False,
+                                "message": result.get("reason") or "未知失败",
+                                "material_id": result.get("material_id")})
+        except DouyinClientError as e:
+            # 客户端层错误（解析失败/风控/Cookie 失效等）：记录失败原文与原因，便于排障
+            logger.warning("[分享导入] 失败 text={!r}：{}", text[:80], e)
+            results.append({"share_text": text[:50], "ok": False, "message": str(e), "material_id": None})
+        except Exception as e:  # noqa: BLE001
+            # 未知异常：全栈记录（下载/入库/探测等环节出错）
+            logger.exception("[分享导入] 未知异常 text={!r}", text[:80])
+            results.append({"share_text": text[:50], "ok": False, "message": str(e), "material_id": None})
+    return {
+        "results": results,
+        "success": len([r for r in results if r["ok"]]),
+        "failed": len([r for r in results if not r["ok"]]),
+    }
+
+
+# ---------- 本地上传（F-03.4） ----------
+
+def upload_files(file_paths: list[str], category_id: str) -> dict:
+    """上传本地文件入库：白名单过滤 → 复制到 data/material → MD5 去重 → 探测入库。
+
+    返回:
+        {"results": [...], "success": n, "failed": n}
+    """
+    results = []
+    for raw in file_paths:
+        results.append(_upload_single_file(raw, category_id))
+    return {
+        "results": results,
+        "success": len([r for r in results if r["ok"]]),
+        "failed": len([r for r in results if not r["ok"]]),
+    }
+
+
+def _upload_single_file(raw: str, category_id: str) -> dict:
+    """单文件上传入库（供同步上传与异步任务共用）。
+
+    返回:
+        {"file", "ok", "message", "material_id"}
+    """
+    from app.db.utils import new_id
+    d = get_db()
+    # 允许 UNCATEGORIZED_ID 作为入库目标（虚拟分类）；其他必须存在
+    if category_id != UNCATEGORIZED_ID:
+        cat = d.query_one("SELECT * FROM material_category WHERE id=? AND deleted=0", (category_id,))
+        if not cat:
+            raise ValueError("分类不存在")
+        material_type = cat["type"]
+    else:
+        # 未分类入库：按文件扩展名推断类型
+        ext_lower = Path(raw).suffix.lower()
+        if ext_lower in VIDEO_EXTS:
+            material_type = "video"
+        elif ext_lower in MUSIC_EXTS:
+            material_type = "music"
+        else:
+            return {"file": Path(raw).name, "ok": False,
+                    "message": f"不支持的格式 {ext_lower}", "material_id": None}
+    src = Path(raw)
+    if not src.exists():
+        return {"file": src.name, "ok": False, "message": "文件不存在", "material_id": None}
+    ext = src.suffix.lower()
+    if (material_type == "video" and ext not in VIDEO_EXTS) or \
+       (material_type == "music" and ext not in MUSIC_EXTS):
+        return {"file": src.name, "ok": False, "message": f"不支持的格式 {ext}", "material_id": None}
+    md5 = _md5_of_file(src)
+    dup = _duplicate_check(None, md5)
+    if dup:
+        return {"file": src.name, "ok": False,
+                "message": f"已存在（素材：{dup['title']}）", "material_id": dup["id"]}
+    material_id = new_id()
+    dest = _build_material_path(material_type, category_id, material_id, src.stem, ext)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    _probe_and_save(material_id, src.stem, material_type, category_id, dest,
+                    "upload", None, None, md5)
+    # 视频上传：抽取本地帧作为封面（与拉取/分享来源保持一致）
+    if material_type == "video":
+        cover_rel = _extract_local_cover(dest, material_id, "video")
+        if cover_rel:
+            d.execute("UPDATE material SET cover_url=? WHERE id=?", (cover_rel, material_id))
+    return {"file": src.name, "ok": True, "message": "入库成功", "material_id": material_id}
+
+
+# ---------- 素材列表与维护（F-03.5 / F-03.6 / F-03-R8） ----------
+
+def list_materials(filters: dict, page: int = 1, page_size: int = 20) -> dict:
+    """素材分页列表：类型/分类（含子孙）/来源/时长/大小/分辨率/关键词/时间筛选。"""
+    d = get_db()
+    where = "WHERE m.deleted=0"
+    params: list = []
+    if filters.get("type"):
+        where += " AND m.type=?"
+        params.append(filters["type"])
+    if filters.get("category_id"):
+        # "未分类"为虚拟节点（id='-'，DB 中不存记录）
+        if filters["category_id"] == UNCATEGORIZED_ID:
+            where += " AND m.category_id=?"
+            params.append(UNCATEGORIZED_ID)
+        else:
+            # 含子孙分类
+            cat_ids = _subtree_ids(filters["category_id"])
+            where += f" AND m.category_id IN ({','.join('?' * len(cat_ids))})"
+            params.extend(cat_ids)
+    if filters.get("source_type"):
+        where += " AND m.source_type=?"
+        params.append(filters["source_type"])
+    if filters.get("file_status"):
+        where += " AND m.file_status=?"
+        params.append(filters["file_status"])
+    if filters.get("keyword"):
+        where += " AND m.title LIKE ?"
+        params.append(f"%{filters['keyword']}%")
+    if filters.get("orientation"):
+        where += " AND m.orientation=?"
+        params.append(filters["orientation"])
+    return d.query_page(
+        f"""SELECT m.*,
+                   COALESCE(c.name, CASE WHEN m.category_id=? THEN '未分类' END) AS category_name
+            FROM material m
+            LEFT JOIN material_category c ON m.category_id=c.id
+            {where} ORDER BY m.create_time DESC""",
+        (UNCATEGORIZED_ID, *params), page, page_size)
+
+
+def _subtree_ids(category_id: str) -> list[str]:
+    """分类及全部子孙 ID。"""
+    d = get_db()
+    ids = [category_id]
+    frontier = [category_id]
+    while frontier:
+        marks = ",".join("?" * len(frontier))
+        rows = d.query_all(f"SELECT id FROM material_category WHERE parent_id IN ({marks}) AND deleted=0",
+                           tuple(frontier))
+        frontier = [r["id"] for r in rows]
+        ids.extend(frontier)
+    return ids
+
+
+def update_material(material_id: str, title: str | None, category_id: str | None) -> None:
+    """素材重命名/移动分类。"""
+    fields: dict = {}
+    if title is not None:
+        fields["title"] = title
+    if category_id is not None:
+        # 允许 UNCATEGORIZED_ID（合法语义「移动到未分类」）；其他必须存在于 material_category
+        if category_id != UNCATEGORIZED_ID:
+            d = get_db()
+            if not d.query_one(
+                    "SELECT id FROM material_category WHERE id=? AND deleted=0",
+                    (category_id,)):
+                raise ValueError("分类不存在")
+        fields["category_id"] = category_id
+    if fields:
+        get_db().update_by_id("material", material_id, fields)
+
+
+def delete_material(material_id: str, keep_file: bool = False) -> None:
+    """删除素材（引用提示由前端承担；引用处置为素材缺失占位）。"""
+    d = get_db()
+    row = d.query_one("SELECT file_path FROM material WHERE id=? AND deleted=0", (material_id,))
+    if not row:
+        raise ValueError("素材不存在")
+    # 片段/BGM 引用处置：引用记录保留（生成时校验文件存在性，缺失跳过）
+    d.soft_delete_by_id("material", material_id)
+    if not keep_file:
+        f = get_data_dir() / row["file_path"]
+        f.unlink(missing_ok=True)
+
+
+def relocate_material(material_id: str, new_abs_path: str) -> None:
+    """素材缺失后重新定位文件（F-03-R8）。"""
+    d = get_db()
+    p = Path(new_abs_path)
+    if not p.exists():
+        raise ValueError("新路径文件不存在")
+    try:
+        rel = str(p.relative_to(get_data_dir())).replace("\\", "/")
+    except ValueError:
+        raise ValueError("新路径必须在 data 目录内（素材统一管理）")
+    d.update_by_id("material", material_id, {
+        "file_path": rel, "file_status": "normal",
+        "file_size": p.stat().st_size})
+
+
+def full_path_of(material: dict) -> Path:
+    """素材相对路径转绝对路径。"""
+    return get_data_dir() / material["file_path"]
+
+
+def get_material(material_id: str) -> dict | None:
+    """按 ID 取素材记录（未删除）。"""
+    return get_db().query_one("SELECT * FROM material WHERE id=? AND deleted=0", (material_id,))
+
+
+# ---------- 路径迁移（#364：素材按 ID 子目录聚合） ----------
+
+def migrate_material_paths_to_id_subdir() -> dict:
+    """#364 一次性迁移：素材按 id 子目录聚合。
+
+    触发：
+    - 视频文件 `material/<type>/<date>/<id>.<ext>` → `material/<type>/<date>/<id>/<id>.<ext>`
+    - DB `cover_url` 仍指向 `cache/cover/<id>...` → 搬移到 `material/<type>/<date>/<id>/<id>_cover.<ext>` 并回写
+    - DB `author_avatar` 指向 `cache/avatar/<key>...` → 搬移到 `material/<type>/<date>/<id>/<id>_avatar.<ext>` 并回写
+
+    date 取 material.create_time 的 yyyyMMdd 部分。文件不存在时仅更新 DB。
+    """
+    import os
+    d = get_db()
+    data_dir = get_data_dir()
+    moved = 0
+    updated = 0
+    for m in d.query_all(
+        "SELECT id, type, file_path, cover_url, author_avatar, create_time "
+        "FROM material WHERE deleted=0"
+    ):
+        mid = m["id"]
+        mtype = m["type"] or "video"
+        date = (m["create_time"] or "")[:10].replace("-", "")
+
+        # 1) 视频文件：旧 `material/<type>/<date>/<id>.<ext>`（无 /<id>/ 子目录层）→ 新
+        old_fp = (m["file_path"] or "").replace("\\", "/")
+        if old_fp.startswith(f"material/{mtype}/"):
+            parts = old_fp.split("/")
+            # material/<type>/<date>/<id>.<ext>  ->  parts = [material, type, date, "id.ext"] (len=4)
+            if len(parts) == 4 and not parts[3].startswith(f"{mid}/"):
+                src = data_dir / old_fp
+                if src.is_file():
+                    ext = src.suffix
+                    new_fp = f"material/{mtype}/{date}/{mid}/{mid}{ext}"
+                    dst = data_dir / new_fp
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(src, dst)
+                    d.update_by_id("material", mid, {"file_path": new_fp})
+                    moved += 1
+                    updated += 1
+
+        # 2) cover_url 旧 cache/cover/<id>...<ext> → 新 material/<type>/<date>/<id>/<id>_cover.<ext>
+        old_cover = (m["cover_url"] or "").replace("\\", "/")
+        if old_cover.startswith("cache/cover/"):
+            src = data_dir / old_cover
+            if src.is_file():
+                ext = src.suffix
+                new_cover = f"material/{mtype}/{date}/{mid}/{mid}_cover{ext}"
+                dst = data_dir / new_cover
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(src, dst)
+                d.update_by_id("material", mid, {"cover_url": new_cover})
+                moved += 1
+                updated += 1
+
+        # 3) author_avatar 旧 cache/avatar/<key>...<ext> → 新 material/<type>/<date>/<id>/<id>_avatar.<ext>
+        old_avatar = (m["author_avatar"] or "").replace("\\", "/")
+        if old_avatar.startswith("cache/avatar/"):
+            src = data_dir / old_avatar
+            if src.is_file():
+                ext = src.suffix
+                new_avatar = f"material/{mtype}/{date}/{mid}/{mid}_avatar{ext}"
+                dst = data_dir / new_avatar
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(src, dst)
+                d.update_by_id("material", mid, {"author_avatar": new_avatar})
+                moved += 1
+                updated += 1
+
+    return {"moved_files": moved, "updated_rows": updated}

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+
+# 运行时数据（不进版本库）
+data/
+
+# FFmpeg 二进制（体积大，本地放置）
+assets/ffmpeg/*.exe

@@ -1,0 +1,59 @@
+# 运行数据
+backend/data/
+# 依赖与产物
+node_modules/
+backend/build/
+backend/dist/
+frontend/dist/
+frontend/release/
+__pycache__/
+*.py[cod]
+# FFmpeg 二进制
+backend/assets/ffmpeg/*.exe
+
+# ============ PR3 安全：账号凭据与持久化绝不能进库 ============
+# 真实 cookie 凭据（开发注入用，绝不提交）
+inject_cookie.js
+sh.exe.stackdump
+# Chromium profile：含视频平台登录 cookie + IndexedDB
+# （tests/account_isolation/ 已清理；保留注释说明历史）
+# 真实账号 session 数据
+# （tests/account_isolation/_real_data _real_two 已被清理）
+
+# 应用配置目录：加密密钥 + 用户偏好（含本地数据目录路径 / 业务路径）
+# 仓库只保留 .gitkeep 占位；首次部署由 setting_service.init_app_dirs() 自动生成
+/backend/config/.key
+/backend/config/settings.json
+/backend/config/settings.json.bak
+/backend/config/*.bak
+
+# ============ 调试残留（散落根目录的临时文件） ============
+# 调试 JSON 快照（含真实业务 ID）
+/c1.json
+/d.json
+/empty.json
+/long.json
+/p.json
+/r.json
+/r2.txt
+/response.txt
+# 散落的截图（step* / verify* / test-app-* / tooltip-*）
+/step*.png
+/verify*.png
+/test-app-*.png
+/tooltip-*.png
+# 临时目录
+.tmp/
+.playwright-mcp/
+
+# pytest 缓存
+backend/.pytest_cache/
+# backend 根目录调试残留（已清理 2026-09-29）
+/backend/*.bak
+/backend/test_*.jpeg
+/backend/test_*.db
+/backend/dev_test.log
+/backend/test_out.log
+/backend/seed_*.sql
+/backend/v33_ddl.txt
+/backend/data_test/
