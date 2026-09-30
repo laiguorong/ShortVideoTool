@@ -765,26 +765,28 @@ def _run_pull_round(task_id: str, info) -> str:
     detail_processed = 0
 
     def _write_progress() -> None:
-        """统一写入 progress 模板（多处调用：入循环前 / keepalive 10s / 阶段 B 每条完成 / 4 个 except 块）。
+        """统一写入 progress 模板（多处调用：入循环前 / 阶段 B 完成 / 4 个 except 块）。
 
-        阶段感知：
-        - 阶段 A（搜索）：keepalive 期间仍走搜索模板（翻页采集中...），
-          避免「拉取中：已入库 0，跳过 0」误导用户以为已开始处理视频
-        - 阶段 B（下载）：拉取中模板（已入库 X，跳过 Y，与 DB 字段同源）
-        阶段 B 内部自带 ETA 模板（_fmt_progress）不调此函数。
+        阶段感知（与 _keepalive_loop 配合）：
+        - 阶段 A（搜索）：keepalive 每 10s 调一次，写「翻页采集中...」模板
+          （覆盖 _on_scroll_progress 写入的「已抓到 N 页」详细模板——这是设计
+          意图：让用户在翻页慢或无 XHR 时感知「采集中」）。
+        - 阶段 B（下载）：keepalive 不调（避免覆盖 _fmt_progress 写入的
+          「下载第 X/N 个 详情抓取中」详细模板）。本函数在阶段 B 仅作兜底
+          ——progress 为空时（异常路径）初始化拉取中模板，确保前端有显示。
         错误细节走 info.message（不在 progress 里混错误类型，避免模板撕裂）。
 
         拦截计数用 skip_count（与 _write_pull_log 写入 DB 的字段一致）：
-        - 旧版 progress 文案用「intercept_count」（字幕/人脸/抽帧命中子集），
-          与 DB skip_count 字段不同源 → 「progress 8 vs DB 11」错位
         - skip_count 是超集（filtered + duplicate + failed 三类拒绝），与 DB 字段同源
         - 进度显示与 DB 记录必须同源，避免语义错位
         """
         elapsed = int(time.time() - round_start)
         if _search_phase_active.is_set():
-            # 阶段 A：keepalive 仅刷新用时，不覆盖搜索回调写入的更详细 progress
+            # 阶段 A：写入「翻页采集中」模板（含已用时）
             info.progress = _progress_phase_a_idle(elapsed)
-        else:
+        # 阶段 B：不覆盖 _fmt_progress 写入的详细模板
+        # 兜底：info.progress 为空时写入拉取中模板（防止前端显示空 progress）
+        elif not info.progress:
             info.progress = _progress_phase_b(new_count, skip_count, elapsed)
 
     # 阶段标记：_write_progress 感知当前阶段切换模板。
@@ -805,6 +807,8 @@ def _run_pull_round(task_id: str, info) -> str:
     # 用户在状态栏看不到「用时」数字递增会误判卡死。
     # keepalive daemon 每 10s 调一次 _write_progress()，仅刷新「用时」字段，
     # 让用户感知任务还活着。worker 退出时通过 _keepalive_stop 通知停止。
+    # 阶段 B 时不调 _write_progress（避免覆盖 _fmt_progress 写入的
+    # 「下载第 X/N 个 详情抓取中」详细模板，让用户看到当前在做什么）。
     _keepalive_stop = threading.Event()
     def _keepalive_loop() -> None:
         while not _keepalive_stop.is_set():
@@ -812,7 +816,10 @@ def _run_pull_round(task_id: str, info) -> str:
             if _keepalive_stop.wait(10):
                 break
             try:
-                _write_progress()
+                # 阶段 A 调 _write_progress 刷新用时；
+                # 阶段 B 不调（_fmt_progress 每次循环都更新 progress 含已用时）
+                if _search_phase_active.is_set():
+                    _write_progress()
             except Exception as exc:  # noqa: BLE001
                 # daemon 异常属于「状态栏停止刷新」的用户体验降级场景，用 warning 留痕
                 # （debug 默认不输出，等于没留痕）。daemon 在 worker 退出但 stop 尚未生效的
