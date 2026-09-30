@@ -34,10 +34,14 @@
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import quote as _url_quote
 
 from loguru import logger
+
+# browser_actor 模块级 import 安全：browser.py 不引用 search_api，
+# 无循环 import 风险。__init__ 用其 _resolve_headless 读 browser_show_window 配置。
+from app.core.douyin.browser import browser_actor
 
 
 class SearchBlockedError(Exception):
@@ -56,7 +60,13 @@ class BrowserSearchSession:
     - material_service 每页 search 前 new + close 一次，避免与 detail 路径冲突
     """
 
-    def __init__(self, profile_dir: Path, headless: bool = True):
+    def __init__(self, profile_dir: Path, headless: Optional[bool] = None):
+        # #589 任务配套：素材拉取阶段 A 默认读系统设置 browser_show_window
+        # 与 detail 路径（BrowserActor._resolve_headless）保持一致，
+        # 让用户设置「显示浏览器窗口」时素材拉取也能弹出窗口便于观察。
+        # 显式传 True/False 则覆盖配置（便于测试 / 强制无头）。
+        if headless is None:
+            headless = browser_actor._resolve_headless(None)
         self._profile_dir = str(profile_dir)
         self._headless = headless
         self._pw = None              # SyncPlaywright 实例
@@ -65,6 +75,12 @@ class BrowserSearchSession:
         self._page = None
         # 当前页捕获的响应列表（每次 search_page 入口清空 + 复用同一监听器写入）
         self._captured: list[dict] = []
+        # 跨 search（含 material_service retry 路径）总累计页数：
+        # search_all_for_ids 入口 _captured.clear() 会丢失上一轮页数；
+        # material_service 拉取循环 retry 时复用同一 session，
+        # 这里在 search 出口 += len(_captured) 累加跨轮计数（retry 真实总页数）。
+        # 终态 progress 用此字段（不是 len(_captured) 单轮值）反映 retry 后真实页数。
+        self._total_captured_pages: int = 0
         # 2026-09-30 翻页改造：记录当前已搜索的 keyword，跨页复用避免每页重新 fill+Enter
         # （如果 material_service 跨页复用 session 即可生效；现在每页 close+rebuild
         # 模式下此字段总是被 reset，每次 search_page 都会重新 fill+Enter 触发首屏）
@@ -254,7 +270,7 @@ class BrowserSearchSession:
         round_settle_ms: int = 1500,
         wheel_interval_ms: int = 150,
         *,
-        progress_cb: Optional["Callable[[int, int], None]"] = None,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> int:
         """v5 wheel 真实滚动翻页：mouse.wheel 触发 React 内部 fetch（自带签名）。
 
@@ -312,13 +328,16 @@ class BrowserSearchSession:
                 # 任务 #589：实时进度回调，外层 worker 据此刷新 info.progress
                 if progress_cb is not None:
                     try:
+                        # re-sum 而非增量累加：max_pages≤50 时单次 O(n) 可忽略；
+                        # 换来容错性（万一 listener 漏抓可自愈累计值）
                         total_pages = len(self._captured) - start_count
                         total_videos = sum(
                             self._sum_aweme_in_body(b) for b in self._captured[start_count:]
                         )
                         progress_cb(total_pages, total_videos)
                     except Exception:  # noqa: BLE001 回调异常不影响翻页主流程
-                        pass
+                        # debug 留 trace，便于排查回调里真正的 bug
+                        logger.debug("进度回调异常", exc_info=True)
                 # 终止条件（通俗）
                 if has_more == 0:
                     logger.info("[搜索翻页] 没有更多视频了，停止翻页")
@@ -538,7 +557,7 @@ class BrowserSearchSession:
         max_pages: int = 50,
         *,
         debug: bool = False,
-        progress_cb: Optional["Callable[[int, int], None]"] = None,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> list[str]:
         """507 改造：搜索 + 筛选 + 翻页一次拿完，返回去重后的 aweme_id 列表。
 
@@ -595,6 +614,9 @@ class BrowserSearchSession:
         logger.info(
             "[搜索] 搜索完成，共抓取 {} 条不重复视频", len(ids),
         )
+        # 跨 search 累计页数（入口 _captured.clear() 会丢上轮，所以出口累加）。
+        # material_service 终态 progress 用此字段反映 retry 后真实总页数。
+        self._total_captured_pages += len(self._captured)
         return ids
 
     def _diag_context(self) -> str:
