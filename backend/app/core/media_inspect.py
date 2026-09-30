@@ -43,6 +43,25 @@ _MAX_FRAMES = 120
 # 任务 #128 优化6：流式分批 + 命中早停。每 5s 一批：短视频 1 批可拦；长视频平均砍半耗时。
 _STREAM_BATCH_S = 5.0
 
+
+class VideoCorruptedError(Exception):
+    """视频文件损坏（ffprobe 探测失败：moov atom not found / Invalid data 等）。
+
+    inspect_video 在抽帧前用 ffprobe 探测时长，探测失败即抛本异常。
+    调用方收到后应视为「文件不可用」拒绝入库，不进入抽帧循环（避免无效 ffmpeg 调用）。
+    """
+
+
+class VideoNoStreamError(Exception):
+    """视频文件无视频流（纯音频伪装 mp4 / m4a 误标 .mp4 等）。
+
+    ffprobe 探测成功且有时长字段，但 streams 全是 audio / subtitle / data，
+    没有 codec_type=video。抽帧必然全部 -22 失败（image2 muxer 无 stream 可写）。
+
+    inspect_video 在抽帧前识别抛本异常，跳过抽帧循环直接拒绝入库，
+    节省 100+ 次无效 ffmpeg 调用，同时避免 retry stderr 日志刷屏。
+    """
+
 # 单次抽帧超时（秒）
 _FRAME_TIMEOUT = 15
 
@@ -76,13 +95,36 @@ def _inspect_dir(material_id: str) -> Path:
     return base
 
 
-def _probe_duration_seconds(video_path: str) -> float:
-    """探测视频时长（秒），用于推导抽帧总数；失败返回 0。"""
+def _probe_video_metadata(video_path: str) -> Tuple[float, bool]:
+    """探测视频元数据（时长 + 是否含视频流），用于推导抽帧总数 + 抽帧前置检查。
+
+    一次 ffprobe 同时校验时长与视频流，避免纯音频伪装 mp4 触发 100+ 次 ffmpeg 失败。
+
+    返回:
+        (duration_s, has_video_stream) — 都成功才返回。
+    异常:
+        VideoCorruptedError - ffprobe 失败 / 无 metadata 时长
+            （moov atom not found / Invalid data / metadata 不完整）
+        VideoNoStreamError - 有时长但无 video 流（纯音频 m4a 伪装 .mp4 等）。
+            抽帧必然 -22 失败，应拒绝入库而非进入抽帧循环。
+
+    调用方应在抽帧前识别两个异常，跳过循环直接拒绝入库，节省 100+ 次 ffmpeg 调用。
+    """
     from app.core.ffmpeg import probe_media, extract_media_info
     info = probe_media(video_path)
     if not info:
-        return 0.0
-    return (extract_media_info(info).get("duration_ms") or 0) / 1000.0
+        raise VideoCorruptedError(f"ffprobe 探测失败（文件可能损坏）：{video_path}")
+    duration_ms = extract_media_info(info).get("duration_ms") or 0
+    if duration_ms <= 0:
+        # ffprobe 探测成功但没读到时长：视频缺 metadata/时长字段，
+        # 视为损坏（无法推导抽帧位置，强行抽会全部失败）
+        raise VideoCorruptedError(f"ffprobe 无时长字段（文件 metadata 不完整）：{video_path}")
+    # 校验视频流：纯音频伪装 mp4（如 m4a 误标 .mp4）无 -frames:v 可处理的 stream，
+    # 抽帧必然 rc=-22「Output file does not contain any stream」。
+    has_video = any(s.get("codec_type") == "video" for s in info.get("streams", []))
+    if not has_video:
+        raise VideoNoStreamError(f"ffprobe 无视频流（纯音频伪装？）：{video_path}")
+    return duration_ms / 1000.0, True
 
 
 def _frame_seek_points(duration_s: float) -> List[float]:
@@ -218,23 +260,31 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
         except Exception:  # noqa: BLE001
             pass
         return False
-    # 失败时把 ffmpeg stderr 抽出来（截前 300 字符），便于诊断
+    # 失败时把 ffmpeg stderr 抽出来（截末 1500 字符，_stderr_tail helper），
+# 覆盖 input 探测 + 流映射 + image2 muxer 错，便于诊断真因。
     if proc.returncode != 0 or not frame_path.exists():
         # 兜底：主 seek 失败时重试一次开头帧 0.0（解决 -ss 越界 rc=-22）。
         # 仅在主 seek > 0 时退避，避免对已经是 0.0 的 seek 死循环。
+        # 改用 subprocess.run + capture_output：run 内置封装 communicate + returncode，
+        # 避免 Popen + communicate 的 BrokenPipeError / 子进程 zombie 等 corner case
+        # 让 retry 走 except 路径导致 retry_stderr_b 保持 b""（日志 retry=(empty) 误导）。
+        # 细化异常：TimeoutExpired / Exception 分别记录到 retry_stderr_b，
+        # 让日志 retry 字段永远有内容（真无 stderr 时显式 [empty]，异常时 [exception: ...]）。
         retry_stderr_b: bytes = b""
         if seek > 0:
             retry_cmd = _build_cmd(0.0)
             try:
-                retry_proc = subprocess.Popen(
-                    retry_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                retry_result = subprocess.run(
+                    retry_cmd, capture_output=True, timeout=_FRAME_TIMEOUT,
                     creationflags=creationflags,
                 )
-                retry_stderr_b, _ = retry_proc.communicate(timeout=_FRAME_TIMEOUT)
-                if retry_proc.returncode == 0 and frame_path.exists():
+                retry_stderr_b = retry_result.stderr or b""
+                if retry_result.returncode == 0 and frame_path.exists():
                     return True
-            except Exception:
-                pass
+            except subprocess.TimeoutExpired:
+                retry_stderr_b = b"[timeout]"
+            except Exception as e:  # noqa: BLE001
+                retry_stderr_b = f"[retry exception: {e!r}]".encode("utf-8", errors="ignore")
         # 主失败 + retry 失败时日志同时带两者 stderr，便于区分 root cause：
         # - 主 stderr 是 -ss 越界/文件损坏 → 重试也失败同一根因
         # - 主 stderr 空但 retry 有 stderr → 主进程异常但 retry 真因不同
@@ -249,8 +299,12 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
 
 
 def _stderr_tail(b: bytes) -> str:
-    """截 stderr bytes 末尾 300 字符；空时返 (empty) 占位，保持日志格式统一。"""
-    s = (b or b"").decode("utf-8", errors="ignore").strip()[-300:]
+    """截 stderr bytes 末尾 1500 字符；空时返 (empty) 占位，保持日志格式统一。
+
+    1500 而非 300：ffmpeg stderr 通常包含 input 探测（~500）+ 流映射（~500）+ 末尾错
+    （~200）。300 只看到末尾 image2 muxer 错，看不到上游 decoder / demuxer 错，掩盖真因。
+    """
+    s = (b or b"").decode("utf-8", errors="ignore").strip()[-1500:]
     return s or "(empty)"
 
 
@@ -265,8 +319,11 @@ def extract_inspect_frames(video_path: str, material_id: str) -> List[Path]:
     """
     out_dir = _inspect_dir(material_id)
     try:
-        duration_s = _probe_duration_seconds(video_path)
+        duration_s, _has_video = _probe_video_metadata(video_path)
     except Exception as e:  # noqa: BLE001
+        # VideoNoStreamError / VideoCorruptedError 都被兜底为 duration_s=0.0
+        # → _frame_seek_points(0) 退化为 [0.0] 单帧，worker 跑完发现失败即可。
+        # 此函数无「拒绝入库」职责（只抽帧），不抛异常上抛。
         logger.debug("[抽帧] 探测时长失败 {}：{}", video_path, e)
         duration_s = 0.0
 
@@ -1267,7 +1324,8 @@ def detect_face(frames: List[Path], video_id: str = "") -> bool:
 
 
 def inspect_video(video_path: str, material_id: str,
-                  need_subtitle: bool, need_face: bool) -> Tuple[Optional[bool], Optional[bool], List[str]]:
+                  need_subtitle: bool, need_face: bool
+                  ) -> Tuple[Optional[bool], Optional[bool], List[str], str]:
     """视频内容检测高级封装（任务 #128 优化6：流式分批 + 命中早停）。
 
     流程：每 `_STREAM_BATCH_S` 秒一个批次，依次抽帧 → pHash 合并 → OCR/人脸。
@@ -1281,15 +1339,39 @@ def inspect_video(video_path: str, material_id: str,
         need_subtitle: 是否需要字幕检测
         need_face: 是否需要人脸检测
     返回:
-        (has_subtitle, has_face)；三态：
-        - True：命中（检测到字幕/人脸）
-        - False：未命中（流式跑完全部批次都未命中，或早停时另一项的状态）
-        - None：抽帧完全失败（所有批次均未产出帧），无法判定（v126 语义）
+        (has_subtitle, has_face, sub_texts, inspect_reason) 四元组：
+        - has_subtitle/has_face 三态：
+          - True  = 命中
+          - False = 未命中（流式跑完所有批次都未命中，或早停时另一项的状态）
+          - None  = 抽帧失败无法判定（v126 语义）
+        - sub_texts: 字幕命中时识别到的文本（向上传日志使用）
+        - inspect_reason: 抽帧失败的具体子原因字符串，便于上游精准日志：
+          - ""                  = 正常（命中 / 未命中 / 不需要检测）
+          - "no_video_stream"   = ffprobe 无 video 流（纯音频伪装 mp4 / 图声视频）
+          - "file_corrupted"    = ffprobe 失败 / metadata 不完整
+          - "probe_error"       = ffprobe 探测未知异常
+          - "no_frames"         = 所有批次均未产出帧（ffmpeg 抽帧全失败）
     """
     if not need_subtitle and not need_face:
-        return False, False
+        return False, False, [], ""
     try:
-        duration_s = _probe_duration_seconds(video_path)
+        duration_s, _has_video = _probe_video_metadata(video_path)
+    except VideoNoStreamError as e:
+        # 抽帧前完整性探测：纯音频伪装 mp4 / m4a 误标 .mp4。
+        # 抽帧必然全部 -22 失败（image2 muxer 无 stream 可写），
+        # 不进入抽帧循环，直接返回 (None, None) 让上游严格拒绝入库。
+        logger.warning(
+            "[视频检测] 无视频流跳过抽帧 {}：{}", video_path, e,
+        )
+        return None, None, [], "no_video_stream"
+    except VideoCorruptedError as e:
+        # 抽帧前完整性探测：文件损坏 / moov atom not found / Invalid data 等。
+        # 不进入抽帧循环，直接返回 (None, None) 让上游拒绝入库，
+        # 节省 100+ 次 ffmpeg 调用（避免无效抽帧跑完所有批次才发现）。
+        logger.warning(
+            "[视频检测] 文件受损跳过抽帧 {}：{}", video_path, e,
+        )
+        return None, None, [], "file_corrupted"
     except Exception as e:  # noqa: BLE001
         logger.debug("[视频检测] 探测时长失败 {}：{}", video_path, e)
         duration_s = 0.0
@@ -1298,7 +1380,7 @@ def inspect_video(video_path: str, material_id: str,
     batches = _frame_batches(seek_points, batch_s=_STREAM_BATCH_S)
     if not batches:
         logger.warning("[视频检测] 未产出任何抽帧点 {}：视为无法判定", video_path)
-        return None, None
+        return None, None, [], "probe_error"
 
     out_dir = _inspect_dir(material_id)
     # 三态独立追踪：'pending' 未跑完 / 'hit' 命中 / 'miss' 跑完未命中
@@ -1343,7 +1425,7 @@ def inspect_video(video_path: str, material_id: str,
                     (batch_idx + 1) * _STREAM_BATCH_S,
                     time.time() - t_start,
                 )
-                return True, False, sub_texts  # 字幕文本向上传,排障日志输出
+                return True, False, sub_texts, ""  # 字幕文本向上传,排障日志输出
 
         # 4) 人脸检测（命中即早停；任务 #129 复盘修复：传 video_id 让命中帧存到 cache/face_evidence）
         if face_state == "pending":
@@ -1357,7 +1439,7 @@ def inspect_video(video_path: str, material_id: str,
                     (batch_idx + 1) * _STREAM_BATCH_S,
                     time.time() - t_start,
                 )
-                return False, True, sub_texts  # 人脸命中时字幕未跑,sub_texts 为空
+                return False, True, sub_texts, ""  # 人脸命中时字幕未跑,sub_texts 为空
 
         # 5) 本批跑过且未命中 → 标记 miss
         if sub_state == "pending":
@@ -1372,14 +1454,14 @@ def inspect_video(video_path: str, material_id: str,
     # 审查修复 #3：所有批次都没产出帧 → 抽帧失败，返 None（v126 语义）
     if total_frames_produced == 0:
         logger.warning("[视频检测] 所有批次均未产出帧 {}：视为无法判定", video_path)
-        return None, None, []
+        return None, None, [], "no_frames"
 
     # 流式跑完未命中
     logger.info(
         "[视频检测] 全部分支跑完未命中（总耗时 {:.1f}s，共 {} 批，产出 {} 帧）",
         time.time() - t_start, len(batches), total_frames_produced,
     )
-    return _state_to_out(sub_state), _state_to_out(face_state), sub_texts
+    return _state_to_out(sub_state), _state_to_out(face_state), sub_texts, ""
 
 
 def _state_to_out(state: str) -> Optional[bool]:

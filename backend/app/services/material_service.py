@@ -11,7 +11,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from loguru import logger
 
@@ -42,6 +42,39 @@ _MIN_PULL_PAGES = 10
 # 基础页数下限保护：配置非法（≤0/None/字符串）时回退默认 100；过小（< MIN）也夹到 MIN。
 # 防止用户把 BASE 调成 1 让阶梯失效。
 _PULL_BASE_FLOOR = 10
+
+# 内容检测抽帧失败子原因中文文案（inspect_reason → 上游日志文案）。
+# 与 media_inspect.inspect_video 返回的 inspect_reason 枚举保持一一对应：
+# - "no_video_stream": 图声视频 / m4a 伪装 mp4 / 抖音 play_addr 返回音频
+# - "file_corrupted" : moov atom not found / Invalid data / metadata 不完整
+# - "probe_error"    : 探测时长未知异常（极少触发）
+# - "no_frames"      : 抽帧全失败（无可用帧，写盘失败等）
+# 未命中以上枚举时回退默认文案「内容检测抽帧失败」。
+_INSPECT_REASON_TEXT = {
+    "no_video_stream": "源文件无视频流（图声视频/纯音频伪装）",
+    "file_corrupted": "源文件损坏（ffprobe 失败）",
+    "probe_error": "探测异常",
+    "no_frames": "抽帧全失败（无可用帧）",
+}
+
+
+def _reject_and_cleanup(save_path: Path, video_id: str, reason: str,
+                        sub_texts: Optional[List[str]] = None) -> str:
+    """内容检测命中 / 抽帧失败时拒绝入库并清理：删文件 + 清空目录 + 日志。
+
+    字幕分支会传 sub_texts（OCR 识别到的文本）便于排障日志，
+    人脸分支不传。返回 "" 让上游 _download_video_candidate 知道该视频被过滤。
+    """
+    save_path.unlink(missing_ok=True)
+    _cleanup_empty_dir(save_path.parent)
+    if sub_texts:
+        logger.info(
+            "[过滤] 视频 {} {}，跳过入库 | 字幕内容: {}",
+            video_id, reason, sub_texts,
+        )
+    else:
+        logger.info("[过滤] 视频 {} {}，跳过入库", video_id, reason)
+    return ""
 
 
 def _get_pull_base_pages() -> int:
@@ -267,6 +300,34 @@ def _md5_of_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _cleanup_empty_dir(parent: Path, remove_files: bool = False) -> None:
+    """清理空目录：mkdir 创建后若下载/入库失败，目录可能留下空壳。
+    用 rmdir 尝试删除（仅空目录可删，OSError 自动忽略）；
+    不递归向上，避免误删父目录（如 20260930/ 仍有其他视频）。
+
+    参数:
+        remove_files: True 时先 best-effort 删目录内所有文件再 rmdir。
+            用于 MD5 重场景 — video.mp4 unlink 后 cover/avatar 还在同目录，
+            默认行为会因 ENOTEMPTY 跳过，cover/avatar 成孤儿。
+            调用方传 True 确保整目录一起清，避免孤儿。
+    """
+    try:
+        parent.rmdir()
+        return
+    except OSError:
+        if not remove_files:
+            return
+    # remove_files=True + 非空 → 清空后重试 rmdir（cover/avatar 等孤儿）
+    try:
+        for child in parent.iterdir():
+            if child.is_file():
+                child.unlink(missing_ok=True)
+        parent.rmdir()
+    except OSError:
+        # 并发覆盖后仍非空 / 权限不足，跳过
+        pass
 
 
 def _infer_image_ext(url: str, default: str = ".webp") -> str:
@@ -681,7 +742,7 @@ def _run_pull_round(task_id: str, info) -> str:
         # ==================== 阶段 A：搜索 + 筛选 + 翻页 ====================
         # 复用 search_all_for_ids（v5 wheel + 筛选面板 UI 化），不再逐页遍历。
         # _searched_keyword 由 BrowserSearchSession 内部维护：同 keyword 跨任务复用。
-        search_session = BrowserSearchSession(profile_dir, headless=True)
+        search_session = BrowserSearchSession(profile_dir, headless=None)
         # 进度模板：搜索阶段
         info.progress = (
             f"搜索阶段：翻页采集中..., 用时 {_fmt_hms(int(time.time() - round_start))}"
@@ -733,6 +794,7 @@ def _run_pull_round(task_id: str, info) -> str:
                 aweme_ids = search_session.search_all_for_ids(
                     keyword=keyword, conditions=conditions,
                     idle_timeout=60, max_pages=page_budget,
+                    debug=load_settings().get("pull_debug", False),
                     progress_cb=_on_scroll_progress,
                 )
                 if aweme_ids:
@@ -743,6 +805,14 @@ def _run_pull_round(task_id: str, info) -> str:
                     "搜索阶段未获取到任何视频（疑似风控或关键词无结果），"
                     "建议放宽过滤或重新启用任务"
                 )
+        # 阶段 A→B 切换标记（主路径 + retry 路径退出后统一刷一次）：
+        # 避免 frontend 在阶段切换瞬间读到陈旧的"翻页采集中..."或"重试等待中..."残留，
+        # 也避免 _run_detail_phase 第一帧"下载第 1/N 个 准备中"被误以为是阶段 A 的输出。
+        if aweme_ids:
+            info.progress = (
+                f"搜索阶段完成：共抓到 {len(aweme_ids)} 个视频，"
+                f"准备进入下载阶段，用时 {_fmt_hms(int(time.time() - round_start))}"
+            )
         # ==================== 阶段 B：详情 + 下载 + 入库 ====================
         # #审查 #1：category_id / task_name 直接复用 _run_pull_round 已读取的
         # task 行引用，避免长任务阶段 A→B 期间被编辑（编辑落库后阶段 B 内
@@ -823,7 +893,9 @@ def _run_pull_round(task_id: str, info) -> str:
         except Exception as e:  # noqa: BLE001 #91 finally 静默改为 debug
             logger.debug("[拉取任务] finally 累加 pull_round 失败 task_id={} err={}", task_id, e)
     # #107 注释：search_session 已在 finally 中关闭，下面是 scheduler / DB 操作，
-    # 不要在此处误用 search_session 对象（已释放会触发 None 检查跳过）
+    # 不要在此处误用 search_session 对象（已释放会触发 None 检查跳过）。
+    # 例外：_captured / _total_captured_pages 是普通 list/int 字段，
+    # close() 不清空，可安全读取（终态 progress 用 _total_captured_pages）。
     # 达到 max_count 上限：自动停用任务（移除调度 + 改状态）
     if reached_limit and not fail_reason:
         task_scheduler.remove_job(_JOB_PREFIX + task_id)
@@ -844,6 +916,20 @@ def _run_pull_round(task_id: str, info) -> str:
     )
     if fail_reason:
         logger.info("[拉取] 任务「{}」状态：{}", task["task_name"], fail_reason)
+    # 终态 progress 模板（覆盖 #56 实时即终态的旧设计 — 阶段 B 每条 progress
+    # 都被新值刷新，最后一眼是 "下载第 N/N 个 下载入库中"，用户看不到总览；
+    # 这里统一刷一次终态：总页数 / 新增 / 拦截 / 用时）。
+    # 总页数取 search_session._total_captured_pages（跨 search 累计字段）：
+    # _captured 在每次 search_all_for_ids 入口 .clear()，retry 路径下只反映
+    # 最后一次结果；_total_captured_pages 在 search 出口累加 len(_captured)，
+    # 所以 retry 后总页数 = retry 前 + retry 后，不丢失。
+    _total_pages = (
+        search_session._total_captured_pages if search_session else 0
+    )
+    info.progress = (
+        f"总页数 {_total_pages}，新增 {new_count}，"
+        f"拦截 {intercept_count}，用时 {_fmt_hms(int(time.time() - round_start))}"
+    )
     # 任务 #367：信息列直接显示抓取详情(fail_reason),task_service 保留 info.message
     info.message = fail_reason or ""
     return "partial" if fail_reason else "success"
@@ -1100,13 +1186,17 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
     try:
         client.download_video(url, str(save_path))
     except BaseException:
-        # #P1-1：下载失败清理残文件，避免磁盘垃圾
+        # #P1-1：下载失败清理残文件 + 空目录，避免磁盘垃圾
         save_path.unlink(missing_ok=True)
+        _cleanup_empty_dir(save_path.parent)
         raise
     md5 = _md5_of_file(save_path)
     # MD5 兜底去重（music_id 缺失时同一文件可能重复入库）
     if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
         save_path.unlink(missing_ok=True)
+        # MD5 重时目录可能还含 cover（_download_and_ingest 之前已下完封面）
+        # 传 remove_files=True 把 cover 等孤儿一起清掉，避免磁盘垃圾。
+        _cleanup_empty_dir(save_path.parent, remove_files=True)
         return
     # ffprobe 探测时长（失败回退接口给的 duration）
     probe = extract_media_info(probe_media(str(save_path))) \
@@ -1233,8 +1323,9 @@ def _download_music_ingest(music: dict, category_id: str, client,
     try:
         client.download_video(download_url, str(save_path))
     except BaseException:
-        # #P1-1：下载失败清理残文件
+        # #P1-1：下载失败清理残文件 + 空目录，避免磁盘垃圾
         save_path.unlink(missing_ok=True)
+        _cleanup_empty_dir(save_path.parent)
         raise
 
     md5 = _md5_of_file(save_path)
@@ -1242,6 +1333,8 @@ def _download_music_ingest(music: dict, category_id: str, client,
     d = get_db()
     if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
         save_path.unlink(missing_ok=True)
+        # MD5 重时目录可能还含 cover，传 remove_files=True 清掉 cover 孤儿。
+        _cleanup_empty_dir(save_path.parent, remove_files=True)
         return ""
 
     # ffprobe 探测时长（失败回退接口给的 duration）
@@ -1329,6 +1422,7 @@ def _download_and_ingest(video: dict, category_id: str, client,
             candidates.append(("download_url", video["download_url"]))
         if not candidates:
             save_path.unlink(missing_ok=True)
+            _cleanup_empty_dir(save_path.parent)
             raise DouyinClientError("视频直链为空，无法下载")
         # 任务 #508：每次下载之前先输出本地路径（一次，整批 _download_with_retry 入口）
         logger.info(
@@ -1391,8 +1485,9 @@ def _download_and_ingest(video: dict, category_id: str, client,
     try:
         _download_with_retry()
     except BaseException:
-        # #P1-1：下载失败清理残文件
+        # #P1-1：下载失败清理残文件 + 空目录
         save_path.unlink(missing_ok=True)
+        _cleanup_empty_dir(save_path.parent)
         raise
 
     # 内容检测（字幕/主播人脸）：下载后、入库前按需过滤；命中则清理下载文件后返回空串
@@ -1401,30 +1496,26 @@ def _download_and_ingest(video: dict, category_id: str, client,
     if need_subtitle or need_face:
         from app.core.media_inspect import inspect_video
         try:
-            has_subtitle, has_face, sub_texts = inspect_video(
+            has_subtitle, has_face, sub_texts, inspect_reason = inspect_video(
                 str(save_path), material_id,
                 need_subtitle=need_subtitle, need_face=need_face,
             )
+            video_id = video.get("video_id") or "未知"  # 防御 video dict 缺字段（None / 空串都走兜底）
             # v126 三态语义：
             # - True  = 命中 → 拒绝入库
             # - False = 未命中 → 放行
-            # - None  = 抽帧失败无法判定 → 严格拒绝（避免漏过滤）
+            # - None  = 抽帧失败无法判定 → 严格拒绝（避免漏过滤，
+            #          覆盖 VideoCorruptedError / VideoNoStreamError）
             if need_subtitle and has_subtitle is not False:
-                save_path.unlink(missing_ok=True)
-                reason = "命中字幕" if has_subtitle else "字幕检测抽帧失败"
-                if sub_texts:
-                    logger.info(
-                        "[过滤] 视频 {} {}，跳过入库 | 字幕内容: {}",
-                        video.get("video_id"), reason, sub_texts,
-                    )
-                else:
-                    logger.info("[过滤] 视频 {} {}，跳过入库", video.get("video_id"), reason)
-                return ""
+                reason = "命中字幕" if has_subtitle else _INSPECT_REASON_TEXT.get(
+                    inspect_reason, "内容检测抽帧失败"
+                )
+                return _reject_and_cleanup(save_path, video_id, reason, sub_texts)
             if need_face and has_face is not False:
-                save_path.unlink(missing_ok=True)
-                reason = "命中主播人脸" if has_face else "人脸检测抽帧失败"
-                logger.info("[过滤] 视频 {} {}，跳过入库", video.get("video_id"), reason)
-                return ""
+                reason = "命中主播人脸" if has_face else _INSPECT_REASON_TEXT.get(
+                    inspect_reason, "内容检测抽帧失败"
+                )
+                return _reject_and_cleanup(save_path, video_id, reason)
         except Exception as e:  # noqa: BLE001
             # 检测异常默认放行，不阻断主流程
             logger.warning("[内容检测] 异常，默认放行：{}", e)
@@ -1652,23 +1743,21 @@ def _run_detail_phase(
     # #124 连续失败计数器
     consecutive_fails = 0
     CONSECUTIVE_FAIL_THRESHOLD = 5
-    # #127 ETA 计算（基于已完成视频平均耗时）
     processed_count = 0
     for i, aweme_id in enumerate(aweme_ids):
         raise_for_cancel(info)
-        # #127 进度模板：含预计剩余时长 + 当前视频 ID（任务 #589 实时显示）
+        # 任务 #589：进度模板只显示当前视频 + 已入库/跳过数 + 用时，
+        # 不显示预计剩余时间（视频单条耗时受网络/CDN 抖动影响极大，
+        # 估出来的 ETA 经常骗人，不如让用户看实时轮次更踏实）。
         elapsed_s = int(time.time() - (info.start_ts or time.time()))
-        if processed_count > 0:
-            avg_per_video = elapsed_s / processed_count
-            eta_s = int(avg_per_video * (total - processed_count))
-        else:
-            eta_s = 0
 
+        # 任务 #589：进度模板 helper，闭包捕获本轮 i/aweme_id/new_count/...
+        # 同步调用立即求值，无 late-binding 风险；每轮 def 开销 ~µs 级可忽略。
         def _fmt_progress(stage: str) -> str:
             return (
                 f"下载第 {i + 1}/{total} 个 (id={aweme_id}) {stage}，"
                 f"已入库 {new_count}，跳过 {intercept_count + skip_count}，"
-                f"用时 {_fmt_hms(elapsed_s)}，预计剩余 {_fmt_hms(eta_s)}"
+                f"用时 {_fmt_hms(elapsed_s)}"
             )
 
         info.progress = _fmt_progress("准备中")

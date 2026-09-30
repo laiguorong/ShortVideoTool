@@ -743,6 +743,17 @@ def _parse_aweme_common(aw: dict, fallback_id: str, source: str) -> Optional[dic
     width, height = (w, h) if (w and h) else (0, 0)
     orientation = ("horizontal" if w >= h else "vertical") if (w and h) else "vertical"
     duration_ms = int(video.get("duration") or video.get("duration_ms") or 0)
+    # 任务 #509：图声视频警告。aweme_type ∈ {2, 68} 已在 _parse_search_item 过滤，
+    # 此处都是普通视频（aweme_type ∈ {0,1,4}）。宽高 = 0 + 时长 > 0 + play_addr 非空
+    # → 抖音 play_addr CDN 可能返回 audio-only m4a（用于原声提取场景），
+    # 下游抽帧必然 -22 失败。仅打 WARNING 标记，不阻止下载（部分图声视频用户可能需要）。
+    # WARNING 放在 w/h + duration_ms 都定义完后，复用不重复 int(or 0)。
+    if not (w and h) and duration_ms > 0 and play_list:
+        logger.warning(
+            "[搜索解析] 疑似图声视频 {}：aweme_type={} 时长={}ms 但宽高=0，"
+            "play_addr CDN 可能返回 m4a 音频",
+            aweme_id, aw.get("aweme_type"), duration_ms,
+        )
     author = aw.get("author") or {}
     avatar_list = ((author.get("avatar_thumb") or {}).get("url_list")) or []
     stats = aw.get("statistics") or {}
