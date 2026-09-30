@@ -16,6 +16,7 @@
 
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -253,51 +254,100 @@ class RealDouyinClient(DouyinClient):
         # 调用方可按需传 manual_wait_ms 拉长窗口（如重试过验证码场景）。
         return self._fetch_aweme_detail(video_id, manual_wait_ms=manual_wait_ms)
 
-    def _fetch_in_page(self, page, video_id: str, timeout_ms: int = 30000,
+    def _fetch_in_page(self, page, video_id: str, timeout_ms: int = 20000,
                        manual_wait_ms: int = 0) -> list[dict]:
         """#161：阶段 B 复用阶段 A page 抓详情。
 
-        在传入 page 上注册响应拦截器 → page.goto 详情 URL → 等 detail XHR 落库。
+        在传入 page 上注册响应拦截器 → page.goto 详情 URL → event-driven 等 detail XHR 落库。
         不创建新 persistent_context（避免同 profile_dir chromium lock 冲突），
         不创建新 sync_playwright runtime（避免 asyncio loop 冲突）。
+
+        加载模型（替换原 domcontentloaded）：
+        - wait_until="load"：等 DOMContentLoaded + 资源加载（图片/脚本/字体）。
+          比 domcontentloaded 晚 2-5s，但更接近真人「页面打开完成」感。
+        - load 后主动 wait_for_timeout(3000)：模拟真人停留看视频 + 等 React 派发
+          更多 XHR（评论/推荐）。配合 event-driven 检测，XHR 已捕获立即返回。
+        - 抖音反爬：停留 < 3s 易被识别为机器人，停留 5-10s 节奏更安全。
+        - timeout 从 15s 扩到 20s：load 比 domcontentloaded 慢 2-5s，需扩上限。
+
+        监听模型（替换原 polling 1s 粒度）：
+        - 注册 page.on("response") 拦截器，匹配 `/aweme/v1/web/aweme/detail/`
+          URL 时 captured.append + detail_event.set() 唤醒 settle 循环
+        - detail_event 是 threading.Event，同线程 wait() 可被 _on_response 立即 set 唤醒
+        - 节省 100ms~1s 检测延迟（polling 1s 粒度 vs event-driven 100ms 内）
+
+        重试策略：page.goto 失败重试 1 次。抖音页面因风控脚本注入延迟 / 视频流 XHR
+        阻塞 load 触发偶发 20s+ 超时。首次失败大多是网络抖动，重试大概率成功。
 
         返回拦截到的响应 JSON 列表（_fetch_aweme_detail 取匹配的 aweme_detail）。
         """
         captured: list[dict] = []
+        # event-driven 唤醒：detail XHR 命中时 _on_response 立即 set()，
+        # settle 循环 wait(1.0) 立即返回无需等满 1s
+        detail_event = threading.Event()
 
         def _on_response(resp):
+            # 注意：detail_event.set() 必须放在 try/except 外（即使 JSON 解析失败
+            # 也要 set），确保「XHR 已到达」信号不被解析异常吞掉。captured.append 失败
+            # 仅影响本次解析层结果，但 XHR 到达本身是上层等到的关键事件。
+            if "/aweme/v1/web/aweme/detail/" not in resp.url:
+                return
+            detail_event.set()
             try:
-                if "/aweme/v1/web/aweme/detail/" in resp.url:
-                    captured.append(resp.json())
-            except Exception:
-                pass
-        # 防御性 remove：当前每次 _fetch_in_page 调用 _on_response 都是新 def
-        # 的局部函数对象，remove 找不到相同对象会抛 ValueError（try 吞）—— 当前
-        # 等同 no-op。保留仅为未来若改成 self._detail_handler 闭包复用时提前 remove
-        # 不会撞 panic。当下净效果：每个详情抓取多注册一个新 listener，但 finally
-        # 内对应 remove，整体 listener 列表归零不污染阶段 A 搜索 listener。
-        try:
-            page.remove_listener("response", _on_response)
-        except Exception:
-            pass
+                captured.append(resp.json())
+            except Exception as e:
+                logger.debug(
+                    "[详情抓取] XHR JSON 解析失败 video_id={} err={}",
+                    video_id, str(e)[:80],
+                )
         page.on("response", _on_response)
         try:
-            page.goto(
-                f"https://www.douyin.com/video/{video_id}",
-                timeout=timeout_ms, referer="https://www.douyin.com/",
-                wait_until="domcontentloaded",
-            )
-            page.wait_for_timeout(2000)
-            settle_deadline = min(timeout_ms, 15000) // 1000
-            for _ in range(settle_deadline):
-                if captured:
+            # 首次 page.goto 失败重试 1 次（load 比 domcontentloaded 更慢，超时概率更高）。
+            # 重试前 sleep 1s backoff（避免连续命中同一网络抖动）。
+            for attempt in range(2):
+                try:
+                    page.goto(
+                        f"https://www.douyin.com/video/{video_id}",
+                        timeout=timeout_ms, referer="https://www.douyin.com/",
+                        wait_until="load",  # ← 等资源全加载（图片/脚本/字体）
+                    )
                     break
-                page.wait_for_timeout(1000)
-            if not captured and manual_wait_ms > 0:
+                except Exception as e:
+                    if attempt == 0:
+                        logger.debug(
+                            "[详情抓取] page.goto 超时 video_id={} attempt=1/2 err={} 1s 后重试",
+                            video_id, str(e)[:120],
+                        )
+                        try:
+                            page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+                        continue
+                    raise
+            # 模拟真人停留：load 后再 3s 让用户看清视频 + 等 React hydration + 触发
+            # 评论/推荐 XHR。这是反爬节奏关键窗口（< 3s 易被识别为机器人）。
+            # 固定 3s 节奏（不抖动）保证页面停留时间一致，避免节奏波动被识别。
+            # page 异常断开时 try/except 兜底，不阻断主流程（finally 内 remove_listener
+            # 会清理 listener）。
+            try:
+                page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.debug(
+                    "[详情抓取] 真人停留异常 video_id={} err={}（继续等 XHR）",
+                    video_id, str(e)[:80],
+                )
+            # event-driven 等待 detail XHR：捕获到立即 set() 唤醒，
+            # 上限 5s 兜底（极端情况下 XHR 在停留后才发出）
+            for _ in range(5):
+                if detail_event.wait(1.0):
+                    break
+            # manual_wait 阶段：用 detail_event 检查而非 captured（XHR 命中但 JSON 解析
+            # 失败时 captured 仍为空，但不需要再等 manual_wait；detail_event 已 set 即说明
+            # 至少收到过一次响应，只是解析层失败）。
+            if not detail_event.is_set() and manual_wait_ms > 0:
                 deadline = manual_wait_ms // 1000
                 for _ in range(deadline):
-                    page.wait_for_timeout(1000)
-                    if captured:
+                    if detail_event.wait(1.0):
                         break
         finally:
             # 解除拦截器避免下一页 goto 重复 append
@@ -354,16 +404,17 @@ class RealDouyinClient(DouyinClient):
         try:
             if page is not None:
                 # #161：阶段 B 复用阶段 A page（同 persistent_context，无 chromium lock 冲突）。
-                # 直接 page.goto 详情 URL + 注册响应拦截器，跳过 BrowserActor
+                # 直接 page.goto 详情 URL + 注册响应拦截器，跳开 BrowserActor
                 # launch_persistent_context（撞同 profile_dir lock）。
-                bodies = self._fetch_in_page(page, video_id, timeout_ms=30000,
+                # timeout 20000：wait_until=load 比 domcontentloaded 慢 2-5s，需扩上限。
+                bodies = self._fetch_in_page(page, video_id, timeout_ms=20000,
                                               manual_wait_ms=manual_wait_ms)
             else:
                 bodies = browser_actor.run(
                     f"https://www.douyin.com/video/{video_id}",
                     capture=lambda u: "/aweme/v1/web/aweme/detail/" in u,
                     cookies=cookies, user_data_dir=user_data_dir,
-                    timeout_ms=30000, manual_wait_ms=manual_wait_ms,
+                    timeout_ms=20000, manual_wait_ms=manual_wait_ms,
                 )
         except Exception as e:  # noqa: BLE001 浏览器层失败
             rate_limiter.report_failure()

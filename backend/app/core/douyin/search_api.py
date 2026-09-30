@@ -239,6 +239,9 @@ class BrowserSearchSession:
         race fix：page.expect_response 是注册后才监听，click+type+Enter 触发的 XHR
         比 expect_response 注册更早，会漏抓。改用 _on_response 在 _ensure_open
         一次性注册的累积监听器，poll _captured 拿到响应。
+
+        防御：page 异常断开（chromium 崩溃 / asyncio loop 关闭）让 wait_for_timeout
+        抛 Error: Page closed，包 try/except 转 SearchBlockedError（与超时同语义）。
         """
         import time as _time
         deadline = _time.time() + timeout
@@ -247,7 +250,14 @@ class BrowserSearchSession:
                 body = self._captured[-1]
                 self._last_cursor = body.get("cursor")
                 return body
-            self._page.wait_for_timeout(200)
+            try:
+                self._page.wait_for_timeout(200)
+            except Exception as e:
+                _diag = self._diag_context()
+                raise SearchBlockedError(
+                    f"等待 XHR 异常（page 已断开）：{str(e)[:80]}"
+                    f" | 诊断：{_diag}"
+                ) from e
         _diag = self._diag_context()
         raise SearchBlockedError(
             f"等待 XHR 超时（{timeout}s 内未捕获 general/search/single）"
@@ -300,8 +310,29 @@ class BrowserSearchSession:
         page = self._page
         # 移到结果列表中央区域（避免在搜索框位置被滚动拦截）
         page.mouse.move(700, 500)
-        last_progress_ts = _time.time()
         start_count = len(self._captured)
+        # 防御：翻页循环整个包 try/except，page 异常断开（chromium 崩溃 / asyncio loop
+        # 关闭）时让循环提前退出而非抛到 search_all_for_ids 让任务直接失败。
+        # 返回当前已捕获的页数（部分结果）让上层能基于已有数据继续。
+        try:
+            return self._scroll_loop(
+                page, idle_timeout, max_pages, target_page, wheels_per_round,
+                wheel_delta, wheel_interval_ms, round_settle_ms, progress_cb,
+                _time, start_count,
+            )
+        except Exception as e:
+            logger.warning(
+                "[搜索翻页] 翻页异常退出 pages={} err={}（返回已捕获部分结果）",
+                len(self._captured) - start_count, str(e)[:120],
+            )
+            return len(self._captured) - start_count
+
+
+    def _scroll_loop(self, page, idle_timeout, max_pages, target_page,
+                     wheels_per_round, wheel_delta, wheel_interval_ms,
+                     round_settle_ms, progress_cb, _time, start_count) -> int:
+        """_scroll_until 实际翻页循环：与外层 try/except 分离便于调试栈清晰。"""
+        last_progress_ts = _time.time()
         while True:
             before = len(self._captured)
             # 连续 wheel 多轮（抖音 IntersectionObserver 节流，一次 wheel 不一定触发）
@@ -317,13 +348,11 @@ class BrowserSearchSession:
                 has_more = last_body.get("has_more")
                 self._last_cursor = cursor
                 last_progress_ts = _time.time()
-                # 通俗日志：累计拉取的视频数。cursor 仍记录到 debug 供排障。
-                logger.info(
-                    "[搜索翻页] 已拉到 {} 页，合计抓取 {} 条视频",
-                    len(self._captured), self._sum_aweme_in_body(last_body),
-                )
+                # 合并 INFO + DEBUG 为单条 DEBUG：用户视角从 progress_cb 拿累计数据。
                 logger.debug(
-                    "[搜索翻页] 内部状态 cursor={} has_more={}", cursor, has_more,
+                    "[搜索翻页] 累计 {} 页 / 本页 {} 条 / cursor={} / has_more={}",
+                    len(self._captured), self._sum_aweme_in_body(last_body),
+                    cursor, has_more,
                 )
                 # 任务 #589：实时进度回调，外层 worker 据此刷新 info.progress
                 if progress_cb is not None:
@@ -349,11 +378,8 @@ class BrowserSearchSession:
                     return len(self._captured)
             else:
                 elapsed = int(_time.time() - last_progress_ts)
-                # 静默日志：没拉到新视频不再 INFO 刷屏（一次任务可能上百次）。
-                # 只在 debug 级别记录详细信息；INFO 仅在达到空闲阈值时打一次。
-                logger.debug(
-                    "[搜索翻页] 本轮无新内容（已等待 {}s）", elapsed,
-                )
+                # 静默策略：没拉到新视频不再日志（一次任务可能上百次，纯噪音）。
+                # 仅在达到空闲阈值时打 WARNING 让用户感知卡顿。
                 if elapsed >= idle_timeout:
                     logger.warning(
                         "[搜索翻页] 已连续 {}s 无新内容，停止翻页", idle_timeout,
@@ -422,7 +448,21 @@ class BrowserSearchSession:
         div.IMWRHJOg 面板容器，div.pvZiVjtd 组标题，span.KlEyP1lp 选项
         （.HjptjtzN = 选中态）。旧 _FILTER_BTN_SELECTORS / _CONFIRM_BTN_SELECTORS
         / _FILTER_CHIP_SELECTORS 全部失效，本函数按新结构重写。
+
+        防御：phase A 期间浏览器异常断开（chromium 崩溃 / asyncio loop 关闭）
+        会让任何裸 wait_for_timeout 抛 Error: Page closed。外层 try/except 兜底
+        按无筛选拉取，避免异常传播到 _run_pull_round 让任务直接失败（fail_reason
+        会变成「Page closed」这种技术性文案）。
         """
+        try:
+            return self._apply_filters_inner(page, conditions, debug=debug)
+        except Exception as e:
+            logger.warning("[筛选] 面板操作意外异常：{}（按无筛选拉取）", e)
+            return False
+
+
+    def _apply_filters_inner(self, page, conditions: dict, *, debug: bool = False) -> bool:
+        """_apply_filters 实际逻辑：与外层 try/except 分离便于调试栈清晰。"""
         # 筛选面板失败不再每条 warning 刷屏：收集结果到尾部一次性 INFO。
         # 用户决策：筛选失效 = 不需要过滤，按无筛选拉取。
         # 1. hover 触发筛选按钮（hover 才能显示下拉面板，click 反而可能关闭）
@@ -449,7 +489,12 @@ class BrowserSearchSession:
         except Exception:
             logger.info("[筛选] hover 后筛选面板未弹出（按无筛选拉取）")
             return False
-        page.wait_for_timeout(500)
+        # 防御：wait_for_timeout 在 page 异常断开时会抛 Error: Page closed，
+        # 包 try/except 后继续后续步骤（按部分生效拉取），不让单点故障阻断整个筛选。
+        try:
+            page.wait_for_timeout(500)
+        except Exception as e:
+            logger.info("[筛选] 面板稳定等待异常：{}（继续点选项）", e)
         # 收集每步结果
         steps: list[tuple[str, bool]] = []
         # 3. 排序依据 = 最新发布（507 强制要求）
@@ -611,7 +656,9 @@ class BrowserSearchSession:
                 if aid and aid not in seen:
                     seen.add(aid)
                     ids.append(aid)
-        logger.info(
+        # A3: 搜索完成 INFO 改 DEBUG。数字已在 material_service 终态 progress
+        # 「搜索阶段完成：共抓到 N 个视频」展示，再加 INFO 重复。
+        logger.debug(
             "[搜索] 搜索完成，共抓取 {} 条不重复视频", len(ids),
         )
         # 跨 search 累计页数（入口 _captured.clear() 会丢上轮，所以出口累加）。
@@ -704,8 +751,10 @@ class BrowserSearchSession:
         # 真实键盘 Enter（触发 form submit / keyboard event 链）
         page.keyboard.press("Enter")
         page.wait_for_timeout(1500)
-        # 关键节点日志：用户能感知「搜索请求已发出」
-        logger.info(
+        # A4: 「已发起搜索」改 DEBUG。「启动浏览器」INFO 已覆盖关键事件，
+        # 用户视角从 material_service 的 progress「搜索阶段：翻页采集中...」
+        # 感知搜索在跑，此条仅留 trace 供排障。
+        logger.debug(
             "[搜索] 已发起搜索 关键词={!r} 当前页={}",
             keyword, page.title(),
         )
