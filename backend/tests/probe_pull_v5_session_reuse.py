@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""probe 验证 material_service 单 session 复用（mocked 隔离层）。
+"""⚠️ 路径已过时（507 改造后）。当前 production 路径走
+probe_pull_507_e2e.py —— 阶段 A 单次 search_all_for_ids + 阶段 B 独立 BrowserActor，
+session 复用语义已变。本 probe 仅保留作为 v5 单 session 复用的历史验证，
+不建议作为回归测试用例（mock 的 search_videos 路径生产不再走）。
+
+----
+
+probe 验证 material_service 单 session 复用（mocked 隔离层）。
 
 跳过真实浏览器/cookie/账号管理器，用 mock 隔离：
 - client.search_videos：每次返 5 条固定 video

@@ -76,14 +76,16 @@ def main() -> int:
     detail_phase_calls = {"n": 0}
 
     def fake_run_detail_phase(task_id, aweme_ids, conditions, client, cookie,
-                              acc_id, max_count, info):
+                              acc_id, max_count, info,
+                              *, category_id, task_name):
         detail_phase_calls["n"] += 1
         n = len(aweme_ids)
         # 模拟阶段 B：前 5 个 new，后 3 个 duplicate（已入库）
         new_count = min(max_count, 5)
         skip_count = max(0, n - new_count)
-        print(f"  [mock _run_detail_phase] total={n} new={new_count} skip={skip_count} reached_limit={new_count >= max_count}")
-        return new_count, skip_count, 0, new_count >= max_count, ""  # 5 元 (含 fail_reason)
+        processed_count = n
+        print(f"  [mock _run_detail_phase] total={n} new={new_count} skip={skip_count} reached_limit={new_count >= max_count} category_id={category_id}")
+        return new_count, skip_count, 0, new_count >= max_count, "", processed_count  # 6 元 (含 fail_reason + processed_count)
 
     # mock client._fetch_aweme_detail 不真正调用（避免 asyncio loop 错）
     fake_client = MagicMock()

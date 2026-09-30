@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""probe 真实跑 v5 wheel 整轮，记录每页耗时 + 所有 XHR URL。
+"""⚠️ 路径已过时（507 改造后）。当前 production 路径走
+probe_pull_507_e2e.py —— 阶段 A 单次 search_all_for_ids + 阶段 B 独立 BrowserActor。
+本 probe 仅保留作为 v5 wheel 翻页的诊断工具（看 XHR URL / 每页耗时），
+实测 production 路径不再调 search_videos 多次。如需回归请跑 507 e2e。
+
+----
+
+probe 真实跑 v5 wheel 整轮，记录每页耗时 + 所有 XHR URL。
 
 调试用：看为什么某些情况下 general/search/single 不触发。
 """

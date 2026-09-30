@@ -10,7 +10,6 @@ import re
 import shutil
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -572,13 +571,20 @@ def _run_pull_round(task_id: str, info) -> str:
     # #95：摘要过滤条件 INFO（含 title_regex pattern），让用户/运维一眼看出
     # 实际生效的过滤规则——之前正则配错 _match_conditions 静默 pass，
     # 一轮跑完才发现"为什么所有 title_regex 都没生效"。
-    logger.info(
-        "[拉取任务] 过滤条件 title_regex={!r} orientation={!r} publish_range={!r} duration_range={!r}",
-        conditions.get("title_regex") or "",
-        conditions.get("orientation") or "",
-        conditions.get("publish_range") or "",
-        conditions.get("duration_range") or "",
-    )
+    # 通俗日志：只输出非默认条件。
+    filters = []
+    if conditions.get("title_regex"):
+        filters.append(f"标题包含「{conditions['title_regex']}」")
+    if conditions.get("orientation"):
+        filters.append(f"画面方向={conditions['orientation']}")
+    if conditions.get("publish_range") and conditions["publish_range"] != "any":
+        filters.append(f"发布时间={conditions['publish_range']}")
+    if conditions.get("duration_range") and conditions["duration_range"] != "any":
+        filters.append(f"视频时长={conditions['duration_range']}")
+    if filters:
+        logger.info("[拉取] 任务「{}」应用过滤：{}", task["task_name"], "，".join(filters))
+    else:
+        logger.info("[拉取] 任务「{}」无过滤条件，全量拉取", task["task_name"])
     # max_count 边界：Pydantic 已限制 1-1000；防御性 clamp
     try:
         max_count = int(conditions.get("max_count") or 100)
@@ -600,6 +606,7 @@ def _run_pull_round(task_id: str, info) -> str:
     # 会抛 "inside the asyncio loop"。每页 close+重建避免持久化登录态丢失
     # （profile 持久化由 launch_persistent_context 负责，重建只是订阅登录上下文，不丢登录）。
     from app.core.douyin.search_api import BrowserSearchSession
+    from app.core.douyin.browser import browser_actor
     from app.services.douyin_account import get_profile_dir
     profile_dir = get_profile_dir(account["id"])
     # #审查决定：素材拉取硬编码 headless=True（不显示浏览器窗口）。
@@ -617,27 +624,26 @@ def _run_pull_round(task_id: str, info) -> str:
     # 用户决策：达 max_count 自动停用不清零；手动"重新启用"按钮才重置 round + total_pulled。
     pull_round = int(task.get("pull_round") or 0)
     page_budget = compute_round_pages(pull_round)
-    page = 1
     # 507 改造：阶段 A 需要直接拿 keyword 给 search_all_for_ids。原版只在
     # client.search_videos 内部用 _derive_search_keyword 派生，worker 不持有。
     # 这里派生一次，阶段 A + 早退重试共用。
     keyword = _derive_search_keyword(conditions)
-    # 抖音搜索要求同一会话复用 search_id 才能正确翻页（探针 D 实测：
-    # 不同 search_id 服务端按新一轮会话处理，翻页立刻失败）。在 while 外
-    # 生成一次，整轮翻页复用。
-    # #506 浏览器会话无 search_id 概念，保留此变量仅为兼容 client.search_videos
-    # 签名占位（实际不参与 XHR 参数构造）。
-    search_id = uuid.uuid4().hex
+    # 阶段 B 实际处理视频计数（外层作用域，供 finally 后的日志使用）。
+    # 507 改造后已无逐页 page 计数（搜索阶段一次拿完 + 阶段 B 按 aweme_id 循环），
+    # 日志「拉取完成 第 X 页」改用阶段 B 处理数代替。
+    detail_processed = 0
 
     def _write_progress() -> None:
-        """统一写入 progress 模板（多处调用：入循环前 / 每页完成 / 4 个 except 块）。
+        """统一写入 progress 模板（多处调用：入循环前 / 阶段 B 每条完成 / 4 个 except 块）。
 
-        模板固定：`拉取第 {page}/{page_budget} 页，已入库 {new_count}，跳过 {intercept_count}，用时 ...`
+        507 改造：已无逐页 page 计数（搜索阶段一次拿完），模板固定为
+        `拉取中：已入库 {new_count}，跳过 {intercept_count}，用时 ...`。
+        阶段 B 内部自带 ETA 模板，不调此函数。
         错误细节走 info.message（不在 progress 里混错误类型，避免模板撕裂）。
         """
         nonlocal new_count, intercept_count
         info.progress = (
-            f"拉取第 {page}/{page_budget} 页，已入库 {new_count}，"
+            f"拉取中：已入库 {new_count}，"
             f"跳过 {intercept_count}，用时 {_fmt_hms(int(time.time() - round_start))}"
         )
 
@@ -666,66 +672,6 @@ def _run_pull_round(task_id: str, info) -> str:
     _keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True, name="pull-progress-keepalive")
     _keepalive_thread.start()
 
-    def _process_page_videos(videos: list) -> None:
-        """处理一页视频：客户端兜底 → 内容过滤 → 下载入库。
-
-        修改闭包内 new_count / skip_count / reached_limit。
-        """
-        nonlocal new_count, skip_count, intercept_count, reached_limit
-        for video in videos:
-            # #P1-2：单视频循环顶部检查取消——单页 12 条可能耗时数十秒，
-            # 不查取消用户点取消后要等整页跑完才生效
-            raise_for_cancel(info)
-            # v126 拉取日志：每条视频进入处理流程前先打印关键字段
-            duration_s = (video.get("duration_ms") or 0) / 1000
-            logger.info(
-                "[拉取候选] 视频 {} | url={} | 标题={!r} | 描述={!r} | 发布时间={} | 时长={:.1f}s",
-                video.get("video_id"),
-                video.get("share_url") or "",
-                (video.get("title") or "")[:50],
-                (video.get("desc") or "")[:100],
-                (video.get("publish_time") or "-"),
-                duration_s,
-            )
-            # 任务 #130/#131：单视频处理收敛到 _process_single_video 公共函数
-            single = _process_single_video(
-                video, task["category_id"], client,
-                source="pull", conditions=conditions, cookie=cookie,
-                account_id=account["id"],   # 此作用域内只有 `account` 字典，无 `account_id` 变量
-                info=info,
-            )
-            action = single["action"]
-            if action == "filtered":
-                # 字幕/人脸/时长等过滤命中 → 拦截(从 skip_count 单拆出来便于进度展示)
-                intercept_count += 1
-                skip_count += 1
-                logger.info(
-                    "[拉取拦截] 视频 {} | 拦截原因：{} | 标题={!r} | 作者={}",
-                    video.get("video_id"), single.get("reason"),
-                    (video.get("title") or "")[:50],
-                    video.get("author_nickname") or "-",
-                )
-            elif action in ("duplicate", "failed"):
-                skip_count += 1
-                logger.info(
-                    "[拉取跳过] 视频 {} | 拦截原因：{} | 标题={!r} | 作者={}",
-                    video.get("video_id"), single.get("reason"),
-                    (video.get("title") or "")[:50],
-                    video.get("author_nickname") or "-",
-                )
-            elif action == "new":
-                new_count += 1
-                logger.info(
-                    "[拉取成功] 视频 {} → 素材 {} | 标题={!r} | 作者={}",
-                    video.get("video_id"), single["material_id"],
-                    (video.get("title") or "")[:50],
-                    video.get("author_nickname") or "-",
-                )
-            # 单轮达到 max_count 上限，停止翻页与下载
-            if new_count >= max_count:
-                reached_limit = True
-                break
-
     # 改造 #507：阶段 A + 阶段 B 分离编排
     # 阶段 A：搜索 + 筛选面板 UI 化 + wheel 翻页一次拿完所有 aweme_id
     # 阶段 B：顺序循环 aweme_ids → BrowserActor 详情 + 下载 + 入库
@@ -741,6 +687,8 @@ def _run_pull_round(task_id: str, info) -> str:
         info.progress = (
             f"搜索阶段：翻页采集中..., 用时 {_fmt_hms(int(time.time() - round_start))}"
         )
+        # 阶段 A 启动 INFO：用户看到「开始搜索关键词」
+        logger.info("[拉取] 任务「{}」开始搜索关键词：{}", task["task_name"], keyword)
         aweme_ids = search_session.search_all_for_ids(
             keyword=keyword, conditions=conditions,
             idle_timeout=60, max_pages=page_budget,
@@ -749,26 +697,30 @@ def _run_pull_round(task_id: str, info) -> str:
         if not aweme_ids:
             # 507 改造：搜索阶段 0 数据 → 早退重试整轮搜索
             # 重试 2 次（30s/45s），仍无数据 → fail_reason 走 B
+            logger.info("[拉取] 没搜到任何视频，准备重试")
             retried_with_data = False
             for retry in range(2):
                 wait_sec = 30 + retry * 15
                 logger.warning(
-                    "[拉取重试] 搜索阶段未拿到 aweme_id，{}s 后第{}次重试",
-                    wait_sec, retry + 1,
+                    "[拉取] 没搜到内容，{}s 后再试一次（共{}次）",
+                    wait_sec, 2,
                 )
-                # #126 重试 sleep 期间每 5s 更新一次 progress，用户感知倒计时
+                # #审查 #3 修复：原版 _time.sleep(5) 循环阻塞主线程 + 不响应
+                # 取消信号，30+45s 累计 75s 长 sleep 在 video_pull 池（单 worker）
+                # 里直接占住调度线程，其他任务调度延迟叠加。改用 interruptible_sleep
+                # 支持取消信号立即唤醒，同时让 progress 模板反映倒计时。
+                from app.services.task_service import interruptible_sleep
                 import time as _time
                 _wait_start = _time.time()
                 while _time.time() - _wait_start < wait_sec:
                     _remaining = int(wait_sec - (_time.time() - _wait_start))
-                    if info.cancel_requested:
-                        raise _TaskCancelled() if False else None  # 抛给 raise_for_cancel
                     info.progress = (
                         f"搜索阶段：第 {retry + 1} 次重试等待中... 剩 {_remaining}s，"
                         f"用时 {_fmt_hms(int(_time.time() - round_start))}"
                     )
-                    _time.sleep(min(5, wait_sec - (_time.time() - _wait_start)))
-                raise_for_cancel(info)
+                    # interruptible_sleep 收到 cancel_requested 会抛 _TaskCancelled，
+                    # 由外层 raise_for_cancel 一致处理；sleep 切片 1s 保持 progress 频率
+                    interruptible_sleep(min(1, wait_sec - (_time.time() - _wait_start)), info)
                 aweme_ids = search_session.search_all_for_ids(
                     keyword=keyword, conditions=conditions,
                     idle_timeout=60, max_pages=page_budget,
@@ -782,10 +734,14 @@ def _run_pull_round(task_id: str, info) -> str:
                     "建议放宽过滤或重新启用任务"
                 )
         # ==================== 阶段 B：详情 + 下载 + 入库 ====================
+        # #审查 #1：category_id / task_name 直接复用 _run_pull_round 已读取的
+        # task 行引用，避免长任务阶段 A→B 期间被编辑（编辑落库后阶段 B 内
+        # 二次 query 会读到新值，导致 total_pulled 累加按旧语义、实际入库落新分类）。
         if aweme_ids:
-            b_new, b_skip, b_intercept, b_limit, b_reason = _run_detail_phase(
+            b_new, b_skip, b_intercept, b_limit, b_reason, detail_processed = _run_detail_phase(
                 task_id, aweme_ids, conditions, client, cookie,
                 account["id"], max_count, info,
+                category_id=task["category_id"], task_name=task["task_name"],
             )
             new_count += b_new
             skip_count += b_skip
@@ -831,6 +787,16 @@ def _run_pull_round(task_id: str, info) -> str:
                 search_session.close()
             except Exception as e:  # noqa: BLE001
                 logger.debug("[拉取任务] finally 关闭 search_session 异常：{}", e)
+        # 1.5) 阶段 A 关闭后必须重置 BrowserActor._tls：search_session 内部持有
+        # 自己的 pw_cm，与 BrowserActor._tls.playwright 同线程共存——阶段 B 启动
+        # BrowserActor 时新 sync_playwright 会撞上残留 loop 抛
+        # "It looks like you are using Playwright Sync API inside the asyncio loop"。
+        # 复现：阶段 A search_session.close 完成后未调 reset → 阶段 B
+        # BrowserActor._fetch_aweme_detail 详情加载失败。
+        try:
+            browser_actor._reset_tls_for_sync_api()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[拉取任务] finally 重置 browser_actor tls 异常：{}", e)
         # 2) 任务 #133：无论 round 成功/异常，bg_task_id 必清，
         #    避免删除任务时 request_cancel 命中已结束的 UUID。
         try:
@@ -865,11 +831,14 @@ def _run_pull_round(task_id: str, info) -> str:
 
     _write_pull_log(task_id, new_count, skip_count, fail_reason)
     # PR3 #56：实时即终态，最后一次循环内的 info.progress 即为终态（删除"总页数 ..."覆写）
+    # #遗漏 #1：507 改造后已无逐页 page 计数（原 page 变量永远 =1），日志改用
+    # 阶段 B 实际处理视频数。
     logger.info(
-        "[拉取完成] 任务「{}」第{}页 结束 | 新增={} 跳过={} 状态={}",
-        task["task_name"], page, new_count, skip_count,
-        fail_reason or "成功",
+        "[拉取] 任务「{}」已结束：共处理 {} 个视频，成功入库 {} 个，跳过 {} 个",
+        task["task_name"], detail_processed, new_count, skip_count,
     )
+    if fail_reason:
+        logger.info("[拉取] 任务「{}」状态：{}", task["task_name"], fail_reason)
     # 任务 #367：信息列直接显示抓取详情(fail_reason),task_service 保留 info.message
     info.message = fail_reason or ""
     return "partial" if fail_reason else "success"
@@ -1638,14 +1607,22 @@ def _run_detail_phase(
     account_id: str,
     max_count: int,
     info,
-) -> tuple[int, int, int, bool]:
+    *,
+    category_id: str,
+    task_name: str,
+) -> tuple[int, int, int, bool, str, int]:
     """507 改造：阶段 B —— 顺序循环 aweme_ids，详情抓取 + 内容校验 + 下载入库。
 
     阶段 A 关闭 search_session 后调用，物理隔离 BrowserActor.sync_playwright
     runtime 与搜索 runtime，避免 asyncio loop 冲突。
 
-    返回: (new_count, skip_count, intercept_count, reached_limit)
+    返回: (new_count, skip_count, intercept_count, reached_limit, fail_reason, processed_count)
     每个视频独立异常不影响后续视频（每条 try/except）。
+
+    processed_count 包含所有实际尝试处理的视频（含 fail），供外层日志/统计用。
+
+    category_id / task_name 由 _run_pull_round 注入（#审查 #1：避免长任务
+    A→B 间隙被编辑后阶段 B 内 query 读到新值导致语义错位）。
 
     507 #124 异常分类：
     - LoginInvalidError：账号登录态失效 → fail_reason 提示，账号置 invalid
@@ -1658,14 +1635,6 @@ def _run_detail_phase(
     reached_limit = False
     fail_reason = ""
     d = get_db()
-    # 拿分类 ID（与阶段 A 一致）
-    task_row = d.query_one(
-        "SELECT category_id, task_name FROM video_pull_task WHERE id=? AND deleted=0",
-        (task_id,))
-    if not task_row:
-        return new_count, skip_count, intercept_count, reached_limit, fail_reason
-    category_id = task_row["category_id"]
-    task_name = task_row["task_name"]
     total = len(aweme_ids)
     # #124 连续失败计数器
     consecutive_fails = 0
@@ -1701,22 +1670,29 @@ def _run_detail_phase(
                 intercept_count += 1
                 skip_count += 1
                 logger.info(
-                    "[阶段B拦截] 视频 {} | 拦截原因：{} | 标题={!r}",
-                    aweme_id, single.get("reason"),
+                    "[拉取] 已过滤一条视频：{} | 标题={!r}",
+                    single.get("reason"),
                     (video.get("title") or "")[:50],
                 )
             elif action in ("duplicate", "failed"):
                 skip_count += 1
-                logger.info(
-                    "[阶段B跳过] 视频 {} | 拦截原因：{} | 标题={!r}",
-                    aweme_id, single.get("reason"),
-                    (video.get("title") or "")[:50],
-                )
+                # duplicate 是常态：1000+ 任务日志被刷屏。仅失败原因才值得用户看。
+                if action == "failed":
+                    logger.info(
+                        "[拉取] 一条视频处理失败：{} | 标题={!r}",
+                        single.get("reason"),
+                        (video.get("title") or "")[:50],
+                    )
+                else:
+                    logger.debug(
+                        "[拉取] 跳过重复视频：{} | 标题={!r}",
+                        single.get("reason"),
+                        (video.get("title") or "")[:50],
+                    )
             elif action == "new":
                 new_count += 1
                 logger.info(
-                    "[阶段B入库] 视频 {} → 素材 {} | 标题={!r}",
-                    aweme_id, single["material_id"],
+                    "[拉取] 已入库一条视频 | 标题={!r}",
                     (video.get("title") or "")[:50],
                 )
             processed_count += 1
@@ -1726,52 +1702,57 @@ def _run_detail_phase(
                 break
         except LoginInvalidError:
             # #124 登录态失效：账号置 invalid，整轮失败
-            fail_reason = f"阶段B登录态失效（aweme_id={aweme_id}）"
+            fail_reason = "账号登录态失效"
             d.update_by_id("account", account_id, {"status": "invalid"})
-            logger.warning("[阶段B] 登录态失效 account_id={} aweme_id={}", account_id, aweme_id)
+            logger.warning("[拉取] 账号登录态失效，账号已置为无效，请重新登录")
             notifier.notify("warn", "task", f"视频任务「{task_name}」账号失效",
-                            "阶段B登录态失效", action=f"relogin:{account_id}")
+                            "请重新登录后再启用任务", action=f"relogin:{account_id}")
             break
         except RiskControlError as e:
             # #124 风控：跳出循环，不再重试
-            fail_reason = f"阶段B风控拦截：{e}"
-            logger.warning("[阶段B] 风控拦截 account_id={} aweme_id={} reason={}",
-                           account_id, aweme_id, str(e)[:200])
+            fail_reason = f"抖音风控拦截：{e}"
+            logger.warning("[拉取] 被抖音风控拦截：{}", str(e)[:200])
             break
         except DouyinClientError as e:
             # #124 单视频详情/下载异常
             skip_count += 1
             consecutive_fails += 1
             processed_count += 1
-            logger.warning(
-                "[阶段B客户端异常] 视频 {} 失败：{}", aweme_id, str(e)[:200],
+            logger.debug(
+                "[拉取] 一条视频处理失败：{}", str(e)[:200],
             )
             if consecutive_fails >= CONSECUTIVE_FAIL_THRESHOLD:
                 fail_reason = (
-                    f"阶段B连续 {consecutive_fails} 个视频失败（疑似账号/网络异常），跳出循环"
+                    f"连续 {consecutive_fails} 个视频处理失败，已停止任务（疑似账号或网络问题）"
                 )
-                logger.warning("[阶段B] 连续失败阈值达到，跳出循环")
+                logger.warning("[拉取] 连续失败 {} 个，停止处理后续视频", consecutive_fails)
                 break
         except Exception as e:  # noqa: BLE001 单视频失败不影响后续
             skip_count += 1
             consecutive_fails += 1
             processed_count += 1
-            logger.warning(
-                "[阶段B异常] 视频 {} 失败：{}", aweme_id, str(e)[:200],
+            logger.debug(
+                "[拉取] 一条视频处理异常：{}", str(e)[:200],
             )
             # #124 完整 traceback 记 debug
-            logger.exception("[阶段B异常trace] aweme_id={}", aweme_id)
+            logger.exception("[拉取异常trace] video_id={}", aweme_id)
             if consecutive_fails >= CONSECUTIVE_FAIL_THRESHOLD:
                 fail_reason = (
-                    f"阶段B连续 {consecutive_fails} 个视频异常，跳出循环"
+                    f"连续 {consecutive_fails} 个视频处理异常，已停止任务"
                 )
                 break
-    logger.info(
-        "[阶段B完成] 任务「{}」处理 {}/{} 个 → new={} skip={} intercept={} reason={}",
-        task_name, min(i + 1, total), total, new_count, skip_count, intercept_count,
-        fail_reason or "正常",
-    )
-    return new_count, skip_count, intercept_count, reached_limit, fail_reason
+    # 阶段 B 结束日志：汇总。如果一切正常，这条就是用户唯一看到的一条 INFO。
+    if fail_reason:
+        logger.info(
+            "[拉取] 阶段 B 已结束：处理 {} 个，成功 {}，跳过 {}，原因：{}",
+            processed_count, new_count, skip_count, fail_reason,
+        )
+    else:
+        logger.info(
+            "[拉取] 阶段 B 已结束：处理 {} 个，成功 {}，跳过 {}",
+            processed_count, new_count, skip_count,
+        )
+    return new_count, skip_count, intercept_count, reached_limit, fail_reason, processed_count
 
 
 # ---------- 分享链接导入（F-03.3） ----------
