@@ -688,10 +688,19 @@ def _run_pull_round(task_id: str, info) -> str:
         )
         # 阶段 A 启动 INFO：用户看到「开始搜索关键词」
         logger.info("[拉取] 任务「{}」开始搜索关键词：{}", task["task_name"], keyword)
+
+        # 任务 #589：实时翻页进度回调，每抓到一页 XHR 调一次刷新 info.progress
+        def _on_scroll_progress(total_pages: int, total_videos: int) -> None:
+            info.progress = (
+                f"搜索阶段：已抓到 {total_pages} 页 / 累计 {total_videos} 条视频，"
+                f"用时 {_fmt_hms(int(time.time() - round_start))}"
+            )
+
         aweme_ids = search_session.search_all_for_ids(
             keyword=keyword, conditions=conditions,
             idle_timeout=60, max_pages=page_budget,
             debug=load_settings().get("pull_debug", False),
+            progress_cb=_on_scroll_progress,
         )
         _write_progress()
         if not aweme_ids:
@@ -724,6 +733,7 @@ def _run_pull_round(task_id: str, info) -> str:
                 aweme_ids = search_session.search_all_for_ids(
                     keyword=keyword, conditions=conditions,
                     idle_timeout=60, max_pages=page_budget,
+                    progress_cb=_on_scroll_progress,
                 )
                 if aweme_ids:
                     retried_with_data = True
@@ -1296,12 +1306,8 @@ def _download_and_ingest(video: dict, category_id: str, client,
     material_id = new_id()
     save_path = _build_material_path("video", category_id, material_id, video["title"], ".mp4")
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    # #审查建议：下载前打印 URL，便于 curl: (35) Connection reset 等下载失败时排查
-    # 是哪条 CDN 节点/URL 出的问题
-    logger.info(
-        "[下载] 视频 {} → URL={} | 本地={}",
-        video.get("video_id"), video.get("download_url"), save_path,
-    )
+    # 任务 #508：本地路径 / CDN 节点 URL 两条日志移到 _download_with_retry 内部
+    # （入口打本地路径 + 每节点尝试前打 URL，节点切换更清晰）
     # curl_cffi 下载大文件偶现 curl: (35) Connection reset
     # （抖音 CDN 节点切换/瞬时风控），原版无重试直接失败。
     # 本次优化：detail 接口 download_addr.url_list 含 3 个 CDN 节点备份，
@@ -1324,10 +1330,20 @@ def _download_and_ingest(video: dict, category_id: str, client,
         if not candidates:
             save_path.unlink(missing_ok=True)
             raise DouyinClientError("视频直链为空，无法下载")
+        # 任务 #508：每次下载之前先输出本地路径（一次，整批 _download_with_retry 入口）
+        logger.info(
+            "[下载] 视频 {} 本地路径={}",
+            video.get("video_id"), save_path,
+        )
         # 每个 URL 内最多 1 次重试（避免在挂掉的节点上空耗）
         MAX_URL_RETRIES = 1
         last_err: Exception | None = None
         for idx, (field, url) in enumerate(candidates):
+            # 任务 #508：每次下载之前输出视频文件链接（每个 CDN 节点尝试前各一条）
+            logger.info(
+                "[下载] 视频 {} URL[{}/{}] field={} → {}",
+                video.get("video_id"), idx + 1, len(candidates), field, url,
+            )
             for attempt in range(MAX_URL_RETRIES + 1):
                 try:
                     client.download_video(url, str(save_path))
@@ -1640,23 +1656,29 @@ def _run_detail_phase(
     processed_count = 0
     for i, aweme_id in enumerate(aweme_ids):
         raise_for_cancel(info)
-        # #127 进度模板：含预计剩余时长
+        # #127 进度模板：含预计剩余时长 + 当前视频 ID（任务 #589 实时显示）
         elapsed_s = int(time.time() - (info.start_ts or time.time()))
         if processed_count > 0:
             avg_per_video = elapsed_s / processed_count
             eta_s = int(avg_per_video * (total - processed_count))
         else:
             eta_s = 0
-        info.progress = (
-            f"下载第 {i + 1}/{total} 个，已入库 {new_count}，"
-            f"跳过 {intercept_count + skip_count}，用时 {_fmt_hms(elapsed_s)}，"
-            f"预计剩余 {_fmt_hms(eta_s)}"
-        )
+
+        def _fmt_progress(stage: str) -> str:
+            return (
+                f"下载第 {i + 1}/{total} 个 (id={aweme_id}) {stage}，"
+                f"已入库 {new_count}，跳过 {intercept_count + skip_count}，"
+                f"用时 {_fmt_hms(elapsed_s)}，预计剩余 {_fmt_hms(eta_s)}"
+            )
+
+        info.progress = _fmt_progress("准备中")
         try:
-            # 1. 详情抓取（独立 BrowserActor）
+            # 1. 详情抓取（独立 BrowserActor）— 约 5-10s
+            info.progress = _fmt_progress("详情抓取中")
             video = client._fetch_aweme_detail(
                 aweme_id, cookie, account_id=account_id, page=page)
             # 2. 单视频统一处理：客户端兜底 → 去重 → 下载 → 内容检测 → 入库
+            info.progress = _fmt_progress("下载入库中")
             single = _process_single_video(
                 video, category_id, client,
                 source="pull", conditions=conditions, cookie=cookie,

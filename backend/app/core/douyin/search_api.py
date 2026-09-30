@@ -253,6 +253,8 @@ class BrowserSearchSession:
         wheels_per_round: int = 5,
         round_settle_ms: int = 1500,
         wheel_interval_ms: int = 150,
+        *,
+        progress_cb: Optional["Callable[[int, int], None]"] = None,
     ) -> int:
         """v5 wheel 真实滚动翻页：mouse.wheel 触发 React 内部 fetch（自带签名）。
 
@@ -268,6 +270,8 @@ class BrowserSearchSession:
             wheels_per_round: 每轮连续 wheel 次数，默认 5
             round_settle_ms: 每轮之间静默等待 XHR 时间，默认 1500ms
             wheel_interval_ms: 每次 wheel 之间间隔，默认 150ms（模拟真人节奏）
+            progress_cb: 进度回调（任务 #589）签名 (累计页数, 累计视频数) -> None；
+                每抓到一页新 XHR 后调用一次，让外层 worker 实时刷新 info.progress。
         返回:
             实际累积 XHR 数量（<= max_pages）
         退出条件（任一满足即返回）：
@@ -305,6 +309,16 @@ class BrowserSearchSession:
                 logger.debug(
                     "[搜索翻页] 内部状态 cursor={} has_more={}", cursor, has_more,
                 )
+                # 任务 #589：实时进度回调，外层 worker 据此刷新 info.progress
+                if progress_cb is not None:
+                    try:
+                        total_pages = len(self._captured) - start_count
+                        total_videos = sum(
+                            self._sum_aweme_in_body(b) for b in self._captured[start_count:]
+                        )
+                        progress_cb(total_pages, total_videos)
+                    except Exception:  # noqa: BLE001 回调异常不影响翻页主流程
+                        pass
                 # 终止条件（通俗）
                 if has_more == 0:
                     logger.info("[搜索翻页] 没有更多视频了，停止翻页")
@@ -524,6 +538,7 @@ class BrowserSearchSession:
         max_pages: int = 50,
         *,
         debug: bool = False,
+        progress_cb: Optional["Callable[[int, int], None]"] = None,
     ) -> list[str]:
         """507 改造：搜索 + 筛选 + 翻页一次拿完，返回去重后的 aweme_id 列表。
 
@@ -535,6 +550,8 @@ class BrowserSearchSession:
             conditions: 拉取任务 conditions dict（用于筛选面板：sort/publish_range/duration_range）
             idle_timeout: 静默多少秒无新 XHR 停止
             max_pages: 最大页数上限
+            progress_cb: 翻页进度回调（任务 #589：实时显示抓取状态）；
+                签名 (累计页数, 累计视频数) -> None，每抓到一页 XHR 后调一次。
         返回:
             去重保序的 aweme_id 字符串列表
         """
@@ -564,6 +581,7 @@ class BrowserSearchSession:
         # 滚到结束（has_more=0 / 60s 无进展 / max_pages 上限）
         self._scroll_until(
             target_page=None, idle_timeout=idle_timeout, max_pages=max_pages,
+            progress_cb=progress_cb,
         )
         # 提取所有 aweme_id（去重保序）
         seen: set[str] = set()
