@@ -238,16 +238,20 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
         # 主失败 + retry 失败时日志同时带两者 stderr，便于区分 root cause：
         # - 主 stderr 是 -ss 越界/文件损坏 → 重试也失败同一根因
         # - 主 stderr 空但 retry 有 stderr → 主进程异常但 retry 真因不同
-        main_tail = (stderr_b or b"").decode("utf-8", errors="ignore").strip()[-300:] \
-            or "(empty)"
-        retry_tail = (retry_stderr_b or b"").decode("utf-8", errors="ignore").strip()[-300:] \
-            or "(empty)"
+        main_tail = _stderr_tail(stderr_b)
+        retry_tail = _stderr_tail(retry_stderr_b)
         logger.warning(
             "[抽帧] ffmpeg 失败 rc={} seek={} 文件={}：主 stderr={} | retry stderr={}",
             proc.returncode, seek, video_path, main_tail, retry_tail,
         )
         return False
     return True
+
+
+def _stderr_tail(b: bytes) -> str:
+    """截 stderr bytes 末尾 300 字符；空时返 (empty) 占位，保持日志格式统一。"""
+    s = (b or b"").decode("utf-8", errors="ignore").strip()[-300:]
+    return s or "(empty)"
 
 
 def extract_inspect_frames(video_path: str, material_id: str) -> List[Path]:
