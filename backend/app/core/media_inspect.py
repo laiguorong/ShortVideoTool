@@ -89,11 +89,12 @@ def _frame_seek_points(duration_s: float) -> List[float]:
     """根据视频时长推导均匀抽帧时间点（秒）。
 
     策略：每 `_FRAME_INTERVAL_S` 秒一个时间点，从 0s 开始，封顶 `_MAX_FRAMES`。
-    极短视频（< 0.5s）至少返回 1 个点；时长探测失败时退化为固定 3 个点。
+    极短视频（< 0.5s）至少返回 1 个点；时长探测失败时退化为单点 [0.0]（开头帧
+    100% 安全，避免旧版 [1.0, 5.0, 10.0] 在短于 1s 的视频上 -ss 越界 rc=-22）。
     """
     if duration_s <= 0:
-        # 探测失败退化：固定抽 3 帧（开头 / 5s / 10s），保持旧版行为
-        return [1.0, 5.0, 10.0]
+        # 探测失败退化：单点开头帧；批量检测对单帧也能跑（OCR/人脸无帧对比依赖）
+        return [0.0]
     n = max(1, math.ceil(duration_s / _FRAME_INTERVAL_S))
     n = min(n, _MAX_FRAMES)
     pts: List[float] = []
@@ -170,19 +171,24 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
     """
     video_path, frame_path, seek, _idx = args
     import subprocess
-    cmd = [
-        FFMPEG, "-y",
-        "-ss", f"{seek:.2f}",
-        "-i", video_path,
-        "-frames:v", "1",
-        # ffmpeg 7.x image2 muxer 默认非「单帧覆盖写入」模式，
-        # 必须显式 -update 1 才能把 .jpg 写为单帧文件；否则报
-        # "Output file does not contain any stream" / rc=-22 (EINVAL)
-        "-update", "1",
-        "-vf", f"scale={THUMB_WIDTH}:-2",
-        "-q:v", str(THUMB_JPEG_Q),
-        str(frame_path),
-    ]
+
+    def _build_cmd(seek_s: float) -> list:
+        return [
+            FFMPEG, "-y",
+            "-ss", f"{seek_s:.2f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            # ffmpeg 7.x image2 muxer 默认非「单帧覆盖写入」模式，
+            # 必须显式 -update 1 才能把 .jpg 写为单帧文件；否则报
+            # "Output file does not contain any stream" / rc=-22 (EINVAL)
+            "-update", "1",
+            "-vf", f"scale={THUMB_WIDTH}:-2",
+            "-q:v", str(THUMB_JPEG_Q),
+            str(frame_path),
+        ]
+    # 主路径用入参 seek；若 -ss 越界（短视频等）失败，退到开头帧 0.0 再试一次。
+    # 兜底机制：开头帧永远在文件内（即使 < 1s），保证至少 1 帧产出。
+    cmd = _build_cmd(seek)
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         proc = subprocess.Popen(
@@ -214,6 +220,20 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
         return False
     # 失败时把 ffmpeg stderr 抽出来（截前 300 字符），便于诊断
     if proc.returncode != 0 or not frame_path.exists():
+        # 兜底：主 seek 失败时重试一次开头帧 0.0（解决 -ss 越界 rc=-22）。
+        # 仅在主 seek > 0 时退避，避免对已经是 0.0 的 seek 死循环。
+        if seek > 0:
+            retry_cmd = _build_cmd(0.0)
+            try:
+                retry_proc = subprocess.Popen(
+                    retry_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=creationflags,
+                )
+                _rb, retry_stderr_b = retry_proc.communicate(timeout=_FRAME_TIMEOUT)
+                if retry_proc.returncode == 0 and frame_path.exists():
+                    return True
+            except Exception:
+                pass
         stderr_txt = (stderr_b or b"").decode("utf-8", errors="ignore").strip()
         stderr_tail = stderr_txt[-300:] if stderr_txt else "(empty)"
         logger.warning(
