@@ -4,8 +4,8 @@
 不 mock search_session、不 mock _fetch_aweme_detail——
 走 production 路径，验证：
 1. 阶段 A 浏览器持久化搜索（filter panel UI）
-2. 阶段 A 关闭后 browser_actor._reset_tls_for_sync_api() 重置 tls
-3. 阶段 B BrowserActor 详情抓取 + 下载入库
+2. 阶段 B 复用阶段 A page 抓详情（page 复用方案）
+3. 阶段 B 顺序处理：详情抓取 + 下载 + 入库
 
 需要：
 - 至少 1 个 status='normal' 账号（持久化 chromium profile 已登录）

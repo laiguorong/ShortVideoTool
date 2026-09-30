@@ -606,7 +606,6 @@ def _run_pull_round(task_id: str, info) -> str:
     # 会抛 "inside the asyncio loop"。每页 close+重建避免持久化登录态丢失
     # （profile 持久化由 launch_persistent_context 负责，重建只是订阅登录上下文，不丢登录）。
     from app.core.douyin.search_api import BrowserSearchSession
-    from app.core.douyin.browser import browser_actor
     from app.services.douyin_account import get_profile_dir
     profile_dir = get_profile_dir(account["id"])
     # #审查决定：素材拉取硬编码 headless=True（不显示浏览器窗口）。
@@ -793,16 +792,6 @@ def _run_pull_round(task_id: str, info) -> str:
                 search_session.close()
             except Exception as e:  # noqa: BLE001
                 logger.debug("[拉取任务] finally 关闭 search_session 异常：{}", e)
-        # 1.5) 阶段 A 关闭后必须重置 BrowserActor._tls：search_session 内部持有
-        # 自己的 pw_cm，与 BrowserActor._tls.playwright 同线程共存——阶段 B 启动
-        # BrowserActor 时新 sync_playwright 会撞上残留 loop 抛
-        # "It looks like you are using Playwright Sync API inside the asyncio loop"。
-        # 复现：阶段 A search_session.close 完成后未调 reset → 阶段 B
-        # BrowserActor._fetch_aweme_detail 详情加载失败。
-        try:
-            browser_actor._reset_tls_for_sync_api()
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[拉取任务] finally 重置 browser_actor tls 异常：{}", e)
         # 2) 任务 #133：无论 round 成功/异常，bg_task_id 必清，
         #    避免删除任务时 request_cancel 命中已结束的 UUID。
         try:

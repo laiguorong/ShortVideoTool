@@ -271,6 +271,14 @@ class RealDouyinClient(DouyinClient):
                     captured.append(resp.json())
             except Exception:
                 pass
+        # 防御性先移除旧 listener：阶段 A page 已注册搜索 XHR 监听器（_on_response），
+        # 若相同函数对象残留会重复回调。当前 _on_response 是局部函数对象，
+        # 每次调用 new_id 都不重复，但保留 remove 调用防御 URL 匹配规则放宽后
+        # 旧 listener 误命中（如未来新增 XHR 兜底）。
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
         page.on("response", _on_response)
         try:
             page.goto(
@@ -314,12 +322,19 @@ class RealDouyinClient(DouyinClient):
         # 不再读 storage.json / storage_state 注入（避免 storage.json 缺失时降级到纯 cookies
         # → 签名失败 0 响应）。
 
+        #161 复用阶段 A page：传 page 参数时跳过 BrowserActor 独立 launch_persistent_context，
+        # 直接在传入 page 上注册拦截器 + page.goto 详情 URL，避免同 profile_dir chromium lock
+        # 冲突 + asyncio loop 冲突。**page 复用时 account_id 不生效**——profile 由 page 所在
+        # context 决定（阶段 A 创建时已绑定账号 profile）。
+
         参数:
             video_id: 抖音视频 ID（短链 302 解析后 / 搜索列表直接拿）
             cookie: 账号登录态（默认空串=匿名；任务 #131 验证匿名可拿全字段）
             manual_wait_ms: 人工等待窗口毫秒数（0 响应时让人过验证码，>0 进入等待）。
                 分享导入手动重试时通常传 30000~60000（30s~60s）。
-            account_id: 账号 ID（#fix-unify-profile-storage：传时走 accounts/<id>/profile/）
+            account_id: 账号 ID（#fix-unify-profile-storage：传时走 accounts/<id>/profile/）。
+                page 复用路径下不生效。
+            page: 复用阶段 A 的 Playwright page（None 时回退到 BrowserActor 独立 launch）
         返回:
             统一视频字段 dict（_parse_detail_item 输出）
         异常:

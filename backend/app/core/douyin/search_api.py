@@ -367,9 +367,9 @@ class BrowserSearchSession:
         "1to5m": "1-5分钟",
         "gt5m": "5分钟以上",
     }
-    # 内容形式=视频：必须限定在面板内第一个匹配（抖音内容形式面板项文字就是「视频」）
+    # 内容形式=视频：精确匹配「视频」字面量，避免误命中「图文」/「直播」等含「视」字项
     _CONTENT_VIDEO_SELECTORS = [
-        f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("视频")',
+        f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:text-is("视频")',
     ]
     # 无确认按钮：旧版 confirm selectors 全部删除（点选项即时生效）。
 
@@ -478,10 +478,10 @@ class BrowserSearchSession:
         return False
 
     def _click_filter_option(self, page, selectors: list[str], desc: str, *, debug: bool = False) -> bool:
-        """点筛选面板选项 + 等 .HjptjtzN 选中态 class 出现（最多 1.5s）。
+        """点筛选面板选项 + 等 .HjptjtzN 选中态 class 出现（最多 1s）。
 
         用户反馈：抖音 UI 切换有延迟，点完立即下一步会丢点击。把「等选中态」
-        作为生效信号，比固定 wait_for_timeout 更稳——已生效立即返回，未生效最多等 1.5s。
+        作为生效信号，比固定 wait_for_timeout 更稳——已生效立即返回，未生效最多等 1s。
 
         实现注意：page.evaluate + document.querySelector 不识别 Playwright 的
         :has-text 扩展伪类，必须用 Playwright locator API（page.locator）。
@@ -495,7 +495,7 @@ class BrowserSearchSession:
             return False
         settle_ms = 2500 if debug else 500
         try:
-            for _ in range(15):
+            for _ in range(10):
                 for sel in selectors:
                     try:
                         loc = page.locator(sel).first
@@ -687,17 +687,6 @@ class BrowserSearchSession:
             self._pw_cm = None
             self._pw = None
 
-    def get_pw(self):
-        """暴露 SyncPlaywright 实例供外部（阶段 B BrowserActor）复用。
-
-        阶段 A 跑完搜索后，阶段 B 在同一线程再开 sync_playwright 会撞
-        「inside the asyncio loop」。让阶段 B 共用阶段 A 的 runtime
-        （仅创建新 persistent_context，不启停 driver + loop）可彻底规避。
-
-        调用方必须在 search_session.close() 之前用完 pw；之后 self._pw=None。
-        """
-        return self._pw
-
     def get_page(self):
         """暴露当前 page 给阶段 B 复用（同 persistent_context，无 chromium lock 冲突）。
 
@@ -707,10 +696,6 @@ class BrowserSearchSession:
         必须在 search_session.close() 之前用完；close 后 page 已被置 None。
         """
         return self._page
-
-    def get_context(self):
-        """暴露 BrowserContext 给阶段 B 复用（避免同 profile_dir 重复 launch 撞 lock）。"""
-        return self._ctx
 
     def __enter__(self):
         # with 上下文进入即 lazy launch + goto 首页（search_page 调用前完成准备）
