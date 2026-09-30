@@ -222,6 +222,7 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
     if proc.returncode != 0 or not frame_path.exists():
         # 兜底：主 seek 失败时重试一次开头帧 0.0（解决 -ss 越界 rc=-22）。
         # 仅在主 seek > 0 时退避，避免对已经是 0.0 的 seek 死循环。
+        retry_stderr_b: bytes = b""
         if seek > 0:
             retry_cmd = _build_cmd(0.0)
             try:
@@ -229,16 +230,21 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
                     retry_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     creationflags=creationflags,
                 )
-                _rb, retry_stderr_b = retry_proc.communicate(timeout=_FRAME_TIMEOUT)
+                retry_stderr_b, _ = retry_proc.communicate(timeout=_FRAME_TIMEOUT)
                 if retry_proc.returncode == 0 and frame_path.exists():
                     return True
             except Exception:
                 pass
-        stderr_txt = (stderr_b or b"").decode("utf-8", errors="ignore").strip()
-        stderr_tail = stderr_txt[-300:] if stderr_txt else "(empty)"
+        # 主失败 + retry 失败时日志同时带两者 stderr，便于区分 root cause：
+        # - 主 stderr 是 -ss 越界/文件损坏 → 重试也失败同一根因
+        # - 主 stderr 空但 retry 有 stderr → 主进程异常但 retry 真因不同
+        main_tail = (stderr_b or b"").decode("utf-8", errors="ignore").strip()[-300:] \
+            or "(empty)"
+        retry_tail = (retry_stderr_b or b"").decode("utf-8", errors="ignore").strip()[-300:] \
+            or "(empty)"
         logger.warning(
-            "[抽帧] ffmpeg 失败 rc={} seek={} 文件={}：stderr={}",
-            proc.returncode, seek, video_path, stderr_tail,
+            "[抽帧] ffmpeg 失败 rc={} seek={} 文件={}：主 stderr={} | retry stderr={}",
+            proc.returncode, seek, video_path, main_tail, retry_tail,
         )
         return False
     return True
