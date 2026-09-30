@@ -175,6 +175,10 @@ def _run_extract_frame(args: Tuple[str, Path, float, int]) -> bool:
         "-ss", f"{seek:.2f}",
         "-i", video_path,
         "-frames:v", "1",
+        # ffmpeg 7.x image2 muxer 默认非「单帧覆盖写入」模式，
+        # 必须显式 -update 1 才能把 .jpg 写为单帧文件；否则报
+        # "Output file does not contain any stream" / rc=-22 (EINVAL)
+        "-update", "1",
         "-vf", f"scale={THUMB_WIDTH}:-2",
         "-q:v", str(THUMB_JPEG_Q),
         str(frame_path),
