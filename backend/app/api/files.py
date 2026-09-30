@@ -23,8 +23,9 @@ router = APIRouter(prefix="/files", tags=["文件服务"])
 # #363：项目片段路径 project/<pid>/clip/* 与封面 project/<pid>/cover/* 都在 "project" 前缀下
 _ALLOWED_PREFIXES = ("cache", "material", "project", "finished", "accounts")
 
-# accounts 目录含敏感文件（storage.json/sessionid、meta.json），
-# 仅允许访问头像文件，其余拒绝（#504 头像迁移到账号目录后补的安全校验）
+# accounts 目录含敏感文件（profile 持久化目录/sessionid），
+# 仅允许访问头像文件，其余拒绝（#504 头像迁移到账号目录后补的安全校验；
+# #fix-unify-profile-storage 后 storage.json 已下线，profile_dir 由 chromium 自管）
 import re as _re
 _ACCOUNT_AVATAR_RE = _re.compile(r"^accounts/[^/]+/avatar\.jpeg$")
 
@@ -35,7 +36,7 @@ _CHUNK_SIZE = 256 * 1024
 def _allowed(rel_path: str) -> bool:
     """相对路径是否落在白名单前缀内（含分隔符边界）。
 
-    accounts 前缀特殊处理：仅允许 accounts/<id>/avatar.jpeg，其余（storage.json 等）拒绝。
+    accounts 前缀特殊处理：仅允许 accounts/<id>/avatar.jpeg，其余（profile_dir 等）拒绝。
     """
     if rel_path == "accounts" or rel_path.startswith("accounts/"):
         return bool(_ACCOUNT_AVATAR_RE.match(rel_path))

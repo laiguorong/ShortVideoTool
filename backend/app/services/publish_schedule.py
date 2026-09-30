@@ -537,7 +537,8 @@ def _schedule_video_dir_balanced(account_id: str,
                                  limit: int,
                                  start_dt: datetime,
                                  end_dt: datetime,
-                                 interval_min: int) -> list[VideoDirScheduleItem]:
+                                 interval_min: int,
+                                 acc_offset: int = 0) -> list[VideoDirScheduleItem]:
     """#418 视频目录模式 - 均衡模式（与 _schedule_for_account_balanced 算法对齐：两模式同配置应生成一致 plan_time）。
 
     算法对齐（#calc_mode 对齐项目模式）：
@@ -547,9 +548,10 @@ def _schedule_video_dir_balanced(account_id: str,
     - 单账号上限 limit；超窗 → 截断（不抛错）
     - 末条约束：每目录独立——任一条 t_dt > end_dt − step 时截断
     - 同账号冲突重排（同 _schedule_for_account_balanced）：t_dt 已被占则按 step 推到下一个空 slot
-    - 视频简介-按项目一一对应：取该目录专属的简介池按 k 轮转（k = seq // n_dirs）
-    - 门店按 k 轮转（k = seq // n_dirs）
+    - 视频简介-按项目一一对应：取该目录专属的简介池按 k 轮转
+    - 门店按 k 轮转
     - 视频文件取该目录下第 k 个（k 超长则抛 ScheduleOverflowError，由前端拦截）
+    - #fix-video-dedup：acc_offset 让多账号在同一目录的 k 段错开，避免共用同一视频文件
 
     例：interval_min=60, n_dirs=2 → step=30
         seq=0: 0×60 + 0×30 = 0    → 07:00 dir0
@@ -583,13 +585,15 @@ def _schedule_video_dir_balanced(account_id: str,
             break  # 末条约束；超出直接停
         used_times.add(t_dt)
         d = video_dirs[dir_idx]
-        k = seq // n_dirs
+        # #fix-video-dedup：acc_offset 让多账号在同目录占不同 k 段，避免共用视频
+        k = seq // n_dirs + acc_offset
         # 视频数耗尽：直接抛错，让前端提示用户调整数量/换目录（避免重复排期同文件导致多条明细指向同一视频）
         if k >= len(d.video_paths):
             raise ScheduleVideoShortageError(
                 f"目录「{d.title}」仅有 {len(d.video_paths)} 个合规视频，"
                 f"当前账号需发布 {limit} 条、按 {n_dirs} 个目录平均分配，"
-                f"本目录需 {k + 1} 个。请减少每账号发布数或增加目录内视频。"
+                f"本账号起始 k={acc_offset}、本目录需 k={k + 1}。"
+                f"请减少每账号发布数或增加目录内视频。"
             )
         vp = d.video_paths[k]
         # 门店 / 简介轮转（__post_init__ 已强制非空）
@@ -624,6 +628,9 @@ def build_video_dir_schedule(cfg: VideoDirScheduleConfig) -> tuple[list[VideoDir
     if cfg.schedule_mode == "balanced":
         items: list[VideoDirScheduleItem] = []
         stats = VideoDirScheduleStats()
+        # #fix-video-dedup：累加 acc_offset 让每账号在每个目录占独立 k 段
+        n_dirs = len(cfg.video_dirs)
+        acc_offset = 0
         for account_id in cfg.account_ids:
             account_items = _schedule_video_dir_balanced(
                 account_id=account_id,
@@ -633,9 +640,13 @@ def build_video_dir_schedule(cfg: VideoDirScheduleConfig) -> tuple[list[VideoDir
                 start_dt=start_dt,
                 end_dt=end_dt,
                 interval_min=cfg.balanced_step_min,
+                acc_offset=acc_offset,
             )
             items.extend(account_items)
             stats.by_account[account_id] = len(account_items)
+            # 下一个账号的 acc_offset：本账号最多占 ceil(limit / n_dirs) 段
+            if limits[account_id] > 0 and n_dirs > 0:
+                acc_offset += (limits[account_id] + n_dirs - 1) // n_dirs
     else:
         # fixed：单函数生成（与 _schedule_fixed 同构，seq 跨账号累加）
         items, stats = _schedule_video_dir_fixed_inner(
@@ -675,11 +686,14 @@ def _schedule_video_dir_fixed_inner(account_ids: tuple[str, ...],
     - 每账号独立 seq=0..acc_limit-1，dir_idx = seq % n_dirs
     - 每条 plan_time = start_dt + seq × fixed_min（严格单调递增，天然无同时间冲突）
     - 末条约束：每账号最末条 ≤ end_dt − step
-    - 视频文件 / 门店 / 简介：按 k（k = seq // n_dirs）在该目录专属池轮转，k 超长抛 ScheduleOverflowError
+    - 视频文件 / 门店 / 简介：按 k（k = seq // n_dirs + acc_offset）在该目录专属池轮转
+      - #fix-video-dedup：acc_offset 让多账号在同一目录占不同 k 段，避免共用同一视频
+    - k 超长抛 ScheduleOverflowError
 
     例：fixed_min=10, n_dirs=3, accounts=2, acc_limit=4
-        账号0: 07:00/07:10/07:20/07:30
-        账号1: 07:00/07:10/07:20/07:30  ← 每账号独立 seq，同起点
+        账号0: 07:00/07:10/07:20/07:30（k=0/0/0/1 → video[0]/[0]/[0]/[1]）
+        账号1: 07:00/07:10/07:20/07:30（k=2/2/2/3 → video[2]/[2]/[2]/[3]，acc_offset=2）
+        每账号同起点 + 不同视频段 → 多账号不共用同一视频
     """
     if fixed_min < 1:
         raise ScheduleTimeShortageError(f"固定间隔必须 ≥ 1min，当前 {fixed_min}")
@@ -691,6 +705,8 @@ def _schedule_video_dir_fixed_inner(account_ids: tuple[str, ...],
 
     items: list[VideoDirScheduleItem] = []
     stats = VideoDirScheduleStats()
+    # #fix-video-dedup：累加 acc_offset 让每账号在每个目录占独立 k 段，避免多账号共用同一视频
+    acc_offset = 0
     for account_id in account_ids:
         limit = limits[account_id]
         produced_for_acc = 0
@@ -700,13 +716,14 @@ def _schedule_video_dir_fixed_inner(account_ids: tuple[str, ...],
             if t_dt > last_allowed_dt:
                 break
             d = video_dirs[dir_idx]
-            k = seq // n_dirs
+            # acc_offset 让同 dir_idx 的多账号 k 错开（账号0: 0..N，账号1: M..M+N）
+            k = seq // n_dirs + acc_offset
             # 视频数耗尽：直接抛错，让前端提示用户调整数量/换目录（避免重复排期同文件导致多条明细指向同一视频）
             if k >= len(d.video_paths):
                 raise ScheduleVideoShortageError(
                     f"目录「{d.title}」仅有 {len(d.video_paths)} 个合规视频，"
-                    f"当前账号需发布 {limit} 条、按 {n_dirs} 个目录平均分配，"
-                    f"本目录需 {k + 1} 个。请减少每账号发布数或增加目录内视频。"
+                    f"当前账号起始 k={acc_offset}、本目录需 k={k + 1}。"
+                    f"请减少每账号发布数或增加目录内视频。"
                 )
             vp = d.video_paths[k]
             shop_name = d.shop_names[k % len(d.shop_names)]
@@ -724,5 +741,7 @@ def _schedule_video_dir_fixed_inner(account_ids: tuple[str, ...],
             stats.total += 1
             stats.by_account[account_id] = stats.by_account.get(account_id, 0) + 1
             stats.by_directory[d.id] = stats.by_directory.get(d.id, 0) + 1
-        # 单账号耗尽（末条约束）→ 不影响其他账号（每账号独立 seq）
+        # 下一个账号的 acc_offset：本账号最多占 ceil(limit / n_dirs) 段
+        if limit > 0:
+            acc_offset += (limit + n_dirs - 1) // n_dirs
     return items, stats

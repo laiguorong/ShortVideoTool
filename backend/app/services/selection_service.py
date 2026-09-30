@@ -304,32 +304,17 @@ def _run_one_round(task_id: str, info=None) -> str:
     except Exception as exc:
         logger.warning("[选品] 刷新 last_run_time 失败 task={}: {}", task_id, exc)
 
-    # 2. 校验账号登录态（storage 缺失 → 标 invalid + 跳过本轮，不抛异常避免死循环失败）
-    try:
-        storage_state = get_account_manager().load_storage(account_id)
-    except FileNotFoundError as exc:
-        # DB 有账号记录但 FS 无 storage.json（账号列表与 accounts 目录漂移）
-        # 不再自动弹内置浏览器，让用户去账号管理手动重新登录（更可控）
-        msg = "账号登录态文件丢失，请到「账号管理」重新登录"
-        logger.warning("[选品] {}（原异常：{}）", msg, exc)
-        _mark_account_invalid(account_id, reason="storage 目录缺失")
-        _write_log(task_id, 0, 0, 0, msg)
-        if info:
-            info.message = msg
-        # 任务 #59 P0 #3：返 "failed" 而非 dict（状态机契约对齐）
-        return "failed"
-    except Exception as exc:
-        msg = f"账号登录态文件读取失败：{exc}"
-        _mark_account_invalid(account_id, reason=f"storage 读取失败: {exc}")
-        _write_log(task_id, 0, 0, 0, msg)
-        if info:
-            info.message = msg
-        # 任务 #59 P0 #3：返 "failed" 而非 dict（状态机契约对齐）
-        return "failed"
-
-    if not storage_state.get("cookies"):
-        msg = "账号未登录，请到「账号管理」重新登录"
-        _mark_account_invalid(account_id, reason="storage 无 cookie")
+    # 2. 校验账号 profile_dir 存在（#fix-unify-profile-storage 统一持久化路径）
+    #    profile_dir 缺失 → 标 invalid + 跳过本轮（让用户去账号管理重新登录写满 profile）
+    from app.services.douyin_account import get_profile_dir
+    profile_dir = get_profile_dir(account_id)
+    # 检查 profile 是否有效（Default/Network/Cookies 或 Default/Cookies 存在）
+    has_cookies = (profile_dir / "Default" / "Network" / "Cookies").exists() or \
+                  (profile_dir / "Default" / "Cookies").exists()
+    if not has_cookies:
+        msg = "账号 profile 缺失，请到「账号管理」重新登录"
+        logger.warning("[选品] {}（profile_dir={}）", msg, profile_dir)
+        _mark_account_invalid(account_id, reason="profile 缺失")
         _write_log(task_id, 0, 0, 0, msg)
         if info:
             info.message = msg
@@ -352,15 +337,20 @@ def _run_one_round(task_id: str, info=None) -> str:
     )
 
     # 3. 一次会话内翻页 search + 批量 detail（任务 #449：复用 context/page）
-    cookies = poi_service._storage_to_playwright_cookies(storage_state)
+    cookies = None
     try:
         with browser_actor.new_session(
             url=poi_service.UPLOAD_URL,
-            storage_state=storage_state,
+            user_data_dir=profile_dir,
             cookies=cookies,
             timeout_ms=60000,
             referer=poi_service.UPLOAD_URL,
             label=f"shop_pull:{task_id[:8]}",
+            # #审查决定：门店拉取硬编码 headless=True，避免与 BrowserActor 其他路径
+            # 串行使用 profile_dir 时出现 chromium lock file 冲突（实测浏览器
+            # 已关闭类异常）。需要观察浏览器内部行为走 publish / check / 登录窗路径，
+            # 这三类跟 browser_show_window 配置切换 headless。
+            headless=True,
         ) as session:
             # 3a. 翻页拉取
             for page in range(1, MAX_PAGES_PER_ROUND + 1):

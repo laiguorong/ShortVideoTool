@@ -1820,10 +1820,11 @@ def _dispatch_items(item_ids: list[str]) -> int:
     循环原子 UPDATE waiting→publishing 抢占并调 inner（task_service pool max_workers=1
     仍限制并发）。
 
-    关键修复 #bug：原版 dispatch 阶段对每条 item 都原子 UPDATE waiting→publishing，结果
-    所有 waiting 都被抢光（但只 submit 1 次），worker 进入 while 时 SELECT waiting 已空
-    → 立刻 break，task 永远卡在「全 publishing / 不前进」。修：dispatch 只 submit 不抢 item，
-    由 worker 自己循环抢占。
+    关键修复 #bugfix-dispatch-claim：
+    原版 dispatch 阶段对每条 item 都原子 UPDATE waiting→publishing，结果所有 waiting
+    都被抢光（但只 submit 1 次），worker 进入 while 时 SELECT waiting 已空 → 立刻 break
+    → done_count=0 → return "failed"，task 永远卡在「publishing 但没前进」。
+    修：dispatch 只 submit 不抢 item，状态翻转由 _publish_one_task 2199-2204 行自己抢。
 
     参数:
         item_ids: 已在外层过滤好的 publish_task_item.id 列表
@@ -1838,15 +1839,12 @@ def _dispatch_items(item_ids: list[str]) -> int:
     if not item_ids:
         return 0
     d = get_db()
-    # #confirm-kickoff-2：dispatch 阶段原子 UPDATE waiting→publishing，让前端 confirm 后立即看到
-    # 全部明细状态翻转（不等 worker 启动后再抢）。原子抢与 worker 抢占使用同一条 SQL，
-    # 并发安全；worker 起来后 SELECT waiting 已空 → break，无副作用。
+    # #fix-dispatch-claim-XXX：dispatch 不再原子 UPDATE waiting→publishing。原版让前端
+    # 立即看到状态翻转（视觉收益 ≤ 几十 ms），但代价是 worker SELECT waiting 已空 → 立刻
+    # break → done_count=0 → task 立即 failed。状态翻转由 _publish_one_task 2199-2204 行
+    # 自己抢即可。
+    # 预取去重的 task_id + task_name：dispatch 只决定 submit 哪些 task
     marks = ",".join("?" * len(item_ids))
-    d.execute(
-        f"""UPDATE publish_task_item SET status='publishing'
-            WHERE id IN ({marks}) AND status='waiting'""",
-        tuple(item_ids))
-    # 预取去重的 task_id + task_name：dispatch 不再动 item.status，只决定 submit 哪些 task
     rows = d.query_all(
         f"""SELECT DISTINCT pti.task_id, pt.task_name
             FROM publish_task_item pti

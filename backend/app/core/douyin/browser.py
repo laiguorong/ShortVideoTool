@@ -178,6 +178,26 @@ class BrowserActor:
         except Exception:  # noqa: BLE001 配置未初始化（启动早期）默认无头
             return True
 
+    def _reset_tls_for_sync_api(self) -> None:
+        """独立 sync_playwright() 前调用：关闭 + 清空当前线程 tls.runtime，
+        避免「inside the asyncio loop」冲突（tls 已开 + 新 sync_playwright 同线程共存）。
+        复用此方法于 BrowserSearchSession / open_login_window / check_account 三处独立 sync_playwright。
+        """
+        browser = getattr(self._tls, "browser", None)
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            self._tls.browser = None
+        old_pw = getattr(self._tls, "playwright", None)
+        if old_pw is not None:
+            try:
+                old_pw.stop()
+            except Exception:
+                pass
+            self._tls.playwright = None
+
     def _ensure_browser(self, headless: bool = True):
         """确保当前线程的 Chromium 已启动（懒启动 + 崩溃重建）。
 
@@ -276,6 +296,7 @@ class BrowserActor:
         url: str,
         storage_state: dict | None = None,
         cookies: list[dict] | None = None,
+        user_data_dir: Optional["Path"] = None,
         headless: Optional[bool] = None,
         timeout_ms: int = 60000,
         referer: str = "https://www.douyin.com/",
@@ -301,6 +322,15 @@ class BrowserActor:
         返回:
             BrowserSession（上下文管理器，with 退出自动关 context）
         """
+        # #审查修复：user_data_dir 路径走独立 sync_playwright（_new_session_with_profile_dir
+        # 内部 with sync_playwright() as pw），不复用 tls.runtime——避免 tls 已开 + 新
+        # sync_playwright 同线程共存抛「inside the asyncio loop」（实测 selection_service
+        # 走 user_data_dir 时稳定复现）。仅非 user_data_dir 路径才 _ensure_browser 复用 tls。
+        if user_data_dir is not None:
+            return self._new_session_with_profile_dir(
+                url, user_data_dir, headless=headless,
+                timeout_ms=timeout_ms, referer=referer, label=label,
+            )
         self._ensure_browser(self._resolve_headless(headless))
         context = self._tls.browser.new_context(
             user_agent=UA,
@@ -334,8 +364,61 @@ class BrowserActor:
                 pass
             raise
 
+    def _new_session_with_profile_dir(
+        self, url: str, user_data_dir: "Path",
+        headless: Optional[bool] = None, timeout_ms: int = 60000,
+        referer: str = "https://www.douyin.com/",
+        label: str = "session",
+    ) -> "BrowserSession":
+        """#fix-unify-profile-storage：独立 launch_persistent_context(user_data_dir) 会话。
+
+        与 _publish_via_independent_browser 同源：登录态走持久化 profile（cookies + IndexedDB + localStorage），
+        不走 _tls.browser.new_context（漏 IndexedDB）。
+        """
+        from playwright.sync_api import sync_playwright
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        # #审查修复：之前用 `with sync_playwright() as pw:` 包整个函数体，但 `return session`
+        # 之后 with 立刻退出 → pw.__exit__ 自动关所有由它启动的 chromium/context，
+        # session 创建后立刻被关闭（实测 4.6s 内「Target page, context or browser has been
+        # closed」）。改为手动 start，把 pw_cm 交给 session.close() 释放。
+        pw_cm = sync_playwright()
+        try:
+            pw = pw_cm.__enter__()
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=self._resolve_headless(headless),
+                user_agent=UA,
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=AutomationControlled,AutomationControlledForRenderProcessHost,AutomationControlledForSwap",
+                    "--no-sandbox", "--no-first-run",
+                    "--no-default-browser-check", "--disable-infobars",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            page = context.new_page()
+            page.add_init_script(_ANTI_BOT_INIT_SCRIPT)
+            session = BrowserSession(
+                context=context, page=page,
+                goto_url=url, timeout_ms=timeout_ms, referer=referer,
+                parent=self, label=label,
+                pw_cm=pw_cm,
+            )
+            with self._run_lock:
+                session._initial_goto()
+            return session
+        except Exception:
+            # 启动失败：手动清理 pw_cm（不会落到 session.close()）
+            try:
+                pw_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            raise
+
     def run(self, url: str, capture: Callable[[str], bool], cookies: list[dict] | None = None,
-            storage_state: dict | None = None,
+            storage_state: dict | None = None, user_data_dir: Optional["Path"] = None,
             actions: Optional[Callable] = None, headless: Optional[bool] = None,
             timeout_ms: int = 30000, referer: str = "https://www.douyin.com/",
             manual_wait_ms: int = 0) -> list[dict]:
@@ -349,6 +432,9 @@ class BrowserActor:
                 抖音接口需要 msToken / a_bogus 等 localStorage token 算签名，
                 只注 cookies 拿不到 localStorage → 签名失败 0 响应。
                 优先于 cookies，二选一。
+            user_data_dir: chromium 持久化 profile 目录（#fix-unify-profile-storage）
+                传此参数时改走独立 launch_persistent_context，跳过全局 _tls.browser。
+                与 storage_state 互斥（持久化 profile 包含完整登录态）。
             actions: 页面加载后的附加操作（如滚动翻页），参数为 page
             headless: 无头模式（调试时 False 可肉眼观察）
             timeout_ms: 单次导航超时
@@ -358,11 +444,79 @@ class BrowserActor:
         返回:
             拦截到的响应 JSON 列表（解析失败的跳过）
         """
+        # #fix-unify-profile-storage：传 user_data_dir 时走独立 launch_persistent_context 路径
+        if user_data_dir is not None:
+            return self._run_with_profile_dir(
+                url, capture, user_data_dir=user_data_dir,
+                actions=actions, headless=headless,
+                timeout_ms=timeout_ms, referer=referer, manual_wait_ms=manual_wait_ms,
+            )
         # #131：浏览器单例不支持高并发，多 context 同时 nav/拦 XHR 会互相
         # 干扰（实测偶发 0 响应）。run() 全程加锁串行，简单稳定。
         with self._run_lock:
             return self._run_impl(url, capture, cookies, storage_state, actions, headless,
                                   timeout_ms, referer, manual_wait_ms)
+
+    def _run_with_profile_dir(self, url: str, capture: Callable[[str], bool],
+                              user_data_dir: "Path",
+                              actions: Optional[Callable] = None,
+                              headless: Optional[bool] = None,
+                              timeout_ms: int = 30000,
+                              referer: str = "https://www.douyin.com/",
+                              manual_wait_ms: int = 0) -> list[dict]:
+        """#fix-unify-profile-storage：独立 launch_persistent_context(user_data_dir=...) 路径。
+
+        与 _publish_via_independent_browser（publish_actions.py）同源：登录态走持久化 profile
+        （cookies + IndexedDB + localStorage），不走 _tls.browser.new_context（漏 IndexedDB）。
+        """
+        from playwright.sync_api import sync_playwright
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        captured: list[dict] = []
+        with sync_playwright() as pw:
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=self._resolve_headless(headless),
+                user_agent=UA,
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=AutomationControlled,AutomationControlledForRenderProcessHost,AutomationControlledForSwap",
+                    "--no-sandbox", "--no-first-run",
+                    "--no-default-browser-check", "--disable-infobars",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            try:
+                page = context.new_page()
+                page.add_init_script(_ANTI_BOT_INIT_SCRIPT)
+
+                def _on_response(resp):
+                    try:
+                        if capture(resp.url):
+                            captured.append(resp.json())
+                    except Exception:
+                        pass
+                page.on("response", _on_response)
+
+                page.goto(url, timeout=timeout_ms, referer=referer, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
+                if actions:
+                    actions(page)
+                settle_deadline = min(timeout_ms, 15000) // 1000
+                for _ in range(settle_deadline):
+                    if captured:
+                        break
+                    page.wait_for_timeout(1000)
+                if not captured and manual_wait_ms > 0:
+                    deadline = manual_wait_ms // 1000
+                    for _ in range(deadline):
+                        page.wait_for_timeout(1000)
+                        if captured:
+                            break
+                return captured
+            finally:
+                context.close()  # flush profile 落盘
 
     def _run_impl(self, url: str, capture: Callable[[str], bool],
                   cookies: list[dict] | None = None,
@@ -477,8 +631,10 @@ class BrowserActor:
         user_data_dir = _Path(user_data_dir)
         user_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # 用独立 playwright runtime（独立线程内创建、close、stop），
-        # 不动 self._tls / 不抢 self._run_lock
+        # 用独立 playwright runtime（独立线程内创建、close、stop）。
+        # 若当前线程已有 tls.runtime，先 cleanup 避免「inside the asyncio loop」冲突
+        # （实测与 BrowserSearchSession 同一线程调用时稳定复现）。
+        self._reset_tls_for_sync_api()
         pw = sync_playwright().start()
         context = None
         try:
@@ -511,22 +667,33 @@ class BrowserActor:
             except Exception as exc:
                 logger.warning("[浏览器] 登录页初始导航异常（可能需用户手动操作）: {}", exc)
 
-            # 监测登录成功：与 check_account 统一为「域 + sessionid + DOM 资料卡」三重判据
-            # 注：用户扫码后可能停在 creator-micro/content/upload 或 home 子路径，
-            # 不能精确匹配 creator-micro/home（会卡死 300s）——只用 creator.douyin.com 域判定。
+            # 监测登录成功：sessionid cookie 出现即视为登录成功（创作者接口鉴权唯一硬判据）。
+            # 登录成功 → 主动跳 creator-micro/home（修复「抖音 SDK 跳精选页后 evaluate 拿空」）。
+            # 等 DOM 资料卡 selector 命中 → 进 evaluate。
+            # 注：与 check_account 不同点——check_account 强制 goto(home) 是因为它用 storage cookies 模拟；
+            # 这里是扫码后真实跳转，URL 不可预测（精选/data-analysis/upload 等），必须主动拉回 home。
+            home_url = "https://creator.douyin.com/creator-micro/home"
             deadline = timeout_s
             for i in range(deadline):
                 page.wait_for_timeout(1000)
-                current_url = page.url
-                # 1. URL 在 creator.douyin.com 域 + 不在 /login（已登出 /login）
-                if "/login" in current_url.lower() or "creator.douyin.com" not in current_url:
-                    continue
-                # 2. sessionid cookie 必须出现（创作者接口鉴权唯一凭据）
+                # 1. sessionid cookie 必须出现（登录成功的硬判据）
                 cookies = context.cookies()
                 cookie_names = {c['name'] for c in cookies}
                 if 'sessionid' not in cookie_names:
                     continue
-                # 3. 等 DOM 资料卡 selector（与 check_account 同一 selector，5s 超时不抛）
+                # 2. URL 仍在 /login → 等扫码完成
+                current_url = page.url
+                if "/login" in current_url.lower():
+                    continue
+                # 3. 不在 home → 主动 goto(home) 拉回创作者中心（修复「跳精选页后 evaluate 失败」）
+                if home_url not in current_url:
+                    logger.info("[浏览器] 登录成功后停在 {}，主动跳 home 拿 profile", current_url)
+                    try:
+                        page.goto(home_url, timeout=15000, wait_until="domcontentloaded")
+                    except Exception as exc:
+                        logger.warning("[浏览器] 主动跳 home 失败: {}", exc)
+                        continue
+                # 4. 等 DOM 资料卡 selector（unique_id- / nick_name），5s 超时不抛
                 dom_ok = False
                 for sel in ('[class*="unique_id-"]', '[class*="nick_name"]'):
                     try:
@@ -536,53 +703,94 @@ class BrowserActor:
                     except Exception:
                         continue
                 if not dom_ok:
-                    # 域对 + sessionid 有但 DOM 没渲染（SPA 跳转中 / 风控空壳）
+                    # sessionid 有 + 在 home 但 DOM 没渲染（SPA 跳转中 / 风控空壳）
                     # → 不算登录成功，继续等下一轮
                     continue
                 # 三重确认通过：等 SDK 异步写入 + 触发创作者中心 → 持久化由 user_data_dir 自动完成
                 # #451：登录成功后等 SDK 异步写入 localStorage（__tea_cache_tokens_*/security-sdk 等
                 # 跨域 origin 异步初始化），立即关闭会丢 origins，导致发布时找不到 input
                 page.wait_for_timeout(5000)
-                try:
-                    page.goto("https://creator.douyin.com/creator-micro/home",
-                              timeout=15000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
-                except Exception:
-                    pass
+
+                # 登录后强制回 home：扫码成功后页面会自动跳转（content/upload/data-analysis 等子页），
+                # 非 home 页面 evaluate 拿不到 unique_id 锚点 → nickname/douyin_id/avatar 三字段全空。
+                # 持续监控：每 500ms 轮询 page.url，不在 home 立即强制跳 home，连续 1.5s 在 home 才 evaluate。
+                # 注：不用 framenavigated 监听（SPA pushState 不触发事件），纯轮询更可靠。
+                home_url = "https://creator.douyin.com/creator-micro/home"
+                home_stable_ticks = 0
+                for _ in range(30):  # 最多 15s
+                    page.wait_for_timeout(500)
+                    cur = page.url
+                    if home_url in cur:
+                        home_stable_ticks += 1
+                        if home_stable_ticks >= 3:  # 1.5s 稳定在 home
+                            break
+                    else:
+                        # 不在 home → 立即强制跳（避免反复跳转残留）
+                        logger.info("[浏览器] 监测到跳转 {}，强制回 home 拿 profile", cur)
+                        try:
+                            page.goto(home_url, timeout=10000, wait_until="domcontentloaded")
+                        except Exception as exc:
+                            logger.warning("[浏览器] 强制跳 home 失败: {}", exc)
+                        home_stable_ticks = 0
+
+                # 兜底：15s 循环超时仍未在 home → 最后再强制跳一次
+                if home_url not in page.url:
+                    logger.warning("[浏览器] 15s 内未稳定在 home，最后一次强制")
+                    try:
+                        page.goto(home_url, timeout=15000, wait_until="domcontentloaded")
+                    except Exception as exc:
+                        logger.warning("[浏览器] 最终强制跳 home 失败: {}", exc)
+
+                # 等 home 资料卡渲染（与 check_account 完全一致）
+                for sel in ('[class*="unique_id-"]', '[class*="nick_name"]'):
+                    try:
+                        page.wait_for_selector(sel, timeout=5000)
+                        break
+                    except Exception:
+                        continue
+                page.wait_for_timeout(2000)
                 # #452：context.close() 会 flush user_data_dir（cookies + IndexedDB + localStorage 全部持久化）
-                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                # fix-storage-state：一次性拿全 cookies + origins + localStorage，作为后续 cookie_str / 兜底
+                # / storage.json 三处的唯一源，避免 SDK 异步刷新 cookie 期间三处数据漂移。
+                # 异常降级：仅捕获 Playwright/IO 错误（非业务异常），降级路径再调一次 context.cookies() 拿
+                # 最新快照，避免 SDK 异步 Set-Cookie 漂移。
+                try:
+                    from playwright.sync_api import Error as PlaywrightError
+                except ImportError:  # 理论不会发生（hard dep），防御性兜底
+                    PlaywrightError = Exception
+                try:
+                    storage_dict = context.storage_state()
+                    final_cookies = storage_dict.get("cookies") or cookies
+                except (PlaywrightError, OSError) as exc:
+                    logger.warning("[浏览器] context.storage_state() 失败: {}", exc)
+                    storage_dict = None
+                    # 降级再拿一次最新 cookies（SDK 异步 Set-Cookie 漂移场景）
+                    try:
+                        final_cookies = context.cookies() or cookies
+                    except (PlaywrightError, OSError) as exc2:
+                        logger.warning("[浏览器] context.cookies() 降级也失败: {}", exc2)
+                        final_cookies = cookies
+                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in final_cookies)
                 logger.info("[浏览器] 登录成功（{}s），profile 持久化到 {}（{} 个 cookie）",
-                            i + 1, user_data_dir, len(cookies))
+                            i + 1, user_data_dir, len(final_cookies))
                 # #452：同步写 storage.json 备份（API 校验用 + 兼容旧调用方）
                 if save_path is not None:
                     try:
-                        # 抓 origins 列表（cookies 已有，origins 需要 page.evaluate 序列化）
-                        origins_data = []
-                        for origin_url in {c.get("domain", "") for c in cookies if c.get("domain")}:
-                            if not origin_url:
-                                continue
-                            try:
-                                page.goto(f"https://{origin_url.lstrip('.')}",
-                                          timeout=10000, wait_until="domcontentloaded")
-                                ls = page.evaluate(
-                                    "() => Object.entries(localStorage).map(([k,v]) => ({name:k, value:v}))"
-                                )
-                                if ls:
-                                    origins_data.append({"origin": page.url.rstrip('/'), "localStorage": ls})
-                            except Exception:
-                                pass
-                        storage_dict = {"cookies": cookies, "origins": origins_data}
-                        import json as _json
-                        save_path.parent.mkdir(parents=True, exist_ok=True)
-                        save_path.write_text(_json.dumps(storage_dict, ensure_ascii=False, indent=2),
-                                              encoding="utf-8")
-                        logger.info("[浏览器] storage.json 备份: {}", save_path)
+                        # 防御性兼容 str/Path 两种类型（#bug-617：str 类型 .parent 不存在报错）
+                        from pathlib import Path as _Path
+                        save_path_obj = _Path(save_path) if isinstance(save_path, str) else save_path
+                        # storage_state() 失败时兜底只写 cookies（不写 origins）
+                        save_data = storage_dict if storage_dict is not None else {"cookies": cookies}
+                        save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                        save_path_obj.write_text(json.dumps(save_data, ensure_ascii=False, indent=2),
+                                                 encoding="utf-8")
+                        logger.info("[浏览器] storage.json 备份: {}", save_path_obj)
                     except Exception as exc:
                         logger.warning("[浏览器] storage.json 备份失败: {}", exc)
                 profile = _extract_creator_profile(page)
                 # evaluate 拿不到 douyin_id 时，从 cookies 兜底（uid/passport_uid）
                 if not profile.get("douyin_id"):
-                    cookie_map = {c['name']: c.get('value', '') for c in cookies}
+                    cookie_map = {c['name']: c.get('value', '') for c in final_cookies}
                     profile["douyin_id"] = (
                         cookie_map.get("uid")
                         or cookie_map.get("passport_uid")
@@ -705,7 +913,8 @@ class BrowserSession:
     """
 
     def __init__(self, context, page, goto_url: str, timeout_ms: int,
-                 referer: str, parent: BrowserActor, label: str = "session"):
+                 referer: str, parent: BrowserActor, label: str = "session",
+                 pw_cm=None):
         self._context = context
         self._page = page
         self._goto_url = goto_url
@@ -713,6 +922,9 @@ class BrowserSession:
         self._referer = referer
         self._parent = parent  # 持父级 _run_lock
         self._label = label
+        # #审查修复：独立 sync_playwright 的 context manager（_new_session_with_profile_dir
+        # 用）。close 时一并 stop playwright runtime，避免外部 with 自动关闭抢在 session 之前。
+        self._pw_cm = pw_cm
         self._closed = False
         self._resp_handler = None
         # 统计：call 次数 / 分类耗时 / 空响应数
@@ -748,7 +960,22 @@ class BrowserSession:
                 except Exception:
                     pass
                 self._resp_handler = None
-            self._context.close()
+            # #审查修复：独立 sync_playwright runtime 清理（必须最后关——它停了之后
+            # _context / _page 都失效；浏览器在 _context.close() 时关掉，pw_cm.__exit__
+            # 仅负责 stop driver + 关 asyncio loop）。
+            if self._pw_cm is not None:
+                try:
+                    self._context.close()
+                except Exception:
+                    pass
+                try:
+                    self._pw_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._pw_cm = None
+            else:
+                # 非独立 sync_playwright 路径（tls 复用）：仅关 context
+                self._context.close()
         except Exception:
             pass
         # 输出统计汇总行（一次会话一打，方便量化复用收益）

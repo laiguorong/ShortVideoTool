@@ -64,7 +64,7 @@ class BrowserSearchSession:
         if self._page is not None:
             return
         from playwright.sync_api import sync_playwright
-        from app.core.douyin.browser import UA
+        from app.core.douyin.browser import UA, browser_actor
         # #P0-11：BrowserActor detail path 在同线程持有 sync_playwright runtime，
         # dispatcher loop 持续 running（_tls.playwright 不关）→ 当前线程
         # asyncio.get_running_loop() 返回 is_running=True 的 loop。
@@ -73,46 +73,16 @@ class BrowserSearchSession:
         # 解法：search 前先强制关闭 BrowserActor 同线程的 playwright + browser runtime，
         # 再起新的 sync_playwright()——两个 runtime 在同一线程不共存，避免 loop 残留冲突。
         # BrowserActor 后续 detail 时会自动重建（_ensure_browser 检查 is_connected）。
-        import asyncio as _asyncio
-        from app.core.douyin.browser import browser_actor
-        tls = getattr(browser_actor, "_tls", None)
-        if tls:
-            old_browser = getattr(tls, "browser", None)
-            if old_browser is not None:
-                try:
-                    old_browser.close()
-                except Exception:
-                    pass
-                tls.browser = None
-            old_pw = getattr(tls, "playwright", None)
-            if old_pw is not None:
-                try:
-                    old_pw.stop()
-                except Exception:
-                    pass
-                tls.playwright = None
+        browser_actor._reset_tls_for_sync_api()
 
         self._pw_cm = sync_playwright()
         self._pw = self._pw_cm.__enter__()
-        self._ctx = self._pw.chromium.launch_persistent_context(
-            user_data_dir=self._profile_dir,
-            headless=self._headless,
-            user_agent=UA,
-            viewport={"width": 1440, "height": 900},
-            locale="zh-CN",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=AutomationControlled,AutomationControlledForRenderProcessHost,AutomationControlledForSwap",
-                "--no-sandbox",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-infobars",
-                "--disable-dev-shm-usage",
-            ],
+        # #审查建议：playwright 启动是耗时操作（3-5s），之前完全静默，运维无法判断
+        # 是浏览器启动慢还是网络慢。打印 profile_dir + headless 便于排查。
+        logger.info(
+            "[搜索会话] 启动浏览器（playwright） profile_dir={} headless={}",
+            self._profile_dir, self._headless,
         )
-        self._page = self._ctx.new_page()
-        # 一次性注册监听器（避免多次 on() 累积导致重复 append 错位）
-        self._page.on("response", self._on_response)
         self._ctx = self._pw.chromium.launch_persistent_context(
             user_data_dir=self._profile_dir,
             headless=self._headless,
@@ -149,7 +119,7 @@ class BrowserSearchSession:
         sort_type: int = 0,
         publish_time: int = 0,
         filter_duration: str = "",
-        timeout: int = 20,
+        timeout: int = 60,
     ) -> dict:
         """在已 launch 的浏览器里拦截 search/item XHR 拿一页结果。
 
@@ -157,6 +127,10 @@ class BrowserSearchSession:
         - 清空 _captured 复用同一监听器
         - page.expect_response() 等待匹配 search/item 的响应（比 polling 更准）
         - page.goto 触发搜索（首屏 + 翻页都换 offset 重 navigate）
+
+        timeout 默认 60s：#审查调高——首屏冷启 + 风控握手 + 慢响应可能超 20s，
+        旧值 20s 在翻页第 3-4 页时偶现误判为搜索被拦截（实际是接口慢）。
+        60s 仍能在 1 分钟内抛出，便于 _run_pull_round 早退重试机制继续工作。
 
         参数:
             keyword: 搜索关键词
@@ -204,11 +178,37 @@ class BrowserSearchSession:
 
         try:
             # 用 expect_response 等匹配 URL 的响应，避免 polling + wait_for_timeout 抓旧 XHR
-            with page.expect_response(
-                lambda r: "search/item" in r.url and "aweme/v1/web" in r.url,
-                timeout=timeout * 1000,
-            ) as resp_info:
-                page.goto(url, wait_until="domcontentloaded")
+            try:
+                with page.expect_response(
+                    lambda r: "search/item" in r.url and "aweme/v1/web" in r.url,
+                    timeout=timeout * 1000,
+                ) as resp_info:
+                    page.goto(url, wait_until="domcontentloaded")
+            except Exception as exc:
+                # #审查建议：超时/失败时输出诊断上下文（URL/标题/console/已收到的所有 response）
+                # 便于区分是「真风控」「网络慢」「登录失效」「DOM 未渲染」哪种情况
+                _diag_lines: list[str] = []
+                try:
+                    _diag_lines.append(f"page.url={page.url}")
+                except Exception:
+                    pass
+                try:
+                    _diag_lines.append(f"page.title={page.title()!r}")
+                except Exception:
+                    pass
+                try:
+                    _msgs = [f"{m.type}: {m.text}" for m in page.context.pages[0].context._impl_obj._background_pages] if False else []
+                except Exception:
+                    pass
+                try:
+                    # 监听 search/item 期间页面收到的所有响应（XHR 列表）
+                    _diag_lines.append(f"已收到响应: {self._captured[:5]}")
+                except Exception:
+                    pass
+                _diag = " | ".join(_diag_lines)
+                raise SearchBlockedError(
+                    f"搜索 XHR 等待失败：{exc} | 诊断：{_diag}"
+                ) from exc
             try:
                 body = resp_info.value.json()
             except Exception as e:

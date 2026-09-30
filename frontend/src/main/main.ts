@@ -198,14 +198,16 @@ async function startBackend(dataDir: string | null = null) {
     // 生产路径：单文件后端，无需 Python 环境
     // #382：stdio 改为 'pipe' 以捕获 stderr，弹窗可展示真实失败原因
     const dataDirArg = dataDir ? ['--data-dir', dataDir] : []
-    logDev(`[Main] 启动内置后端: ${bundled} --port ${BACKEND_PORT}${dataDir ? ` --data-dir ${dataDir}` : ''}`)
+    // 指向 extraResources 拷入的 chromium 目录，避免走默认 %LOCALAPPDATA%\ms-playwright
+    const msPlaywrightPath = path.join(path.dirname(bundled), 'ms-playwright')
+    logDev(`[Main] 启动内置后端: ${bundled} --port ${BACKEND_PORT}${dataDir ? ` --data-dir ${dataDir}` : ''} (PLAYWRIGHT_BROWSERS_PATH=${msPlaywrightPath})`)
     backendProcess = spawn(
       bundled,
       ['--port', String(BACKEND_PORT), '--host', '127.0.0.1', ...dataDirArg],
       {
         cwd: path.dirname(bundled),
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: baseEnv,
+        env: { ...baseEnv, PLAYWRIGHT_BROWSERS_PATH: msPlaywrightPath },
       },
     )
   } else {

@@ -13,6 +13,10 @@ class AddAccountRequest(BaseModel):
     nickname: str = Field(default="", description="登录窗从页面 evaluate 拿到的昵称")
     douyin_id: str = Field(default="", description="登录窗从页面 evaluate 拿到的抖音号")
     avatar: str = Field(default="", description="登录窗从页面 evaluate 拿到的头像 URL")
+    profile_dir: Optional[str] = Field(
+        default=None,
+        description="登录窗临时 chromium profile 目录（添加账号场景，cookie 落库后搬移到 accounts/{id}/profile/）",
+    )
 
 
 class ReloginRequest(BaseModel):

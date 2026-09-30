@@ -126,15 +126,16 @@ def test_draft_preview_confirm_end_to_end() -> None:
     task = db_module.db.query_one("SELECT * FROM publish_task WHERE id=?", (task_id,))
     assert task["status"] == "running"
 
-    # 明细数 = 10；confirm 后被 dispatch_all_waiting 全部抢为 publishing
+    # 明细数 = 10；dispatch 不再抢 item → 状态仍为 waiting（worker 自己抢）
     items = db_module.db.query_all(
         "SELECT * FROM publish_task_item WHERE task_id=? ORDER BY plan_time ASC, id ASC",
         (task_id,))
     assert len(items) == 10
-    # 全部明细 confirm 后立即 publishing，不再依赖 poller 按 plan_time 触发
+    # #fix-dispatch-claim-XXX：dispatch 不再 UPDATE waiting→publishing，避免 worker 找不到
+    # waiting → 立即 failed。状态翻转由 _publish_one_task 2199-2204 行自己抢。
     for it in items:
-        assert it["status"] == "publishing", (
-            f"#confirm-kickoff-2：全部明细应立即 publishing，实际 {it['status']!r} "
+        assert it["status"] == "waiting", (
+            f"dispatch 不抢 item，应仍为 waiting，实际 {it['status']!r} "
             f"plan_time={it['plan_time']!r}"
         )
         assert it["declaration"] == "ai_generated"
@@ -142,7 +143,7 @@ def test_draft_preview_confirm_end_to_end() -> None:
         assert it["intro_snapshot"]
         topics = json.loads(it["topics_snapshot"])
         assert isinstance(topics, list)
-    # 成品被占
+    # 成品被占（confirm 时同步占，dispatch 不抢不影响）
     occ = db_module.db.query_one(
         "SELECT COUNT(*) AS c FROM generated_video WHERE status='occupied'")["c"]
     assert occ == 10

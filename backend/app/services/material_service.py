@@ -8,8 +8,11 @@ import hashlib
 import json
 import re
 import shutil
+import threading
 import time
+import uuid
 from pathlib import Path
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -20,7 +23,7 @@ from app.db import get_db
 from app.db.utils import now_str
 from app.services import account_service
 from app.services.task_service import task_service, raise_for_cancel, _fmt_hms, interruptible_sleep
-from app.services.setting_service import get_data_dir
+from app.services.setting_service import get_data_dir, load_settings
 
 _JOB_PREFIX = "video_pull:"
 # #96：跨调用去重 set——同一 (pattern, error) 已打过 WARNING 就跳过，
@@ -598,6 +601,11 @@ def _run_pull_round(task_id: str, info) -> str:
     from app.core.douyin.search_api import BrowserSearchSession
     from app.services.douyin_account import get_profile_dir
     profile_dir = get_profile_dir(account["id"])
+    # #审查决定：素材拉取硬编码 headless=True（不显示浏览器窗口）。
+    # 原因：拉取任务频率高、profile_dir 短时间内被 BrowserSearchSession 和 BrowserActor
+    # 串行使用，headless=False 时两个 chromium 实例的 lock file 冲突（实测浏览器
+    # 已关闭类异常）。需要观察浏览器内部行为（搜索/详情/补抓身份）走 publish / check /
+    # 登录窗路径，这三类跟 browser_show_window 配置切换 headless。
     new_count = skip_count = intercept_count = 0
     fail_reason = ""
     reached_limit = False
@@ -614,8 +622,44 @@ def _run_pull_round(task_id: str, info) -> str:
     # 生成一次，整轮翻页复用。
     # #506 浏览器会话无 search_id 概念，保留此变量仅为兼容 client.search_videos
     # 签名占位（实际不参与 XHR 参数构造）。
-    import uuid
     search_id = uuid.uuid4().hex
+
+    def _write_progress() -> None:
+        """统一写入 progress 模板（多处调用：入循环前 / 每页完成 / 4 个 except 块）。
+
+        模板固定：`拉取第 {page}/{page_budget} 页，已入库 {new_count}，跳过 {intercept_count}，用时 ...`
+        错误细节走 info.message（不在 progress 里混错误类型，避免模板撕裂）。
+        """
+        nonlocal new_count, intercept_count
+        info.progress = (
+            f"拉取第 {page}/{page_budget} 页，已入库 {new_count}，"
+            f"跳过 {intercept_count}，用时 {_fmt_hms(int(time.time() - round_start))}"
+        )
+
+    # 入循环前先写一次初始 progress——首轮 search_videos 期间（约 5-20s，
+    # 含 XHR + 风控握手）状态栏才能看到「拉取第 1/N 页」而不是空白，
+    # 空页早退（empty_pages/has_more=0）时也有初始值兜底。
+    _write_progress()
+
+    # #审查建议：60s search_videos 阻塞期间主线程被卡住，progress 字面静止
+    # 用户在状态栏看不到「用时」数字递增会误判卡死。
+    # keepalive daemon 每 10s 调一次 _write_progress()，仅刷新「用时」字段，
+    # 让用户感知任务还活着。worker 退出时通过 _keepalive_stop 通知停止。
+    _keepalive_stop = threading.Event()
+    def _keepalive_loop() -> None:
+        while not _keepalive_stop.is_set():
+            # wait 带超时，可被 set() 立即唤醒
+            if _keepalive_stop.wait(10):
+                break
+            try:
+                _write_progress()
+            except Exception as exc:  # noqa: BLE001
+                # daemon 异常属于「状态栏停止刷新」的用户体验降级场景，用 warning 留痕
+                # （debug 默认不输出，等于没留痕）。daemon 在 worker 退出但 stop 尚未生效的
+                # 窗口期可能触发异常，不抛出避免日志污染。
+                logger.warning("keepalive tick 异常 {}", exc)
+    _keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True, name="pull-progress-keepalive")
+    _keepalive_thread.start()
 
     def _process_page_videos(videos: list) -> None:
         """处理一页视频：客户端兜底 → 内容过滤 → 下载入库。
@@ -643,6 +687,7 @@ def _run_pull_round(task_id: str, info) -> str:
                 video, task["category_id"], client,
                 source="pull", conditions=conditions, cookie=cookie,
                 account_id=account["id"],   # 此作用域内只有 `account` 字典，无 `account_id` 变量
+                info=info,
             )
             action = single["action"]
             if action == "filtered":
@@ -685,7 +730,7 @@ def _run_pull_round(task_id: str, info) -> str:
             # #审查修复：search_session = None 兜底构造异常时的资源泄露
             search_session = None
             try:
-                search_session = BrowserSearchSession(profile_dir)
+                search_session = BrowserSearchSession(profile_dir, headless=True)
                 result = client.search_videos(
                     profile_dir, conditions, page, search_id,
                     _session=search_session,
@@ -704,11 +749,7 @@ def _run_pull_round(task_id: str, info) -> str:
             _process_page_videos(page_videos)
             # v22+#365：每页完成更新后台任务进度(状态栏实时可见)
             # PR3 #56：progress 模板统一（中文逗号→英文逗号）
-            elapsed_s = int(time.time() - round_start)
-            info.progress = (
-                f"拉取第 {page}/{page_budget} 页，已入库 {new_count}，"
-                f"跳过 {intercept_count}，用时 {_fmt_hms(elapsed_s)}"
-            )
+            _write_progress()
             if reached_limit:
                 break
             # v22 A：早退重试扛瞬时风控
@@ -729,7 +770,7 @@ def _run_pull_round(task_id: str, info) -> str:
                     # #审查修复：search_session = None 兜底构造异常时的资源泄露
                     search_session = None
                     try:
-                        search_session = BrowserSearchSession(profile_dir)
+                        search_session = BrowserSearchSession(profile_dir, headless=True)
                         result = client.search_videos(
                             profile_dir, conditions, page, search_id,
                             _session=search_session,
@@ -767,17 +808,24 @@ def _run_pull_round(task_id: str, info) -> str:
         d.update_by_id("account", account["id"], {"status": "invalid"})
         notifier.notify("warn", "task", f"视频任务「{task['task_name']}」账号失效",
                         "本轮跳过", action=f"relogin:{account['id']}")
+        _write_progress()
     except RiskControlError as e:
         fail_reason = f"风控拦截：{e}"
+        _write_progress()
     except SearchBlockedError as e:
         # #审查修复：搜索风控带 page/keyword 上下文，便于排查
         kw = conditions.get("keyword", "") if isinstance(conditions, dict) else ""
         fail_reason = f"搜索接口风控（page={page}, keyword={kw}）：{e}"
         logger.warning("[拉取任务] 任务「{}」搜索风控 page={} keyword={} reason={}",
                        task["task_name"], page, kw, e)
+        _write_progress()
     except Exception as e:  # noqa: BLE001
         fail_reason = str(e)
+        _write_progress()
     finally:
+        # #审查修复：worker 退出前停掉 keepalive daemon，避免它继续 tick 进
+        # 已释放的闭包（虽然 try/except 兜底，但提前停止更干净）。
+        _keepalive_stop.set()
         # #P0-9：每页 search_videos 已经在 try-finally 内 close session，
         # 此处不重复 close（避免对已 close 的 playwright runtime 二次 stop 抛噪声）。
         # 异常路径（search_videos 抛异常未进入 finally）下，search_session 可能残留；
@@ -1265,7 +1313,8 @@ def _download_music_ingest(music: dict, category_id: str, client,
 
 def _download_and_ingest(video: dict, category_id: str, client,
                          conditions: dict | None = None,
-                         source_type: str = "pull") -> str:
+                         source_type: str = "pull",
+                         info: Optional[Any] = None) -> str:
     """下载视频并入库（拉取/分享共用）。
 
     参数:
@@ -1275,6 +1324,8 @@ def _download_and_ingest(video: dict, category_id: str, client,
         conditions: 拉取任务条件 dict（仅拉取任务传入，用于字幕/主播人脸过滤与 BGM 开关）；
             分享导入场景传 None，跳过内容检测与 BGM。
         source_type: 来源标记 pull（拉取任务）/ share（分享导入）
+        info: 任务信息（worker 上下文）；提供时重试 sleep 改为 interruptible_sleep
+            响应取消信号，传 None 时降级 time.sleep（分享导入场景无 worker info）。
     返回:
         material_id；过滤命中时返回空串 ""（调用方据此计入 skip_count）。
     """
@@ -1284,8 +1335,84 @@ def _download_and_ingest(video: dict, category_id: str, client,
     material_id = new_id()
     save_path = _build_material_path("video", category_id, material_id, video["title"], ".mp4")
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    # #审查建议：下载前打印 URL，便于 curl: (35) Connection reset 等下载失败时排查
+    # 是哪条 CDN 节点/URL 出的问题
+    logger.info(
+        "[下载] 视频 {} → URL={} | 本地={}",
+        video.get("video_id"), video.get("download_url"), save_path,
+    )
+    # curl_cffi 下载大文件偶现 curl: (35) Connection reset
+    # （抖音 CDN 节点切换/瞬时风控），原版无重试直接失败。
+    # 本次优化：detail 接口 download_addr.url_list 含 3 个 CDN 节点备份，
+    # 节点偶发连接重置/超时 → 遍历 download_urls 逐节点尝试，每个节点 1 次重试。
+    # 不可重试：「疑似风控页」（连续重试无意义）/ HTTP 4xx（资源不存在/拒访）。
+    def _download_with_retry() -> None:
+        # CDN fallback 列表：download_urls（detail 接口 video 节点全部直链，按无水印优先拼接）→
+        # download_url（主节点，单 URL 兜底，兼容旧版调用方直接传单 URL 的情况）。
+        # 元素形态：(field, url) 元组，field 是 video 节点字段名便于排查节点归属；
+        # 兼容旧形态（裸 URL 字符串）—— auto-detect 后 normalize。
+        raw = video.get("download_urls") or []
+        candidates: list[tuple[str, str]] = []
+        for item in raw:
+            if isinstance(item, tuple) and len(item) == 2:
+                candidates.append((item[0], item[1]))
+            elif isinstance(item, str) and item:
+                candidates.append(("legacy", item))
+        if not candidates and video.get("download_url"):
+            candidates.append(("download_url", video["download_url"]))
+        if not candidates:
+            save_path.unlink(missing_ok=True)
+            raise DouyinClientError("视频直链为空，无法下载")
+        # 每个 URL 内最多 1 次重试（避免在挂掉的节点上空耗）
+        MAX_URL_RETRIES = 1
+        last_err: Exception | None = None
+        for idx, (field, url) in enumerate(candidates):
+            for attempt in range(MAX_URL_RETRIES + 1):
+                try:
+                    client.download_video(url, str(save_path))
+                    if idx > 0:
+                        logger.info(
+                            "[下载] 视频 {} CDN fallback 成功 field={} URL[{}/{}]",
+                            video.get("video_id"), field, idx + 1, len(candidates),
+                        )
+                    return
+                except DouyinClientError as e:
+                    last_err = e
+                    msg = str(e)
+                    # 不可重试错误：风控页 / HTTP 4xx（用正则匹配状态码独立数字，
+                    # 避免「Timeout 4000ms」之类误匹配「400」）→ 换下一 CDN 节点
+                    # 残文件由 client.download_video 内部 unlink 清理（DRY 单一职责）
+                    if "疑似风控页" in msg or re.search(r"\b(400|401|403|404)\b", msg):
+                        logger.warning(
+                            "[下载] 视频 {} field={} URL[{}/{}] 不可重试（{}）→ 换下一 CDN 节点",
+                            video.get("video_id"), field, idx + 1, len(candidates), msg[:80],
+                        )
+                        break  # 跳出当前 URL 内重试循环，轮到下一 URL
+                    # 已用尽当前 URL 的重试 → 换下一 CDN 节点
+                    if attempt >= MAX_URL_RETRIES:
+                        logger.warning(
+                            "[下载] 视频 {} field={} URL[{}/{}] 重试 {} 次仍失败 → 换下一 CDN 节点",
+                            video.get("video_id"), field, idx + 1, len(candidates), MAX_URL_RETRIES,
+                        )
+                        break
+                    # 退避重试（仍有可能恢复：节点瞬时拥塞）
+                    wait_sec = 1 + attempt * 2  # 1s, 3s
+                    logger.warning(
+                        "[下载重试] 视频 {} field={} URL[{}/{}] 第 {}/{} 次重试 {}s 后 reason={}",
+                        video.get("video_id"), field, idx + 1, len(candidates),
+                        attempt + 1, MAX_URL_RETRIES, wait_sec, msg,
+                    )
+                    if info is not None:
+                        interruptible_sleep(wait_sec, info)
+                    else:
+                        time.sleep(wait_sec)
+        # 所有 CDN 节点都失败（残文件清理交给外层 except BaseException 统一处理，DRY）
+        raise DouyinClientError(
+            f"视频下载失败：所有 {len(candidates)} 个 CDN 节点均不可用"
+        ) from last_err
+
     try:
-        client.download_video(video["download_url"], str(save_path))
+        _download_with_retry()
     except BaseException:
         # #P1-1：下载失败清理残文件
         save_path.unlink(missing_ok=True)
@@ -1406,6 +1533,7 @@ def _process_single_video(
     conditions: dict | None = None,
     cookie: str = "",
     account_id: str = "",   # #P0-8：拉取侧补抓详情走 storage_state 路径
+    info: Optional[Any] = None,
 ) -> dict:
     """单视频统一处理：拉取侧补抓详情 → 客户端兜底过滤 → 去重 → 下载入库。
 
@@ -1460,7 +1588,7 @@ def _process_single_video(
     # 4) 下载 + 内容过滤 + 入库
     try:
         material_id = _download_and_ingest(
-            video, category_id, client, conditions, source_type=source)
+            video, category_id, client, conditions, source_type=source, info=info)
     except DouyinClientError as e:
         return {
             "action": "failed",
@@ -1561,6 +1689,9 @@ def import_share_links(share_texts: list[str], category_id: str) -> dict:
                 result = _process_single_video(
                     resolved, category_id, client,
                     source="share", conditions=None,
+                    # 同步分享导入无 worker info，传 None 让 _download_and_ingest
+                    # 内部降级 time.sleep（不响应取消信号，调用方控制整体超时）
+                    info=None,
                 )
             action = result["action"]
             if action == "new":

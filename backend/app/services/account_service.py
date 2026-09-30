@@ -6,57 +6,38 @@
 """
 
 import json
+import shutil
+from pathlib import Path
 
 from loguru import logger
 
 from app.core import crypto, notifier
 from app.core.douyin import get_douyin_client, LoginInvalidError, DouyinClientError
 from app.core.douyin.avatar_cache import cache_avatar, cache_account_avatar
-from app.core.douyin.poi_service import cookie_str_to_storage_state
 from app.core import task_scheduler
 from app.db import get_db
 from app.db.utils import now_str
 from app.services import setting_service
 from app.services.setting_service import get_data_dir
-from app.services.douyin_account import get_account_manager, extract_login_state
+from app.services.douyin_account import get_account_manager
 from app.services.task_service import task_service
 
 # 定时检测调度任务标识
 _CHECK_JOB_ID = "account_check"
 
 
-def _persist_storage(account_id: str, cookie: str, nickname: str, avatar_url: str) -> None:
-    """把 cookie 重建 storage_state 落盘到账号目录 + 写 meta.json。
-
-    #134：add_account/relink 都调，保证 check_account 读 storage.json 能找到。
-    cookie_str_to_storage_state 重建的 storage 只含 cookies（无 localStorage），
-    但 extract_login_state 对 creator cookie 能判 creator_logged_in
-    （has_mc_security + has_passport），不依赖 localStorage。
-    落盘失败不阻塞主流程（DB cookie 已落库，检测可回退用 DB cookie 重建判定）。
-    """
-    try:
-        mgr = get_account_manager()
-        # save_storage 要求账号目录已存在（_account_dir 不存在会抛 FileNotFoundError）；
-        # add_account 新建账号时目录还没建，这里先建。
-        (mgr.root / account_id).mkdir(parents=True, exist_ok=True)
-        storage = cookie_str_to_storage_state(cookie, ".douyin.com")
-        mgr.save_storage(
-            account_id, storage, nickname=nickname, avatar_url=avatar_url,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[account] 落盘 storage.json 失败 account={}: {}",
-                       account_id, exc)
-
-
-
 def add_account(cookie: str, remark: str = "",
-               profile: dict | None = None) -> dict:
+               profile: dict | None = None,
+               profile_dir: str | None = None) -> dict:
     """添加账号：登录窗已抓到 cookie + 页面身份信息 → 加密落库。
 
     参数:
         cookie: 登录窗抓取的 Cookie 串（必须含 sessionid）
         remark: 备注名（可空，默认取昵称）
         profile: 登录窗 evaluate 拿到的 {"nickname", "douyin_id", "avatar"}（可能字段为空）
+        profile_dir: 登录窗临时 chromium profile 目录路径（添加账号场景）
+            #fix-profile-dir-move：搬移到 accounts/{id}/profile/，确保后续
+            launch_persistent_context 能读到登录态（cookies + IndexedDB）
     返回:
         账号记录 dict
     异常:
@@ -108,9 +89,35 @@ def add_account(cookie: str, remark: str = "",
         d.update_by_id("account", account_id, {"avatar": avatar_local})
     row = d.query_one("SELECT * FROM account WHERE id=?", (account_id,))
     row.pop("cookie_encrypted", None)
-    # #134：落盘 storage.json 到账号目录（check_account / selection_service 依赖）
-    _persist_storage(account_id, cookie, nickname, avatar_local)
+    # #fix-profile-dir-move：搬移登录窗临时 profile_dir 到账号目录
+    # （否则 launch_persistent_context 启动时用空 profile → 无登录态 → 发布失败）
+    if profile_dir:
+        _move_profile_dir(profile_dir, account_id)
     return row
+
+
+def _move_profile_dir(src_path: str, account_id: str) -> None:
+    """把登录窗临时 chromium profile 目录搬移到 accounts/<id>/profile/。
+
+    失败仅日志（不阻塞账号创建，账号本身可用，仅后续发布需重新登录）。
+    """
+    from app.services.douyin_account import get_profile_dir
+    src = Path(src_path)
+    dst = get_profile_dir(account_id)
+    if not src.exists():
+        logger.warning("[profile-dir-move] 源目录不存在: {}", src)
+        return
+    if src.resolve() == dst.resolve():
+        # 已是目标位置（重新登录场景），无需搬
+        return
+    try:
+        # dst 是 get_profile_dir 已 mkdir 的空目录，先删再 move（避免变成 dst/src_basename/）
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.move(str(src), str(dst))
+        logger.info("[profile-dir-move] 临时 profile 搬移成功: {} → {}", src, dst)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[profile-dir-move] 搬移失败: src={} dst={} err={}", src, dst, exc)
 
 
 def list_accounts(status: str = "", keyword: str = "", page: int = 1, page_size: int = 20) -> dict:
@@ -179,56 +186,56 @@ def save_extra_cookies(account_id: str, extra: dict) -> None:
 def check_account(account_id: str) -> dict:
     """检测单个账号登录态，更新状态。
 
-    时序（统一为 login_window 同源判定）：
-    1. 读 storage.json（不存在 → 直接 invalid，必须重新登录）
-    2. 用 storage 启 headless Chromium 加载 creator-micro/home
+    时序（统一为 login_window 同源判定，#fix-unify-profile-storage 统一持久化路径）：
+    1. 检查 profile_dir（accounts/<id>/profile/）是否有 Cookies 文件 → 无直接 invalid
+    2. 用 profile_dir 启 headless Chromium + launch_persistent_context 加载 creator-micro/home
     3. 等 DOM 资料卡 selector [class*="unique_id-"] 出现
     4. 从页面拿 profile（顺路一次 headless 启动完成）
-    5. extract_login_state 字典判定 + DOM 渲染双重确认 → normal/invalid
-
-    删除：DB cookie 重建兜底（cookie_str 是字符串无 origins/localStorage，
-    重建后 extract_login_state 误判 normal 但实际 publish 仍失效）。
+    5. DOM 渲染判定 → normal/invalid
     """
     d = get_db()
     row = d.query_one("SELECT * FROM account WHERE id=? AND deleted=0", (account_id,))
     if not row:
         raise ValueError("账号不存在")
 
-    mgr = get_account_manager()
-    storage = mgr.load_storage(account_id)
-
-    # 1. storage.json 不存在或 cookies 空 → 直接 invalid
-    if not storage.get("cookies"):
+    # 1. profile_dir 不存在或无 Cookies 文件 → 直接 invalid（#fix-unify-profile-storage）
+    from app.services.douyin_account import get_profile_dir as _get_profile_dir
+    profile_dir = _get_profile_dir(account_id)
+    has_cookies = (profile_dir / "Default" / "Network" / "Cookies").exists() or \
+                  (profile_dir / "Default" / "Cookies").exists()
+    if not has_cookies:
         d.update_by_id("account", account_id, {"status": "invalid", "last_check_time": now_str()})
         _notify_invalid(row, account_id)
         prev_status = row.get("status")
         if prev_status != "invalid":
-            logger.info("[check_account] 账号 {} storage.json 不存在 → invalid",
+            logger.info("[check_account] 账号 {} profile 缺失 → invalid",
                         row["remark"] or row["nickname"] or account_id[:8])
         return {"account_id": account_id, "status": "invalid",
-                "message": "会话不存在，请到「账号管理」重新登录"}
+                "message": "profile 缺失，请到「账号管理」重新登录"}
 
-    # 2. 用 storage 启 headless 加载主页 + 拿 profile（一次 headless 完成）
+    # 2. 用 profile_dir 启 headless + launch_persistent_context 加载主页 + 拿 profile
     from playwright.sync_api import sync_playwright
-    from app.core.douyin.browser import _extract_creator_profile, UA
-    from app.core.douyin.poi_service import _storage_to_playwright_cookies
+    from app.core.douyin.browser import _extract_creator_profile, UA, browser_actor
 
-    cookies = _storage_to_playwright_cookies(storage)
-    show_window = bool(setting_service.load_settings().get("browser_show_window", False))
     pw = None
-    browser = None
     dom_ok = False
     prof: dict = {"nickname": "", "douyin_id": "", "avatar": ""}
+    show_window = bool(setting_service.load_settings().get("browser_show_window", False))
+    # 若当前线程已有 BrowserActor tls.runtime，先 cleanup 避免「inside the asyncio loop」
+    # 冲突（check_all 调度与拉取任务并发时会复现）。
+    browser_actor._reset_tls_for_sync_api()
     try:
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
             headless=not show_window,
+            user_agent=UA,
+            viewport={"width": 1440, "height": 900},
+            locale="zh-CN",
             args=["--disable-blink-features=AutomationControlled",
                   "--no-sandbox", "--disable-dev-shm-usage"],
         )
-        ctx = browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900}, locale="zh-CN")
         try:
-            ctx.add_cookies(cookies)
             page = ctx.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
@@ -256,24 +263,16 @@ def check_account(account_id: str) -> dict:
                        account_id[:8], exc)
     finally:
         try:
-            if browser is not None:
-                browser.close()
-        except Exception:
-            pass
-        try:
             if pw is not None:
                 pw.stop()
         except Exception:
             pass
 
-    # 5. 双重确认：DOM 渲染 + extract_login_state
-    state = extract_login_state(storage)
-    cookies_have_session = bool(state.get("sessionid"))
-    logged_in = dom_ok and cookies_have_session
-    new_status = "normal" if logged_in else "invalid"
+    # 5. 双重确认：DOM 渲染判定（#fix-unify-profile-storage：不再读 storage.json）
+    new_status = "normal" if dom_ok else "invalid"
     logger.debug(
-        "[check_account] account={} dom_ok={} sessionid={} logged_in={}",
-        account_id[:8], dom_ok, cookies_have_session, logged_in,
+        "[check_account] account={} dom_ok={} new_status={}",
+        account_id[:8], dom_ok, new_status,
     )
 
     fields: dict = {"status": new_status, "last_check_time": now_str()}
@@ -293,6 +292,7 @@ def check_account(account_id: str) -> dict:
                 fields["douyin_id"] = prof["douyin_id"]
             # 浏览器拿不到部分字段时用 meta.json 兜底
             if "nickname" not in fields and "avatar" not in fields:
+                mgr = get_account_manager()
                 meta = mgr.get(account_id)
                 if meta:
                     if "nickname" not in fields and meta.nickname and meta.nickname != (row.get("nickname") or ""):
@@ -362,13 +362,13 @@ def _notify_invalid(row: dict, account_id: str) -> None:
 def relogin(account_id: str, new_cookie: str, profile: dict | None = None) -> dict:
     """重新登录：更新 Cookie 并恢复状态（用登录窗 evaluate 拿到的身份信息回填）。
 
-    与 check_account 统一：复用 extract_login_state 纯函数判定 status，
+    登录态判定：直接读新 cookie 的 sessionid（#fix-unify-profile-storage 不再依赖 storage.json）。
     不调 check_account（避免重开 headless 二次检测——登录窗 headed 已确认 DOM 渲染）。
 
     校验：
     - 新 Cookie 必须含 sessionid
     - 登录窗拿到的 douyin_id 必须与 DB 原记录一致（防登错账号）
-      不一致 → 删除原 storage.json → 抛 ValueError（前端展示提示）
+      不一致 → 删除原 profile_dir → 抛 ValueError（前端展示提示）
     - 缺失字段（昵称/头像）保留原值
     """
     d = get_db()
@@ -384,26 +384,24 @@ def relogin(account_id: str, new_cookie: str, profile: dict | None = None) -> di
     new_avatar = (p.get("avatar") or "").strip()
     # douyin_id 一致性校验（拿到 douyin_id + DB 有 douyin_id → 必须一致；不一致=登错账号）
     if new_douyin_id and row.get("douyin_id") and new_douyin_id != row["douyin_id"]:
-        # 删除原 storage.json：避免下次 selection_service 误用旧账号会话
-        old_storage = get_account_manager().root / account_id / "storage.json"
+        # 删除原 profile_dir：避免下次 launch_persistent_context 误用旧账号会话（#fix-unify-profile-storage）
+        from app.services.douyin_account import get_profile_dir as _get_profile_dir
+        old_profile_dir = _get_profile_dir(account_id)
         try:
-            if old_storage.exists():
-                old_storage.unlink()
-                logger.warning("[relogin] 抖音号不一致，删除原会话文件：{}", old_storage)
+            import shutil as _shutil
+            if old_profile_dir.exists():
+                _shutil.rmtree(old_profile_dir)
+                logger.warning("[relogin] 抖音号不一致，删除原 profile_dir：{}", old_profile_dir)
         except Exception as exc:
-            logger.warning("[relogin] 删除旧 storage 失败：{}（不影响主流程）", exc)
+            logger.warning("[relogin] 删除旧 profile_dir 失败：{}（不影响主流程）", exc)
         raise ValueError(
             f"登录的账号（抖音号 {new_douyin_id}）与原账号（{row['douyin_id']}）不符，"
             f"原会话已删除，请用原账号重新登录"
         )
-    # #134：重登后同步刷新 storage.json（cookie 已变，旧 storage 失效）
-    _persist_storage(account_id, new_cookie, new_nickname, new_avatar or "")
 
-    # 复用 check_account 的纯函数判定 status（不启 headless）
-    storage = get_account_manager().load_storage(account_id)
-    state = extract_login_state(storage)
-    cookies_have_session = bool(state.get("sessionid"))
-    new_status = "normal" if cookies_have_session else "invalid"
+    # #fix-unify-profile-storage：登录态判定从 profile_dir 拿（不依赖 storage.json）
+    # 登录窗 headed 已确认 DOM 渲染（cookie 含 sessionid 即视为正常；过期由后续 check_account / publish 检测）
+    new_status = "normal" if "sessionid" in new_cookie else "invalid"
 
     fields: dict = {
         "cookie_encrypted": crypto.encrypt(new_cookie),
@@ -518,100 +516,4 @@ def register_account_check_job() -> None:
 def _timed_check_all() -> None:
     """定时回调：直接同步执行（任务队列重构 PR2 #54：账号维护已去掉，不走 task_service）。"""
     check_all()
-
-
-def _auto_relogin_via_browser(account_id: str) -> str:
-    """账号失效自动重登：弹 Playwright headed 浏览器等用户登录，回写 storage + 恢复 normal。
-
-    调用方：check_account 检测到 invalid 时同步触发（阻塞等用户登录，超时 5 分钟）。
-    流程：
-    1. BrowserActor.open_login_window（headed）打开登录页（sessionid + 页面 profile 一并返回）
-    2. 用户扫码 / 手机验证 / 一键登录
-    3. 登录成功 → storage.json 落盘 + 抓 Cookie + evaluate 拿 douyin_id
-    4. douyin_id 一致性校验：登错账号则删除 storage.json + 通知用户
-    5. 写库（cookie + status=normal + 取消冷却）+ 触发挂起发布明细恢复
-
-    返回:
-        "success" / "failed" / "skipped"
-    """
-    from app.core.douyin.browser import browser_actor
-    from app.services.douyin_account import get_account_manager
-
-    d = get_db()
-    row = d.query_one(
-        "SELECT remark, nickname, douyin_id FROM account WHERE id=?", (account_id,))
-    if not row:
-        return "failed"
-
-    mgr = get_account_manager()
-    storage_path = mgr.root / account_id / "storage.json"
-    logger.info("[auto-relogin] 弹登录浏览器 account={} → {}", account_id, storage_path)
-
-    result = browser_actor.open_login_window(
-        url="https://creator.douyin.com/",
-        save_path=storage_path,
-        timeout_s=300,
-        headless=False,
-    )
-    if not result:
-        notifier.notify("warn", "account",
-                        f"账号 {row['remark'] or row['nickname']} 自动重登超时",
-                        "请到「账号管理」手动重新登录")
-        return "failed"
-
-    cookie = result.get("cookie", "")
-    new_douyin_id = (result.get("douyin_id") or "").strip()
-    # douyin_id 一致性校验（登错账号则删除原 storage.json + 通知用户）
-    if new_douyin_id and row.get("douyin_id") and new_douyin_id != row["douyin_id"]:
-        try:
-            if storage_path.exists():
-                storage_path.unlink()
-                logger.warning("[auto-relogin] 抖音号不一致，删除会话：{}", storage_path)
-        except Exception as exc:
-            logger.warning("[auto-relogin] 删除 storage 失败：{}", exc)
-        notifier.notify("error", "account",
-                        f"账号 {row['remark'] or row['nickname']} 自动重登失败",
-                        f"登录账号（抖音号 {new_douyin_id}）与原账号（{row['douyin_id']}）不符，"
-                        f"原会话已删除，请用原账号重新登录",
-                        action=f"relogin:{account_id}")
-        return "failed"
-
-    # 登录成功 + 校验通过：写库
-    try:
-        from datetime import datetime, timedelta
-        fields = {
-            "cookie_encrypted": crypto.encrypt(cookie),
-            "last_check_time": (datetime.now() - timedelta(minutes=31)).strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "normal",
-        }
-        new_nickname = (result.get("nickname") or "").strip()
-        new_avatar = (result.get("avatar") or "").strip()
-        if new_nickname:
-            fields["nickname"] = new_nickname
-        if new_avatar:
-            local = cache_account_avatar(new_avatar, account_id)
-            if local:
-                fields["avatar"] = local
-        d.update_by_id("account", account_id, fields)
-    except Exception as exc:
-        logger.error("[auto-relogin] 写库失败: {}", exc)
-        return "failed"
-
-    # 联动恢复挂起发布明细
-    try:
-        from app.services.publish_service import resume_suspended_items
-        resumed = resume_suspended_items(account_id)
-        if resumed:
-            notifier.notify("info", "account",
-                            f"账号 {row['remark'] or row['nickname']} 已自动恢复",
-                            f"{resumed} 条挂起发布明细已恢复待发布")
-        else:
-            notifier.notify("info", "account",
-                            f"账号 {row['remark'] or row['nickname']} 已自动恢复登录",
-                            "已保存新 Cookie，可正常使用")
-    except ImportError:
-        notifier.notify("info", "account",
-                        f"账号 {row['remark'] or row['nickname']} 已自动恢复登录",
-                        "已保存新 Cookie")
-    return "success"
 

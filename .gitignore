@@ -8,8 +8,8 @@ frontend/dist/
 frontend/release/
 __pycache__/
 *.py[cod]
-# FFmpeg 二进制
-backend/assets/ffmpeg/*.exe
+# FFmpeg 二进制（Git LFS 跟踪，详见 .gitattributes）
+backend/assets/ffmpeg/
 
 # ============ PR3 安全：账号凭据与持久化绝不能进库 ============
 # 真实 cookie 凭据（开发注入用，绝不提交）

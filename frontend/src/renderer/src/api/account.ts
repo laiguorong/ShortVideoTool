@@ -14,13 +14,12 @@ export interface Account {
   create_time: string
 }
 
-/** 有 storage.json 的账号（用于选品任务创建） */
+/** 有 profile 的账号（用于选品任务创建） */
 export interface AvailableAccount {
   id: string
   nickname: string | null
   remark: string | null
   status: string
-  cookie_count: number
 }
 
 export const accountApi = {
@@ -38,20 +37,22 @@ export const accountApi = {
   },
 
   /** 添加账号（登录窗抓 cookie + 页面身份信息）。后端收到完整 Cookie 串 */
-  add: (cookie: string, remark: string, profile: { nickname?: string; douyin_id?: string; avatar?: string } = {}) =>
+  add: (cookie: string, remark: string, profile: { nickname?: string; douyin_id?: string; avatar?: string } = {}, profileDir?: string) =>
     request<Account>('/accounts', {
       method: 'POST',
-      body: JSON.stringify({ cookie, remark, ...profile }),
+      body: JSON.stringify({ cookie, remark, ...profile, profile_dir: profileDir ?? null }),
     }),
 
   /** 弹 Playwright headed 浏览器登录窗，登录成功后返回 cookie + 页面 evaluate 拿到的身份信息。
-   *  accountId 可选：重新登录时传，登录成功 storage.json 自动落到账号目录 */
+   *  accountId 可选：重新登录时传，登录成功 storage.json 自动落到账号目录。
+   *  添加账号场景额外返回 profile_dir（临时 chromium profile 路径），前端 add 时回传让后端搬移到账号目录 */
   openLogin: (accountId?: string) =>
     request<{
       cookie: string | null
       nickname: string
       douyin_id: string
       avatar: string
+      profile_dir?: string
     }>('/accounts/login-window', {
       method: 'POST',
       body: JSON.stringify({ account_id: accountId ?? null }),

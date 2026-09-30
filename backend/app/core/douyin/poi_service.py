@@ -23,17 +23,9 @@ from typing import Optional
 from loguru import logger
 
 from app.core.douyin.base import DouyinClientError, RiskControlError
-from app.core.douyin.browser import browser_actor, BrowserSession, _cookie_header_to_playwright
+from app.core.douyin.browser import browser_actor, BrowserSession
 from app.core.douyin.rate_limiter import rate_limiter
 
-
-def cookie_str_to_storage_state(cookie_str: str, domain: str = ".douyin.com") -> dict:
-    """把 cookie 头串转 storage_state dict。
-
-    用途：account_service 把 DB cookie 重建 storage 落盘 / 判定登录态。
-    """
-    cookies = _cookie_header_to_playwright(cookie_str, domain)
-    return {"cookies": cookies, "origins": []}
 
 # 抖音创作中心域（POI 接口固定）
 CREATOR_DOUYIN = "https://creator.douyin.com"
@@ -49,23 +41,6 @@ _POI_LIST_KEYS = ("poi_list", "poi_infos", "poi_info_list", "pois",
 def _cookie_str(storage_state: dict) -> str:
     """从 storage_state 抽 cookie 头串（name=value; name=value）。"""
     return "; ".join(f"{c['name']}={c['value']}" for c in storage_state.get("cookies", []))
-
-
-def _storage_to_playwright_cookies(storage_state: dict) -> list[dict]:
-    """storage_state cookies → playwright add_cookies 格式。
-
-    域名归一化到 .douyin.com（cookie 可能落在 creator/www/snssdk 等子域）。
-    """
-    out = []
-    for c in storage_state.get("cookies", []):
-        # playwright 要求 name/value/domain/path
-        out.append({
-            "name": c["name"],
-            "value": c["value"],
-            "domain": c.get("domain") or ".douyin.com",
-            "path": c.get("path") or "/",
-        })
-    return out
 
 
 def search_poi_in_session(

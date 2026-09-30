@@ -15,3 +15,5 @@ data/
 
 # FFmpeg 二进制（体积大，本地放置）
 assets/ffmpeg/*.exe
+# Playwright 浏览器二进制（chromium + headless-shell + ffmpeg，~700MB，本地放置；打包时通过 extraResources 拷入）
+assets/ms-playwright/

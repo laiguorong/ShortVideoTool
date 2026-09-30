@@ -58,6 +58,10 @@
           "shortvideo-backend",
           "shortvideo-backend.exe"
         ]
+      },
+      {
+        "from": "../backend/assets/ms-playwright",
+        "to": "backend/ms-playwright"
       }
     ],
     "win": {

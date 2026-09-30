@@ -41,6 +41,8 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: {
   const profileRef = useRef<{ nickname: string; douyin_id: string; avatar: string }>({
     nickname: '', douyin_id: '', avatar: '',
   })
+  // #fix-profile-dir-move：登录窗临时 chromium profile 路径，add 时回传给后端搬移
+  const profileDirRef = useRef('')
   const submittedRef = useRef(false)  // 防止重复提交
 
   // 弹窗打开时重置状态
@@ -49,17 +51,24 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: {
       submittedRef.current = false
       cookieRef.current = ''
       profileRef.current = { nickname: '', douyin_id: '', avatar: '' }
+      profileDirRef.current = ''
     }
   }, [open])
 
   /** 拿到 cookie 后自动提交（备注名留空，后端 add_account 用昵称兜底） */
-  const autoSubmit = async (cookie: string, profile: { nickname: string; douyin_id: string; avatar: string }) => {
+  const autoSubmit = async (
+    cookie: string,
+    profile: { nickname: string; douyin_id: string; avatar: string },
+    profileDir: string,
+  ) => {
     if (submittedRef.current) return
     submittedRef.current = true
     setLoading(true)
     try {
       // #136：备注名传空——后端 remark_name = remark or nickname 自动用昵称兜底
-      await accountApi.add(cookie, '', profile)
+      // #fix-profile-dir-move：把登录窗临时 profile_dir 一并传给后端，
+      // 后端负责搬移到 accounts/{id}/profile/（否则后续发布用空 profile 失败）
+      await accountApi.add(cookie, '', profile, profileDir || undefined)
       toast('账号添加成功', 'success')
       cookieRef.current = ''
       onOpenChange(false)
@@ -84,9 +93,10 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: {
       }
       cookieRef.current = r.cookie
       profileRef.current = { nickname: r.nickname, douyin_id: r.douyin_id, avatar: r.avatar }
+      profileDirRef.current = r.profile_dir ?? ''
       toast('登录成功，正在添加账号…', 'success')
       // 拿到 cookie 立即自动提交，无需点确认
-      await autoSubmit(r.cookie, profileRef.current)
+      await autoSubmit(r.cookie, profileRef.current, profileDirRef.current)
     } catch (e) {
       toast((e as Error).message, 'error')
     } finally {

@@ -135,7 +135,7 @@ def test_client_uses_curl_cffi():
     from app.core.douyin import client
     src = inspect.getsource(client.RealDouyinClient.download_video)
     assert "from curl_cffi import requests as creq" in src
-    assert 'impersonate="chrome110"' in src
+    assert 'impersonate="chrome124"' in src
     # download_video 内不应再有 urlopen
     assert "urlopen(" not in src
 
@@ -147,6 +147,58 @@ def test_fetch_aweme_detail_accepts_account_id():
     sig = inspect.signature(client.RealDouyinClient._fetch_aweme_detail)
     assert "account_id" in sig.parameters
     assert sig.parameters["account_id"].default == ""
+
+
+def test_import_share_links_no_info_undefined():
+    """回归测试：import_share_links 内部传 info=None 不应引用未定义变量。
+
+    历史 bug：分享导入循环里 `info=info` 触发 NameError（函数内无 info 形参）。
+    修复后传 None，走 _download_and_ingest 内部 time.sleep 降级。
+    """
+    import inspect
+    from app.services import material_service
+    src = inspect.getsource(material_service.import_share_links)
+    # 修复点：必须传 None 而非 info（info 在函数作用域内未定义）
+    assert "info=None" in src, "import_share_links 内 info= 应改为 info=None"
+    # 防御性：不应再出现裸 `info=info`（除非 import_share_links 真有 info 形参）
+    sig = inspect.signature(material_service.import_share_links)
+    assert "info" not in sig.parameters, (
+        "import_share_links 签名包含 info 时无需传 None，请同步测试"
+    )
+
+
+def test_parse_aweme_common_download_urls_have_field():
+    """验证 _parse_aweme_common 输出 download_urls 为 (field, url) 元组列表。
+
+    设计目标：_download_with_retry 日志要能看出当前节点来自哪个字段
+    （play_addr / play_addr_h264 / play_addr_265），便于排查 CDN 节点归属。
+    """
+    import inspect
+    from app.core.douyin import client
+    src = inspect.getsource(client._parse_aweme_common)
+    # 拼接处必须把字段名和 URL 绑在一起
+    assert "dl_list = [(f, u)" in src or '("play_addr", play_list)' in src, (
+        "_parse_aweme_common 应输出 (field, url) 元组列表"
+    )
+
+
+def test_download_with_retry_accepts_tuple_list():
+    """验证 _download_with_retry 接受 (field, url) 形态的 download_urls。
+
+    应兼容新旧两种形态：
+    - 新：[(field, url), ...]
+    - 旧：[url, ...]（legacy fallback 标 field='legacy'）
+    """
+    import inspect
+    from app.services import material_service
+    src = inspect.getsource(material_service._download_and_ingest)
+    # 内联函数 _download_with_retry 应解析 tuple + 兼容裸 URL
+    assert "isinstance(item, tuple)" in src, (
+        "_download_with_retry 应识别 (field, url) 元组"
+    )
+    assert '"legacy"' in src, (
+        "_download_with_retry 兼容旧形态（裸 URL）时应打 'legacy' 字段名"
+    )
 
 
 # ============ runner ============

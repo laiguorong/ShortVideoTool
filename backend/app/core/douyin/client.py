@@ -264,40 +264,36 @@ class RealDouyinClient(DouyinClient):
         任务 #131 E2E 实测：匿名（cookie=""）即可拿全字段（与账号登录态一致），
         cookie 仅在需要账号增强（如 BGM 来源标记）时传入。
 
-        #P0-8：cookie 路径下纯 cookies 无 localStorage，a_bogus 签名失败率高。
-        传 account_id 时优先用账号目录的 storage.json（含 localStorage），
-        提高 detail 接口签名成功率。anonymous 路径保持 cookies=None。
+        #fix-unify-profile-storage：传 account_id 时统一走账号持久化 profile（user_data_dir），
+        # 不再读 storage.json / storage_state 注入（避免 storage.json 缺失时降级到纯 cookies
+        # → 签名失败 0 响应）。
 
         参数:
             video_id: 抖音视频 ID（短链 302 解析后 / 搜索列表直接拿）
             cookie: 账号登录态（默认空串=匿名；任务 #131 验证匿名可拿全字段）
             manual_wait_ms: 人工等待窗口毫秒数（0 响应时让人过验证码，>0 进入等待）。
                 分享导入手动重试时通常传 30000~60000（30s~60s）。
-            account_id: 账号 ID（#P0-8：传入时读 storage.json 走 storage_state 路径）
+            account_id: 账号 ID（#fix-unify-profile-storage：传时走 accounts/<id>/profile/）
         返回:
             统一视频字段 dict（_parse_detail_item 输出）
         异常:
             DouyinClientError: 浏览器层失败 / 详情接口 0 响应
         """
         from app.core.douyin.browser import browser_actor, _cookie_header_to_playwright
-        # #P0-8：账号有 storage 时走 storage_state 路径，签名成功率显著高于纯 cookies
-        storage_state = None
+        # #fix-unify-profile-storage：传 account_id 时走持久化 profile（user_data_dir）路径
+        user_data_dir = None
         cookies = None
         if account_id:
-            try:
-                from app.services.douyin_account import get_account_manager
-                mgr = get_account_manager()
-                storage_state = mgr.load_storage(account_id)  # 包含 localStorage + cookies
-            except Exception:  # noqa: BLE001 storage 缺失/损坏时降级用 cookies
-                storage_state = None
-        if storage_state is None:
+            from app.services.douyin_account import get_profile_dir
+            user_data_dir = get_profile_dir(account_id)
+        if user_data_dir is None:
             # 降级：cookies 路径或匿名
             cookies = _cookie_header_to_playwright(cookie, ".douyin.com") if cookie else None
         try:
             bodies = browser_actor.run(
                 f"https://www.douyin.com/video/{video_id}",
                 capture=lambda u: "/aweme/v1/web/aweme/detail/" in u,
-                cookies=cookies, storage_state=storage_state,
+                cookies=cookies, user_data_dir=user_data_dir,
                 timeout_ms=30000, manual_wait_ms=manual_wait_ms,
             )
         except Exception as e:  # noqa: BLE001 浏览器层失败
@@ -348,7 +344,8 @@ class RealDouyinClient(DouyinClient):
         """CDN 直链下载（仅需 UA+Referer，无需 Cookie）。
 
         #P0-7：原 urllib.request.urlopen 缺 TLS 指纹伪装，抖音 CDN 对纯 Python
-        urllib 返 403/风控页。改用 curl_cffi 模拟 Chrome 110 指纹。
+        urllib 返 403/风控页。改用 curl_cffi 模拟 Chrome 124 指纹
+        （与 playwright bundled chromium-1234 TLS ClientHello 对齐）。
         """
         from curl_cffi import requests as creq
         rate_limiter.acquire()
@@ -358,7 +355,7 @@ class RealDouyinClient(DouyinClient):
             resp = creq.get(
                 url,
                 headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"},
-                impersonate="chrome110",
+                impersonate="chrome124",
                 stream=True,
                 timeout=120,
             )
@@ -395,28 +392,26 @@ class RealDouyinClient(DouyinClient):
         from pathlib import Path
         from datetime import datetime
 
-        storage_state = None
+        storage_state = None  # 保留为 None（#fix-unify-profile-storage 不再依赖 storage_state）
         profile_dir: Path | None = None
         account_dir: Path | None = None
         if account_id:
             from app.services.douyin_account import get_profile_dir
             mgr = get_account_manager()
-            storage_state = mgr.load_storage(account_id)
-            # #452：profile 持久化目录（chromium launch_persistent_context 用）
+            # #fix-unify-profile-storage：profile_dir 替代 storage_state 注入
             profile_dir = get_profile_dir(account_id)
             account_dir = mgr._account_dir(account_id)
 
-        if not storage_state or not storage_state.get("cookies"):
-            raise LoginInvalidError(f"账号 {account_id or '?'} storage 缺失或 cookies 为空，请先登录")
-
-        # #bugfix：cookies 存在但 sessionid/ttwid 已失效 → 发布接口返 403。
-        # 每次发布前校验登录态，过期则抛 LoginInvalidError 让上层挂起并提示用户重新登录。
-        from app.services.douyin_account import extract_login_state
-        state = extract_login_state(storage_state)
-        if not state["logged_in"]:
-            raise LoginInvalidError(
-                f"账号 {account_id} 登录态已失效（sessionid/ttwid 过期），请重新登录"
-            )
+        # #fix-unify-profile-storage：profile_dir 有 Cookies 文件即视为有效
+        # （cookie 有效性由 launch_persistent_context 启动后 chromium 自动校验，过期时 403
+        # 上层 publish_video 兜底；本处只做"profile 缺失"快速失败）
+        if account_id and profile_dir is not None:
+            has_cookies = (profile_dir / "Default" / "Network" / "Cookies").exists() or \
+                          (profile_dir / "Default" / "Cookies").exists()
+            if not has_cookies:
+                raise LoginInvalidError(
+                    f"账号 {account_id} profile 缺失或 cookies 为空，请先登录"
+                )
 
         # 定时发布：当前时间 < schedule + 10min 视为过期（抖音拒接过期）
         if schedule:
@@ -646,6 +641,27 @@ def _parse_aweme_common(aw: dict, fallback_id: str, source: str) -> Optional[dic
     video = aw.get("video") or {}
     play = video.get("play_addr") or {}
     play_list = play.get("url_list") or []
+    # 抖音详情接口 video 节点带多个直链字段，2026-09 实测验证：
+    # - play_addr_* 系列（play_addr / play_addr_h264 / play_addr_265）= **无水印**（用户肉眼判断确认）
+    # - download_addr / download_suffix_logo_addr = **带水印**（高码率 12.4MB 但强制水印）
+    # 任务要求严格无水印：只采用 play_addr_* 系列，不带水印兜底——全部失败就报错，
+    # 避免误下载到带水印版本。
+    #
+    # 优先级（无水印 + 默认播放字段优先）：
+    # 1. play_addr（原始 720p play_addr，多 CDN 节点 7.16MB）
+    # 2. play_addr_h264（H.264 显式声明，7.16MB）
+    # 3. play_addr_265（HEVC，最低码率 2.4MB，最后兜底）
+    #
+    # 空值过滤：服务端偶发返回 url_list=[null, ""] 等脏数据，下游 _download_with_retry
+    # 不能识别 None / 空串为有效 URL，会 curl 进 download_video 触发 404 → 错换 CDN 节点。
+    play_h264 = (video.get("play_addr_h264") or {}).get("url_list") or []
+    play_265 = (video.get("play_addr_265") or {}).get("url_list") or []
+    # 拼接顺序：play_addr → h264 → 265，全失败时 dl_list 为空 → 上层报"无无水印版本"
+    # 元素为 (field, url) 元组，_download_with_retry 拿 field 写日志便于排查节点归属
+    dl_list = [(f, u) for f, lst in (
+        ("play_addr", play_list), ("play_addr_h264", play_h264), ("play_addr_265", play_265)
+    ) for u in lst if u]
+    play_list = [u for u in play_list if u]
     # 宽高三源提取（任务 #133 复盘）：dimension → video.width/height → play_addr.width/height
     dim = video.get("dimension") or {}
     w, h = int(dim.get("width") or 0), int(dim.get("height") or 0)
@@ -668,7 +684,13 @@ def _parse_aweme_common(aw: dict, fallback_id: str, source: str) -> Optional[dic
         "width": width,
         "height": height,
         "resolution": f"{w}x{h}" if (w and h) else "",
-        "download_url": play_list[0] if play_list else "",
+        "download_url": (dl_list[0][1] if dl_list else ""),  # dl_list[0] = (field, url)
+        # 仅 3 个无水印 play_addr_* 字段拼接（已剔除 download_addr / suffix_logo 带水印字段）：
+        # 顺序 play_addr → play_addr_h264 → play_addr_265（默认播放字段优先）
+        # _download_with_retry 遍历本字段逐 URL 尝试，节点失败自动跳下一条；
+        # download_urls 元素为 (field, url) 元组，日志带 field 便于排查节点归属；
+        # dl_list 为空时上层报"无无水印版本"，不下载带水印版本（任务硬性要求）。
+        "download_urls": dl_list,
         "share_url": f"https://www.douyin.com/video/{aweme_id}",
         "author_nickname": (author.get("nickname") or "").strip(),
         "author_douyin_id": str(author.get("unique_id") or author.get("short_id") or ""),
