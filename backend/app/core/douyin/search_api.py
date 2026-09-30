@@ -352,8 +352,10 @@ class BrowserSearchSession:
     ]
     _FILTER_PANEL_SELECTOR = 'div.IMWRHJOg'      # 弹出面板容器
     _SORT_LATEST_SELECTORS = [
+        # 主：精确字面量匹配（避免误命中含「最新发布」字样的其他文案）
+        f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:text-is("最新发布")',
+        # 兜底：同 class 内的 :has-text 匹配，class 限定防止误命中面板外文本
         f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("最新发布")',
-        f'{_FILTER_PANEL_SELECTOR} span:has-text("最新发布")',
     ]
     _PUBLISH_RANGE_TEXT = {
         "any": "不限",
@@ -419,7 +421,7 @@ class BrowserSearchSession:
         steps: list[tuple[str, bool]] = []
         # 3. 排序依据 = 最新发布（507 强制要求）
         # 用户反馈：抖音 UI 切换有延迟，点完立即下一步会丢点击。点完等
-        # 选中态 .HjptjtzN class 出现作为生效信号（最多 1.5s）。
+        # 选中态 .HjptjtzN class 出现作为生效信号（最多 1s）。
         hit = self._click_filter_option(page, self._SORT_LATEST_SELECTORS, "排序=最新发布", debug=debug)
         steps.append(("排序=最新发布", hit))
         # 4. 发布时间
@@ -438,7 +440,7 @@ class BrowserSearchSession:
         ]
         hit = self._click_filter_option(page, dur_sels, f"视频时长={dur_text}", debug=debug)
         steps.append((f"视频时长={dur_text}", hit))
-        # 6. 内容形式 = 视频（panel 内第一条「视频」匹配）
+        # 6. 内容形式 = 视频（精确匹配字面量，避免命中含「视」字选项如「图文/视频」）
         hit = self._click_filter_option(page, self._CONTENT_VIDEO_SELECTORS, "内容形式=视频", debug=debug)
         steps.append(("内容形式=视频", hit))
         # 7. 把鼠标移开收起面板（不影响后续搜索结果滚动）

@@ -271,10 +271,11 @@ class RealDouyinClient(DouyinClient):
                     captured.append(resp.json())
             except Exception:
                 pass
-        # 防御性先移除旧 listener：阶段 A page 已注册搜索 XHR 监听器（_on_response），
-        # 若相同函数对象残留会重复回调。当前 _on_response 是局部函数对象，
-        # 每次调用 new_id 都不重复，但保留 remove 调用防御 URL 匹配规则放宽后
-        # 旧 listener 误命中（如未来新增 XHR 兜底）。
+        # 防御性 remove：当前每次 _fetch_in_page 调用 _on_response 都是新 def
+        # 的局部函数对象，remove 找不到相同对象会抛 ValueError（try 吞）—— 当前
+        # 等同 no-op。保留仅为未来若改成 self._detail_handler 闭包复用时提前 remove
+        # 不会撞 panic。当下净效果：每个详情抓取多注册一个新 listener，但 finally
+        # 内对应 remove，整体 listener 列表归零不污染阶段 A 搜索 listener。
         try:
             page.remove_listener("response", _on_response)
         except Exception:
