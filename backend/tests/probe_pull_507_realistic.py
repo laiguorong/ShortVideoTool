@@ -20,13 +20,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 
 def main() -> int:
-    from app.services.setting_service import init_data_dir, get_data_dir, get_config_dir
+    from app.services.setting_service import init_data_dir, get_data_dir, get_config_dir, save_settings
     from app.core import crypto
     from app.db.database import init_db, get_db
     init_data_dir()
     crypto.init_crypto(get_config_dir())
     data_dir = get_data_dir()
     init_db(data_dir / "shortvideotool.db")
+    # probe 模式：开启慢路径（每步 2.5s）让用户看清筛选操作
+    save_settings({"pull_debug": True})
     d = get_db()
 
     row = d.query_one(
@@ -47,8 +49,8 @@ def main() -> int:
 
     task_id = d.insert("video_pull_task", {
         "task_name": "probe_507_realistic",
-        # 小 max_count 避免长时间下载
-        "conditions_json": '{"keyword":"鱼公元鱼生","max_count":2,"publish_range":"7d"}',
+        # 完整 4 项筛选：排序=最新发布 / 发布时间=一周内 / 视频时长=1分钟以下 / 内容形式=视频
+        "conditions_json": '{"keyword":"鱼公元鱼生","max_count":2,"publish_range":"7d","duration_range":"lt1m"}',
         "account_id": account_id,
         "category_id": cat_id,
         "interval_config": '{"type":"hour","value":1}',

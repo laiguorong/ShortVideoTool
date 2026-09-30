@@ -253,9 +253,55 @@ class RealDouyinClient(DouyinClient):
         # 调用方可按需传 manual_wait_ms 拉长窗口（如重试过验证码场景）。
         return self._fetch_aweme_detail(video_id, manual_wait_ms=manual_wait_ms)
 
+    def _fetch_in_page(self, page, video_id: str, timeout_ms: int = 30000,
+                       manual_wait_ms: int = 0) -> list[dict]:
+        """#161：阶段 B 复用阶段 A page 抓详情。
+
+        在传入 page 上注册响应拦截器 → page.goto 详情 URL → 等 detail XHR 落库。
+        不创建新 persistent_context（避免同 profile_dir chromium lock 冲突），
+        不创建新 sync_playwright runtime（避免 asyncio loop 冲突）。
+
+        返回拦截到的响应 JSON 列表（_fetch_aweme_detail 取匹配的 aweme_detail）。
+        """
+        captured: list[dict] = []
+
+        def _on_response(resp):
+            try:
+                if "/aweme/v1/web/aweme/detail/" in resp.url:
+                    captured.append(resp.json())
+            except Exception:
+                pass
+        page.on("response", _on_response)
+        try:
+            page.goto(
+                f"https://www.douyin.com/video/{video_id}",
+                timeout=timeout_ms, referer="https://www.douyin.com/",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(2000)
+            settle_deadline = min(timeout_ms, 15000) // 1000
+            for _ in range(settle_deadline):
+                if captured:
+                    break
+                page.wait_for_timeout(1000)
+            if not captured and manual_wait_ms > 0:
+                deadline = manual_wait_ms // 1000
+                for _ in range(deadline):
+                    page.wait_for_timeout(1000)
+                    if captured:
+                        break
+        finally:
+            # 解除拦截器避免下一页 goto 重复 append
+            try:
+                page.remove_listener("response", _on_response)
+            except Exception:
+                pass
+        return captured
+
     def _fetch_aweme_detail(self, video_id: str, cookie: str = "",
                             manual_wait_ms: int = 0,
-                            account_id: str = "") -> dict:
+                            account_id: str = "",
+                            page=None) -> dict:
         """公共方法（任务 #131）：通过浏览器拦 detail XHR 拿视频完整数据。
 
         拉取侧 + 分享侧共用：搜索列表 `aweme_info` author 节点字段值不可信（follower=0），
@@ -290,12 +336,19 @@ class RealDouyinClient(DouyinClient):
             # 降级：cookies 路径或匿名
             cookies = _cookie_header_to_playwright(cookie, ".douyin.com") if cookie else None
         try:
-            bodies = browser_actor.run(
-                f"https://www.douyin.com/video/{video_id}",
-                capture=lambda u: "/aweme/v1/web/aweme/detail/" in u,
-                cookies=cookies, user_data_dir=user_data_dir,
-                timeout_ms=30000, manual_wait_ms=manual_wait_ms,
-            )
+            if page is not None:
+                # #161：阶段 B 复用阶段 A page（同 persistent_context，无 chromium lock 冲突）。
+                # 直接 page.goto 详情 URL + 注册响应拦截器，跳过 BrowserActor
+                # launch_persistent_context（撞同 profile_dir lock）。
+                bodies = self._fetch_in_page(page, video_id, timeout_ms=30000,
+                                              manual_wait_ms=manual_wait_ms)
+            else:
+                bodies = browser_actor.run(
+                    f"https://www.douyin.com/video/{video_id}",
+                    capture=lambda u: "/aweme/v1/web/aweme/detail/" in u,
+                    cookies=cookies, user_data_dir=user_data_dir,
+                    timeout_ms=30000, manual_wait_ms=manual_wait_ms,
+                )
         except Exception as e:  # noqa: BLE001 浏览器层失败
             rate_limiter.report_failure()
             # 兜底 reason：异常无消息时（Playwright 部分底层异常 args 为空），

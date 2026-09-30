@@ -692,6 +692,7 @@ def _run_pull_round(task_id: str, info) -> str:
         aweme_ids = search_session.search_all_for_ids(
             keyword=keyword, conditions=conditions,
             idle_timeout=60, max_pages=page_budget,
+            debug=load_settings().get("pull_debug", False),
         )
         _write_progress()
         if not aweme_ids:
@@ -738,10 +739,15 @@ def _run_pull_round(task_id: str, info) -> str:
         # task 行引用，避免长任务阶段 A→B 期间被编辑（编辑落库后阶段 B 内
         # 二次 query 会读到新值，导致 total_pulled 累加按旧语义、实际入库落新分类）。
         if aweme_ids:
+            # #161：阶段 B 复用阶段 A 的 page（同 persistent_context）抓详情。
+            # 必须在 search_session.close() 之前取 page；close 后 self._page=None。
+            # 同 page 复用避开了「独立 launch_persistent_context 同 profile_dir
+            # chromium lock 冲突」+ 「独立 sync_playwright asyncio loop 冲突」。
             b_new, b_skip, b_intercept, b_limit, b_reason, detail_processed = _run_detail_phase(
                 task_id, aweme_ids, conditions, client, cookie,
                 account["id"], max_count, info,
                 category_id=task["category_id"], task_name=task["task_name"],
+                page=search_session.get_page(),
             )
             new_count += b_new
             skip_count += b_skip
@@ -1610,11 +1616,13 @@ def _run_detail_phase(
     *,
     category_id: str,
     task_name: str,
+    page=None,
 ) -> tuple[int, int, int, bool, str, int]:
     """507 改造：阶段 B —— 顺序循环 aweme_ids，详情抓取 + 内容校验 + 下载入库。
 
-    阶段 A 关闭 search_session 后调用，物理隔离 BrowserActor.sync_playwright
-    runtime 与搜索 runtime，避免 asyncio loop 冲突。
+    page：阶段 A BrowserSearchSession 的 page（同 persistent_context）；
+    阶段 B 复用避免 chromium 同 profile_dir lock 冲突 + asyncio loop 冲突。
+    不传时回退到 BrowserActor 独立 sync_playwright 路径（分享导入等场景）。
 
     返回: (new_count, skip_count, intercept_count, reached_limit, fail_reason, processed_count)
     每个视频独立异常不影响后续视频（每条 try/except）。
@@ -1658,7 +1666,7 @@ def _run_detail_phase(
         try:
             # 1. 详情抓取（独立 BrowserActor）
             video = client._fetch_aweme_detail(
-                aweme_id, cookie, account_id=account_id)
+                aweme_id, cookie, account_id=account_id, page=page)
             # 2. 单视频统一处理：客户端兜底 → 去重 → 下载 → 内容检测 → 入库
             single = _process_single_video(
                 video, category_id, client,

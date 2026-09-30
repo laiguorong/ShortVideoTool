@@ -330,18 +330,30 @@ class BrowserSearchSession:
 
     # ---------- 507 改造：筛选面板 UI 化 ----------
 
-    # 筛选面板 UI 元素 selector 常量（抖音搜索结果页右上角 [筛选]）
-    # 507 需求：排序依据=最新发布，发布时间 / 视频时长 / 内容形式 按 conditions 选。
-    # UI 改版 → selector 失效时静默降级为无筛选（用户决策）。
+    # 筛选面板 UI 元素 selector 常量（抖音 2026-09-30 改版后）。
+    # 旧版 selector（按浮层 / dialog / 确认按钮）已全部失效。
+    # 新版结构：搜索结果页右上角「筛选^」按钮 → hover 出下拉面板 → 选项即时生效（无确认按钮）。
+    # DOM 结构（auto_09_215521.html 截取）：
+    #   <div class="StjIHdE0">            ← 触发按钮（tabindex=0）
+    #     <span class="bR4uhU1W">筛选^</span>
+    #   </div>
+    #   <div class="IMWRHJOg">              ← 弹出面板容器
+    #     <div>                              ← 一组（排序依据 / 发布时间 / ...）
+    #       <div class="pvZiVjtd">组标题</div>
+    #       <span data-index1="0" data-index2="0" class="KlEyP1lp">综合排序</span>
+    #       <span data-index1="0" data-index2="1" class="KlEyP1lp HjptjtzN">最新发布</span>
+    #       ...
+    #     </div>
+    #   </div>
+    # 选中态：span.KlEyP1lp.HjptjtzN（橙色边框 + 浅红底）
     _FILTER_BTN_SELECTORS = [
-        'button:has-text("筛选")',
-        '[data-e2e="filter-btn"]',
-        'div:has-text("筛选")',
+        'div.StjIHdE0',                           # 触发按钮容器（hover 弹出）
+        'span.bR4uhU1W',                          # 「筛选^」文字
     ]
+    _FILTER_PANEL_SELECTOR = 'div.IMWRHJOg'      # 弹出面板容器
     _SORT_LATEST_SELECTORS = [
-        'text="最新发布"',
-        'text="最新"',
-        'div:has-text("最新发布")',
+        f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("最新发布")',
+        f'{_FILTER_PANEL_SELECTOR} span:has-text("最新发布")',
     ]
     _PUBLISH_RANGE_TEXT = {
         "any": "不限",
@@ -355,29 +367,13 @@ class BrowserSearchSession:
         "1to5m": "1-5分钟",
         "gt5m": "5分钟以上",
     }
+    # 内容形式=视频：必须限定在面板内第一个匹配（抖音内容形式面板项文字就是「视频」）
     _CONTENT_VIDEO_SELECTORS = [
-        # 加 parent 限定防误命中（如分类标题/相关推荐含「视频」字样）
-        'div[role="radio"]:has-text("视频")',
-        '[class*="filter-content"] [role="radio"]:has-text("视频")',
-        '[class*="filter"] label:has-text("视频")',
-        'label:has-text("视频"):not(:has-text("视频推荐"))',
+        f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("视频")',
     ]
-    _CONFIRM_BTN_SELECTORS = [
-        'button:has-text("确定")',
-        'button:has-text("确认")',
-        'button:has-text("完成")',
-        '[data-e2e="filter-confirm"]',
-    ]
-    # 507 #123 验证：筛选 chip / 已选状态（点确认后等 DOM 变化）
-    # 抖音筛选生效后通常在结果页顶部展示「已选：最新发布 / 7天内 / 1-5分钟 / 视频」chip
-    _FILTER_CHIP_SELECTORS = [
-        '[class*="filter-active"]',
-        '[class*="selected-tag"]',
-        '[data-e2e="filter-chip"]',
-        'div:has-text("已选筛选")',
-    ]
+    # 无确认按钮：旧版 confirm selectors 全部删除（点选项即时生效）。
 
-    def _apply_filters(self, page, conditions: dict) -> bool:
+    def _apply_filters(self, page, conditions: dict, *, debug: bool = False) -> bool:
         """507 改造：搜索结果页点 [筛选] 按钮 + 设置排序/发布时间/视频时长/内容形式。
 
         返回 True 表示筛选面板成功设置至少一项；False 表示找不到面板（UI 改版或非结果页）。
@@ -385,85 +381,78 @@ class BrowserSearchSession:
 
         507 #125 修复：通用 text= selector 加 parent 限定（filter panel 内）防误命中。
         507 #123 修复：点确认后等筛选 chip DOM 出现验证生效；找不到则记 warning。
-        审查 #2 修复：删除 panel_scope 限定外的裸 text= 兜底。抖音主页面其他位置
-        （推荐分类 / 相关搜索词 / 历史搜索）会出现「不限 / 视频」等字样，裸兜底
-        极易误命中——点错位直接退出筛选面板 + 跳到无关结果。所有点击必须限定
-        在 panel_scope 内；找不到就抛 SearchBlockedError 走 warning 兜底而非误点。
+        审查 #2 修复：删除 panel_scope 限定外的裸 text= 兜底。
+        2026-09-30 改版适配：抖音新版「筛选^」按钮改为 hover 触发下拉面板，
+        选项即时生效（无确认按钮）。DOM 结构：div.StjIHdE0 触发，
+        div.IMWRHJOg 面板容器，div.pvZiVjtd 组标题，span.KlEyP1lp 选项
+        （.HjptjtzN = 选中态）。旧 _FILTER_BTN_SELECTORS / _CONFIRM_BTN_SELECTORS
+        / _FILTER_CHIP_SELECTORS 全部失效，本函数按新结构重写。
         """
         # 筛选面板失败不再每条 warning 刷屏：收集结果到尾部一次性 INFO。
         # 用户决策：筛选失效 = 不需要过滤，按无筛选拉取。
-        # 1. 点 [筛选] 按钮
-        if not self._click_first_visible(page, self._FILTER_BTN_SELECTORS, "筛选按钮"):
+        # 1. hover 触发筛选按钮（hover 才能显示下拉面板，click 反而可能关闭）
+        btn = None
+        for sel in self._FILTER_BTN_SELECTORS:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    btn = loc
+                    break
+            except Exception:
+                continue
+        if btn is None:
             logger.info("[筛选] 抖音筛选按钮找不到，本次按无筛选拉取")
             return False
+        try:
+            btn.hover()
+        except Exception as e:
+            logger.info("[筛选] 筛选按钮 hover 失败 {}（按无筛选拉取）", e)
+            return False
+        # 2. 等面板容器出现
+        try:
+            page.wait_for_selector(self._FILTER_PANEL_SELECTOR, timeout=3_000)
+        except Exception:
+            logger.info("[筛选] hover 后筛选面板未弹出（按无筛选拉取）")
+            return False
         page.wait_for_timeout(500)
-        # 面板限定 selector（点了筛选按钮后，filter panel 一般是浮层/抽屉）。
-        # 严格命中：抖音筛选浮层带 [class*="filter"] 容器 + dialog 角色；
-        # 任何点击都在此 scope 内找，scope 外裸 text 兜底一律删除。
-        panel_scope = '[class*="filter-panel"], [class*="filter-modal"], [role="dialog"]'
-        # 收集每步结果：[步骤名, 是否命中]
+        # 收集每步结果
         steps: list[tuple[str, bool]] = []
-        # 2. 排序依据 = 最新发布（507 强制要求）
-        hit = self._click_first_visible(
-            page, [f'{panel_scope} {sel}' for sel in self._SORT_LATEST_SELECTORS],
-            "最新发布",
-        )
+        # 3. 排序依据 = 最新发布（507 强制要求）
+        # 用户反馈：抖音 UI 切换有延迟，点完立即下一步会丢点击。点完等
+        # 选中态 .HjptjtzN class 出现作为生效信号（最多 1.5s）。
+        hit = self._click_filter_option(page, self._SORT_LATEST_SELECTORS, "排序=最新发布", debug=debug)
         steps.append(("排序=最新发布", hit))
-        page.wait_for_timeout(300)
-        # 3. 发布时间
+        # 4. 发布时间
         pr = conditions.get("publish_range") or "any"
         text = self._PUBLISH_RANGE_TEXT.get(pr, "不限")
-        # 优先级：role=radio + panel_scope（语义最稳）→ 纯 panel_scope text 兜底
         range_sels = [
-            f'{panel_scope} div[role="radio"]:has-text("{text}")',
-            f'{panel_scope} [role="radio"]:has-text("{text}")',
-            f'{panel_scope} text="{text}"',
+            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{text}")',
         ]
-        hit = self._click_first_visible(page, range_sels, f"发布时间={text}")
+        hit = self._click_filter_option(page, range_sels, f"发布时间={text}", debug=debug)
         steps.append((f"发布时间={text}", hit))
-        page.wait_for_timeout(300)
-        # 4. 视频时长
+        # 5. 视频时长
         dr = conditions.get("duration_range") or "any"
         dur_text = self._DURATION_TEXT.get(dr, "不限")
         dur_sels = [
-            f'{panel_scope} div[role="radio"]:has-text("{dur_text}")',
-            f'{panel_scope} [role="radio"]:has-text("{dur_text}")',
-            f'{panel_scope} text="{dur_text}"',
+            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{dur_text}")',
         ]
-        hit = self._click_first_visible(page, dur_sels, f"视频时长={dur_text}")
+        hit = self._click_filter_option(page, dur_sels, f"视频时长={dur_text}", debug=debug)
         steps.append((f"视频时长={dur_text}", hit))
-        page.wait_for_timeout(300)
-        # 5. 内容形式 = 视频
-        hit = self._click_first_visible(
-            page, [f'{panel_scope} {sel}' for sel in self._CONTENT_VIDEO_SELECTORS],
-            "内容形式=视频",
-        )
+        # 6. 内容形式 = 视频（panel 内第一条「视频」匹配）
+        hit = self._click_filter_option(page, self._CONTENT_VIDEO_SELECTORS, "内容形式=视频", debug=debug)
         steps.append(("内容形式=视频", hit))
-        page.wait_for_timeout(300)
-        # 6. 点确认按钮关闭面板
-        confirm_hit = self._click_first_visible(page, self._CONFIRM_BTN_SELECTORS, "确认按钮")
-        if not confirm_hit:
-            # 兜底：点页面边缘收起面板
-            try:
-                page.mouse.click(10, 200)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-        else:
-            # #123 验证：点确认后等筛选生效信号（chip / 已选标签）。
-            # 同样严格在结果页内查，不允许跨域裸 text 兜底。
-            page.wait_for_timeout(800)
-            chip_visible = self._click_first_visible(
-                page, self._FILTER_CHIP_SELECTORS, "筛选生效chip", expect_visible_only=True
-            )
-            if not chip_visible:
-                steps.append(("确认+生效验证", False))
-        # 一次性汇总：命中的打勾、未命中的跳过。用户只看到一行。
+        # 7. 把鼠标移开收起面板（不影响后续搜索结果滚动）
+        try:
+            page.mouse.move(700, 500)
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+        # 一次性汇总
         parts = []
         for name, ok in steps:
             mark = "✓" if ok else "✗"
             parts.append(f"{name}{mark}")
-        if confirm_hit and all(ok for _, ok in steps):
+        if all(ok for _, ok in steps):
             logger.info("[筛选] 面板操作完成：{}", "，".join(parts))
         else:
             logger.info("[筛选] 面板部分失效，按生效项拉取：{}", "，".join(parts))
@@ -488,12 +477,51 @@ class BrowserSearchSession:
                 continue
         return False
 
+    def _click_filter_option(self, page, selectors: list[str], desc: str, *, debug: bool = False) -> bool:
+        """点筛选面板选项 + 等 .HjptjtzN 选中态 class 出现（最多 1.5s）。
+
+        用户反馈：抖音 UI 切换有延迟，点完立即下一步会丢点击。把「等选中态」
+        作为生效信号，比固定 wait_for_timeout 更稳——已生效立即返回，未生效最多等 1.5s。
+
+        实现注意：page.evaluate + document.querySelector 不识别 Playwright 的
+        :has-text 扩展伪类，必须用 Playwright locator API（page.locator）。
+
+        生产路径：选中态出现后 sleep 500ms 让抖音 React 派发 XHR 完成。
+        debug=True：选中态后 sleep 2.5s 让用户能在浏览器里看清每步操作；
+        probe 调试用。
+        """
+        clicked = self._click_first_visible(page, selectors, desc)
+        if not clicked:
+            return False
+        settle_ms = 2500 if debug else 500
+        try:
+            for _ in range(15):
+                for sel in selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if loc.count() == 0:
+                            continue
+                        ok = loc.evaluate(
+                            "(el) => el && el.classList && el.classList.contains('HjptjtzN')"
+                        )
+                        if ok:
+                            page.wait_for_timeout(settle_ms)
+                            return True
+                    except Exception:
+                        continue
+                page.wait_for_timeout(100)
+        except Exception:
+            pass
+        return False
+
     def search_all_for_ids(
         self,
         keyword: str,
         conditions: dict | None = None,
         idle_timeout: int = 60,
         max_pages: int = 50,
+        *,
+        debug: bool = False,
     ) -> list[str]:
         """507 改造：搜索 + 筛选 + 翻页一次拿完，返回去重后的 aweme_id 列表。
 
@@ -528,7 +556,7 @@ class BrowserSearchSession:
             except Exception:
                 pass  # 找不到也不阻塞，走 _apply_filters 自身的可见性判断
             # 507 改造：应用筛选面板（排序/发布时间/视频时长/内容形式）
-            self._apply_filters(page, conditions)
+            self._apply_filters(page, conditions, debug=debug)
         # 等首屏 XHR 落库
         self._poll_captured_until(lambda: bool(self._captured), timeout=60)
         # 滚到结束（has_more=0 / 60s 无进展 / max_pages 上限）
@@ -658,6 +686,31 @@ class BrowserSearchSession:
                 pass
             self._pw_cm = None
             self._pw = None
+
+    def get_pw(self):
+        """暴露 SyncPlaywright 实例供外部（阶段 B BrowserActor）复用。
+
+        阶段 A 跑完搜索后，阶段 B 在同一线程再开 sync_playwright 会撞
+        「inside the asyncio loop」。让阶段 B 共用阶段 A 的 runtime
+        （仅创建新 persistent_context，不启停 driver + loop）可彻底规避。
+
+        调用方必须在 search_session.close() 之前用完 pw；之后 self._pw=None。
+        """
+        return self._pw
+
+    def get_page(self):
+        """暴露当前 page 给阶段 B 复用（同 persistent_context，无 chromium lock 冲突）。
+
+        阶段 A 跑完搜索后 page 还停留在搜索结果页。阶段 B 可以 close 该 page
+        再开新 page 抓详情（共用同一 ctx），或直接 page.goto 详情 URL。
+
+        必须在 search_session.close() 之前用完；close 后 page 已被置 None。
+        """
+        return self._page
+
+    def get_context(self):
+        """暴露 BrowserContext 给阶段 B 复用（避免同 profile_dir 重复 launch 撞 lock）。"""
+        return self._ctx
 
     def __enter__(self):
         # with 上下文进入即 lazy launch + goto 首页（search_page 调用前完成准备）

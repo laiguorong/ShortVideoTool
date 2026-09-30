@@ -421,7 +421,7 @@ class BrowserActor:
             storage_state: dict | None = None, user_data_dir: Optional["Path"] = None,
             actions: Optional[Callable] = None, headless: Optional[bool] = None,
             timeout_ms: int = 30000, referer: str = "https://www.douyin.com/",
-            manual_wait_ms: int = 0) -> list[dict]:
+            manual_wait_ms: int = 0, pw=None) -> list[dict]:
         """执行一次浏览器任务：开 context → 注 Cookie → 导航 → 拦截响应 → 收集。
 
         参数:
@@ -450,6 +450,7 @@ class BrowserActor:
                 url, capture, user_data_dir=user_data_dir,
                 actions=actions, headless=headless,
                 timeout_ms=timeout_ms, referer=referer, manual_wait_ms=manual_wait_ms,
+                pw=pw,
             )
         # #131：浏览器单例不支持高并发，多 context 同时 nav/拦 XHR 会互相
         # 干扰（实测偶发 0 响应）。run() 全程加锁串行，简单稳定。
@@ -463,60 +464,85 @@ class BrowserActor:
                               headless: Optional[bool] = None,
                               timeout_ms: int = 30000,
                               referer: str = "https://www.douyin.com/",
-                              manual_wait_ms: int = 0) -> list[dict]:
+                              manual_wait_ms: int = 0,
+                              pw=None) -> list[dict]:
         """#fix-unify-profile-storage：独立 launch_persistent_context(user_data_dir=...) 路径。
 
         与 _publish_via_independent_browser（publish_actions.py）同源：登录态走持久化 profile
         （cookies + IndexedDB + localStorage），不走 _tls.browser.new_context（漏 IndexedDB）。
+
+        pw=None（默认）：自建 sync_playwright() 独立 runtime；
+        pw=<SyncPlaywright 实例>：复用传入 runtime（阶段 A→B 共用浏览器时用，
+        避免「inside the asyncio loop」冲突）。
         """
         from playwright.sync_api import sync_playwright
         user_data_dir.mkdir(parents=True, exist_ok=True)
         captured: list[dict] = []
-        with sync_playwright() as pw:
-            context = pw.chromium.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
-                headless=self._resolve_headless(headless),
-                user_agent=UA,
-                viewport={"width": 1440, "height": 900},
-                locale="zh-CN",
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=AutomationControlled,AutomationControlledForRenderProcessHost,AutomationControlledForSwap",
-                    "--no-sandbox", "--no-first-run",
-                    "--no-default-browser-check", "--disable-infobars",
-                    "--disable-dev-shm-usage",
-                ],
+        # pw 复用模式：调用方持有 runtime，本方法只创建新 context；否则自建 runtime
+        if pw is not None:
+            return self._run_with_pw(
+                pw, url, capture, user_data_dir, actions, headless,
+                timeout_ms, referer, manual_wait_ms,
             )
-            try:
-                page = context.new_page()
-                page.add_init_script(_ANTI_BOT_INIT_SCRIPT)
+        with sync_playwright() as new_pw:
+            return self._run_with_pw(
+                new_pw, url, capture, user_data_dir, actions, headless,
+                timeout_ms, referer, manual_wait_ms,
+            )
 
-                def _on_response(resp):
-                    try:
-                        if capture(resp.url):
-                            captured.append(resp.json())
-                    except Exception:
-                        pass
-                page.on("response", _on_response)
+    def _run_with_pw(self, pw, url: str, capture: Callable[[str], bool],
+                      user_data_dir: "Path",
+                      actions: Optional[Callable] = None,
+                      headless: Optional[bool] = None,
+                      timeout_ms: int = 30000,
+                      referer: str = "https://www.douyin.com/",
+                      manual_wait_ms: int = 0) -> list[dict]:
+        """共用 sync_playwright runtime 的实现：仅建新 context，不启停 driver。"""
+        captured: list[dict] = []
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=self._resolve_headless(headless),
+            user_agent=UA,
+            viewport={"width": 1440, "height": 900},
+            locale="zh-CN",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=AutomationControlled,AutomationControlledForRenderProcessHost,AutomationControlledForSwap",
+                "--no-sandbox", "--no-first-run",
+                "--no-default-browser-check", "--disable-infobars",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        try:
+            page = context.new_page()
+            page.add_init_script(_ANTI_BOT_INIT_SCRIPT)
 
-                page.goto(url, timeout=timeout_ms, referer=referer, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
-                if actions:
-                    actions(page)
-                settle_deadline = min(timeout_ms, 15000) // 1000
-                for _ in range(settle_deadline):
+            def _on_response(resp):
+                try:
+                    if capture(resp.url):
+                        captured.append(resp.json())
+                except Exception:
+                    pass
+            page.on("response", _on_response)
+
+            page.goto(url, timeout=timeout_ms, referer=referer, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            if actions:
+                actions(page)
+            settle_deadline = min(timeout_ms, 15000) // 1000
+            for _ in range(settle_deadline):
+                if captured:
+                    break
+                page.wait_for_timeout(1000)
+            if not captured and manual_wait_ms > 0:
+                deadline = manual_wait_ms // 1000
+                for _ in range(deadline):
+                    page.wait_for_timeout(1000)
                     if captured:
                         break
-                    page.wait_for_timeout(1000)
-                if not captured and manual_wait_ms > 0:
-                    deadline = manual_wait_ms // 1000
-                    for _ in range(deadline):
-                        page.wait_for_timeout(1000)
-                        if captured:
-                            break
-                return captured
-            finally:
-                context.close()  # flush profile 落盘
+            return captured
+        finally:
+            context.close()  # flush profile 落盘
 
     def _run_impl(self, url: str, capture: Callable[[str], bool],
                   cookies: list[dict] | None = None,

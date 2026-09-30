@@ -51,6 +51,7 @@ DEFAULT_SETTINGS = {
     "temp_retention_days": 7,
     "data_dir": "",                          # 数据目录绝对路径；空 = 首次启动自动选定
     "pull_base_pages": 100,                  # v22 阶梯式翻页：第 1 轮最大页数（线性递减，10 兜底）
+    "pull_debug": False,                     # 拉取任务慢路径开关：True 时筛选面板每步 2.5s 便于真机观察
     "task_history_max_count": 500,           # #高危-1：内存中保留的终态任务上限（防 OOM）
     "task_history_retention_hours": 24,      # #高危-1：终态任务保留时长（超时即淘汰）
     # #418：成品视频目录对话框记住的上次选择路径
