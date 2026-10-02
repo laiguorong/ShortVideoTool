@@ -836,24 +836,18 @@ def _cut_clip(clip_id: str) -> tuple[bool, str]:
         _safe_unlink(tmp)
         _write_clip_failed(d, clip_id, "片段落盘失败（文件被占用）")
         return False, "片段落盘失败（文件被占用）"
+    # 自适应 seek（与素材库 _extract_local_cover 分段算法完全一致）
+    clip_duration_ms = int(clip["clip_end_ms"]) - int(clip["clip_start_ms"])
+    seek_s = _compute_clip_thumb_seek(clip_duration_ms)
     thumb_out = get_data_dir() / thumb_rel
     thumb_out.parent.mkdir(parents=True, exist_ok=True)
-    thumb_ok = extract_frame(str(out), str(thumb_out), seek_seconds=0.1)
+    thumb_ok = extract_frame(str(out), str(thumb_out), seek_seconds=seek_s)
 
-    # rev 自增：缩略图路径不变（按 clip_id），靠版本号让前端破浏览器缓存
-    # v28：file_path INSERT 时已按规则预写，不再重复 UPDATE
-    # #421：rev 用全局 MAX+1 而非本地自增，确保差分轮询（rev > max_rev）能立即命中
-    # （旧逻辑下 addClips 时一次性写 rev=81/82/83，worker 切完递增到 82/83/84 < max_rev=83，
-    # 后续差分查询永远漏掉直到最后一段切完）
-    d.update_by_id("project_shot_clip", clip_id, {
-        "file_status": "ready",
-        "fail_reason": None,
-        "thumb_path": thumb_rel if thumb_ok else None,
-    })
-    d.execute(
-        "UPDATE project_shot_clip SET rev = COALESCE("
-        "(SELECT MAX(rev) FROM project_shot_clip), 0) + 1 WHERE id=?",
-        (clip_id,))
+    # 抽帧失败：清残留 + 设 failed 进入手动重试入口（与素材库 #592 区别：创作中心保留 out）
+    _commit_clip_thumb_result(d, clip_id, thumb_out, thumb_rel, thumb_ok)
+    # 抽帧失败：返回 False 让调用方按失败计数（与 _apply_mirror 抽帧失败语义一致）
+    if not thumb_ok:
+        return False, "封面抽帧失败"
     return True, ""
 
 
@@ -892,21 +886,82 @@ def _apply_mirror(clip_id: str) -> tuple[bool, str]:
         _safe_unlink(tmp)
         _write_clip_failed(d, clip_id, "镜像落盘失败（文件被占用）")
         return False, "镜像落盘失败（文件被占用）"
+    # 自适应 seek（与素材库 _extract_local_cover 分段算法完全一致）
+    streams = video_edit._probe_clip_streams(str(out))
+    clip_duration_ms = streams.get("duration_ms") if streams else 0
+    seek_s = _compute_clip_thumb_seek(clip_duration_ms)
     thumb_out = get_data_dir() / thumb_rel
     thumb_out.parent.mkdir(parents=True, exist_ok=True)
-    thumb_ok = extract_frame(str(out), str(thumb_out), seek_seconds=0.1)
+    thumb_ok = extract_frame(str(out), str(thumb_out), seek_seconds=seek_s)
 
-    # #421：rev 用全局 MAX+1，差分轮询（rev > max_rev）立即命中
-    d.update_by_id("project_shot_clip", clip_id, {
-        "file_status": "ready",
-        "fail_reason": None,
+    # 抽帧失败：清残留 + 设 failed 进入手动重试入口（与素材库 #592 区别：创作中心保留 out）
+    _commit_clip_thumb_result(d, clip_id, thumb_out, thumb_rel, thumb_ok)
+    # 抽帧失败：返回 False 让调用方按失败计数（与 _cut_clip 抽帧失败语义一致）
+    if not thumb_ok:
+        return False, "封面抽帧失败"
+    return True, ""
+
+
+def _compute_clip_thumb_seek(duration_ms: int | None) -> float:
+    """抽帧 seek 计算（与素材库 _extract_local_cover 分段算法完全一致）。
+
+    - duration < 1s → 0.0（取首帧，避免短片段 seek 越过文件长度 → 0 packets → ffmpeg -22）
+    - 1s ≤ duration < 3s → 中点（duration/2，首帧可能黑场）
+    - duration ≥ 3s → 1.0s
+    - duration 缺失/0 → 1.0s 兜底
+
+    创作中心片段时长由用户切分决定（可能 < 1s），素材库 _extract_local_cover 用同款算法。
+    """
+    if not duration_ms or duration_ms <= 0:
+        return 1.0
+    if duration_ms < 1000:
+        return 0.0
+    if duration_ms < 3000:
+        return duration_ms / 2000.0
+    return 1.0
+
+
+def _commit_clip_thumb_result(
+    d, cid: str, thumb_out: Path | None, thumb_rel: str,
+    thumb_ok: bool, *, rev_increment: bool = True,
+) -> None:
+    """统一处理片段抽帧结果：写状态 + 清残留 + rev 自增。
+
+    - thumb_ok=True → file_status='ready' + thumb_path
+    - thumb_ok=False → 清 thumb 残留 + file_status='failed' + fail_reason='封面抽帧失败'
+
+    与素材库 #592「抽帧失败撤销入库」区别——创作中心保留 out 视频文件，
+    重试入口 _spawn_clip_retry 可复用分割产物（无需重切）。
+
+    参数:
+        d: DB 实例
+        cid: 片段 ID
+        thumb_out: 缩略图绝对路径（已 mkdir parent），用于失败时 unlink
+        thumb_rel: 缩略图相对路径（DB 存）
+        thumb_ok: 是否抽帧成功
+        rev_increment: 是否刷 rev（#421 全局 MAX+1）。
+            - True（默认）：首次抽帧 / 重试抽帧成功 → 刷 rev 让前端差分轮询可见
+            - False：重试入口第 2 段抽帧失败 → 状态仍是 failed，无新状态差分，无需刷
+              （首次失败时已刷过，避免同一失败事件连续刷 2 次）
+
+    调用示例:
+        # _cut_clip 首次抽帧：
+        _commit_clip_thumb_result(d, clip_id, thumb_out, thumb_rel, thumb_ok)
+        # _spawn_clip_retry 重试第 2 段失败（避免重复刷）：
+        _commit_clip_thumb_result(d, cid, thumb_out, thumb_rel, False, rev_increment=False)
+    """
+    if not thumb_ok and thumb_out:
+        _safe_unlink(thumb_out)
+    d.update_by_id("project_shot_clip", cid, {
+        "file_status": "ready" if thumb_ok else "failed",
+        "fail_reason": None if thumb_ok else "封面抽帧失败",
         "thumb_path": thumb_rel if thumb_ok else None,
     })
-    d.execute(
-        "UPDATE project_shot_clip SET rev = COALESCE("
-        "(SELECT MAX(rev) FROM project_shot_clip), 0) + 1 WHERE id=?",
-        (clip_id,))
-    return True, ""
+    if rev_increment:
+        d.execute(
+            "UPDATE project_shot_clip SET rev = COALESCE("
+            "(SELECT MAX(rev) FROM project_shot_clip), 0) + 1 WHERE id=?",
+            (cid,))
 
 
 def _safe_replace(src, dst, retries: int = 10, sleep_s: float = 0.5) -> bool:
@@ -1238,23 +1293,19 @@ def _cut_clip_batch(clip_ids: list[str],
                 _done(cid, False)
                 continue
 
+            # 自适应 seek（与素材库 _extract_local_cover 分段算法完全一致）
+            streams = video_edit._probe_clip_streams(str(final_p))
+            clip_duration_ms = streams.get("duration_ms") if streams else 0
+            seek_s = _compute_clip_thumb_seek(clip_duration_ms)
             # 抽帧
             thumb_out = get_data_dir() / thumb_rel
             thumb_out.parent.mkdir(parents=True, exist_ok=True)
-            thumb_ok = extract_frame(str(final_p), str(thumb_out), seek_seconds=0.1)
+            thumb_ok = extract_frame(str(final_p), str(thumb_out), seek_seconds=seek_s)
 
-            # v28：file_path 已预写，不再 UPDATE
-            # #421：rev 用全局 MAX+1，差分轮询立即命中
-            d.update_by_id("project_shot_clip", cid, {
-                "file_status": "ready",
-                "fail_reason": None,
-                "thumb_path": thumb_rel if thumb_ok else None,
-            })
-            d.execute(
-                "UPDATE project_shot_clip SET rev = COALESCE("
-                "(SELECT MAX(rev) FROM project_shot_clip), 0) + 1 WHERE id=?",
-                (cid,))
-            _done(cid, True)
+            # 抽帧失败：清残留 + 设 failed 进入手动重试入口（与素材库 #592 区别：创作中心保留 out）
+            _commit_clip_thumb_result(d, cid, thumb_out, thumb_rel, thumb_ok)
+            # 抽帧失败时不报成功（#P1：进度/计数正确性）
+            _done(cid, thumb_ok)
 
         # 清理临时目录
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -1279,8 +1330,12 @@ def _spawn_clip_mirror(clip_ids: list[str]) -> None:
         d = get_db()
         for cid in ids:
             try:
-                _apply_mirror(cid)  # 函数内已写状态
-                ok_count += 1
+                ok, _ = _apply_mirror(cid)  # 函数内已写状态
+                # 抽帧失败时返 False（不进入 ok 计数）
+                if ok:
+                    ok_count += 1
+                else:
+                    fail_count += 1
             except Exception as e:  # noqa: BLE001
                 fail_count += 1
                 logger.warning("[片段镜像] clip={} 失败：{}", cid, e)
@@ -1476,43 +1531,91 @@ def render_clip(clip_id: str) -> dict:
 
 
 def _spawn_clip_retry(clip_id: str) -> None:
-    """手动重试线程（#380）：按当前 mirrored 状态分派 _cut_clip / _cut_clip+_apply_mirror。
-
-    #80：补入口/出口/异常日志——前端点"重试"后状态栏看不到进度，
-    日志文件也完全无 [片段重试] 痕迹。
+    """手动重试线程：先判断分割是否成功 → 再判断抽帧是否成功 → 依次补完。
+    mirrored=1 时在分割/抽帧都成功后跑 _apply_mirror。
     """
     logger.info("[片段重试] 启动后台线程 clip={}", clip_id)
 
     def _run(cid: str) -> None:
         d = get_db()
-        clip = d.query_one("SELECT mirrored FROM project_shot_clip WHERE id=?", (cid,))
+        clip = d.query_one(
+            """SELECT c.*, s.project_id AS project_id
+               FROM project_shot_clip c JOIN project_shot s ON c.shot_id=s.id
+               WHERE c.id=?""", (cid,))
         if not clip:
             logger.warning("[片段重试] clip 不存在 cid={}", cid)
             return
-        try:
-            ok, reason = _cut_clip(cid)
-        except Exception as e:  # noqa: BLE001
-            # #89：render_clip 入口已写 pending，_cut_clip 自身异常未走到
-            # 内部 _write_clip_failed 时 DB 卡在 pending。补 _write_clip_failed
-            # 写回 failed，状态栏/前端区分"重试中"还是"重试失败"。
-            logger.error("[片段重试] _cut_clip 异常 clip={} 异常={}", cid, e)
+        project_id = clip["project_id"]
+        seq = int(clip["seq"] or 0) or _next_clip_seq(project_id)
+        rel = clip["file_path"] or _clip_rel_path(project_id, seq, cid)
+        thumb_rel = clip["thumb_path"] or _clip_thumb_rel(project_id, seq, cid)
+        out = get_data_dir() / rel
+
+        # 1) 分割未完成（out 不存在）→ 跑 _cut_clip
+        #    _cut_clip 内部含抽帧（成功 ready / 失败 failed），一站式处理
+        if not out.is_file():
             try:
-                _write_clip_failed(d, cid, str(e))
-            except Exception:  # noqa: BLE001 _write_clip_failed 内部已 logger.error
-                pass
-            return
-        if not ok:
-            # _cut_clip 内部已 _write_clip_failed，这里只补日志
-            logger.warning("[片段重试] clip={} cut 失败 reason={}", cid, reason)
-            return
-        if int(clip["mirrored"]):
-            try:
-                _apply_mirror(cid)
-                logger.info("[片段重试] clip={} cut+mirror 成功", cid)
+                ok, reason = _cut_clip(cid)
             except Exception as e:  # noqa: BLE001
-                logger.error("[片段重试] clip={} mirror 异常：{}", cid, e)
-        else:
-            logger.info("[片段重试] clip={} cut 成功（无需镜像）", cid)
+                logger.error("[片段重试] _cut_clip 异常 clip={} 异常={}", cid, e)
+                try:
+                    _write_clip_failed(d, cid, str(e))
+                except Exception:
+                    pass
+                return
+            if not ok:
+                logger.warning("[片段重试] clip={} 分割仍失败 reason={}", cid, reason)
+                return
+            # _cut_clip 抽帧失败已返 False（与 _apply_mirror 抽帧失败语义一致），
+            # 此处 file_status='failed' 兜底检查防御未来 _cut_clip 改回 True 时
+            # _apply_mirror 覆盖 failed → ready/mirror_failed
+            cur = d.query_one("SELECT file_status FROM project_shot_clip WHERE id=?", (cid,))
+            if cur and cur["file_status"] != "ready":
+                logger.warning("[片段重试] clip={} 抽帧仍失败，跳过镜像", cid)
+                return
+            # 分割 + 抽帧都 OK，按 mirrored 决定是否镜像
+            if int(clip["mirrored"]):
+                try:
+                    mirror_ok, mirror_reason = _apply_mirror(cid)
+                    if mirror_ok:
+                        logger.info("[片段重试] clip={} cut+mirror 成功", cid)
+                    else:
+                        # _apply_mirror 内部已 _write_clip_failed / 设 thumb_path，
+                        # 仅补失败原因日志便于排查
+                        logger.warning("[片段重试] clip={} mirror 失败 reason={}", cid, mirror_reason)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("[片段重试] clip={} mirror 异常：{}", cid, e)
+                    _write_clip_failed(d, cid, f"镜像失败：{e}")
+            else:
+                logger.info("[片段重试] clip={} cut 成功（无需镜像）", cid)
+            return
+
+        # 2) 抽帧缺失（thumb_rel 为空 或 文件不存在）→ 单独跑抽帧（无需重切）
+        thumb_out = get_data_dir() / thumb_rel if thumb_rel else None
+        need_thumb = (not thumb_rel) or (thumb_out is None) or (not thumb_out.is_file())
+        if need_thumb:
+            # thumb_rel 缺失时按规则算一个（与 _cut_clip / _apply_mirror 一致）
+            if not thumb_rel:
+                thumb_rel = _clip_thumb_rel(project_id, seq, cid)
+                thumb_out = get_data_dir() / thumb_rel
+            # 自适应 seek（与素材库 _extract_local_cover 分段算法完全一致）
+            streams = video_edit._probe_clip_streams(str(out))
+            clip_duration_ms = streams.get("duration_ms") if streams else 0
+            seek_s = _compute_clip_thumb_seek(clip_duration_ms)
+            thumb_out.parent.mkdir(parents=True, exist_ok=True)
+            if extract_frame(str(out), str(thumb_out), seek_seconds=seek_s):
+                _commit_clip_thumb_result(d, cid, thumb_out, thumb_rel, True)
+                logger.info("[片段重试] 抽帧补全成功 cid={}", cid)
+            else:
+                # 重试入口失败分支不刷 rev（避免与首次抽帧失败的 rev 重复）
+                _commit_clip_thumb_result(d, cid, thumb_out, thumb_rel, False, rev_increment=False)
+                logger.warning("[片段重试] 抽帧仍失败 cid={}", cid)
+            return
+
+        # 3) 分割 + 抽帧都齐备 → 防御性刷 ready + rev（正常 _cut_clip 已写过）
+        thumb_out = get_data_dir() / thumb_rel
+        _commit_clip_thumb_result(d, cid, thumb_out, thumb_rel, True)
+        logger.info("[片段重试] 已就绪跳过 cid={}", cid)
 
     threading.Thread(target=_run, args=(clip_id,), daemon=True).start()
 

@@ -20,6 +20,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.services import setting_service
@@ -44,6 +46,20 @@ def _wait_done(tid: str, timeout: float = 5.0):
             return info
         time.sleep(0.05)
     raise TimeoutError(f"任务 {tid} 超时")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_task_service():
+    """每个测试前后清空 task_service._tasks，防止前序测试残留污染本测试断言）。
+
+    test_cleanup_drops_by_count 期望剩 max_count=3 条，前序 test_cleanup_keeps_running_tasks
+    留下 1 条 success 任务 + 本测试 5 条 = 6 条 finished → 实际剩 2 条 < 期望 3 条。
+    """
+    with task_service._lock:
+        task_service._tasks.clear()
+    yield
+    with task_service._lock:
+        task_service._tasks.clear()
 
 
 # ============ #高危-1：清理函数基本行为 ============

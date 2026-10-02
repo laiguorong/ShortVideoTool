@@ -21,9 +21,9 @@ from app.core.douyin.client import _derive_search_keyword
 from app.core.ffmpeg import probe_media, extract_media_info
 from app.db import get_db
 from app.db.utils import now_str
+from app.services.setting_service import get_data_dir, load_settings
 from app.services import account_service
 from app.services.task_service import task_service, raise_for_cancel, _fmt_hms, interruptible_sleep
-from app.services.setting_service import get_data_dir, load_settings
 
 _JOB_PREFIX = "video_pull:"
 # #96：跨调用去重 set——同一 (pattern, error) 已打过 WARNING 就跳过，
@@ -136,8 +136,7 @@ def _reject_and_cleanup(save_path: Path, video_id: str, reason: str,
     字幕分支会传 sub_texts（OCR 识别到的文本）便于排障日志，
     人脸分支不传。返回 "" 让上游 _download_video_candidate 知道该视频被过滤。
     """
-    save_path.unlink(missing_ok=True)
-    _cleanup_empty_dir(save_path.parent)
+    _cleanup_material_files(_safe_data_rel(save_path))
     if sub_texts:
         logger.info(
             "[过滤] 视频 {} {}，跳过入库 | 字幕内容: {}",
@@ -399,6 +398,178 @@ def _cleanup_empty_dir(parent: Path, remove_files: bool = False) -> None:
     except OSError:
         # 并发覆盖后仍非空 / 权限不足，跳过
         pass
+
+
+# 模块级缓存 data_dir.resolve() 结果（避免每次 cleanup 都 stat 一次文件系统）
+_DATA_ROOT_RESOLVED: Path | None = None
+
+
+def _resolve_data_root() -> Path:
+    """data_dir resolve 单例（防 1000+ 视频每条调一次 stat）。"""
+    global _DATA_ROOT_RESOLVED
+    if _DATA_ROOT_RESOLVED is None:
+        _DATA_ROOT_RESOLVED = get_data_dir().resolve()
+    return _DATA_ROOT_RESOLVED
+
+
+def _invalidate_data_root_cache() -> None:
+    """失效 _DATA_ROOT_RESOLVED 缓存。
+
+    TODO（#592 follow-up）：settings_service 切换 data_dir 时必须调一次本函数，
+    否则旧路径仍被缓存使用，所有 cleanup 静默失效。当前 settings_service
+    未暴露 data_dir 热切接口，本函数预留 hook。
+    """
+    global _DATA_ROOT_RESOLVED
+    _DATA_ROOT_RESOLVED = None
+
+
+# Windows 8.3 短名格式：1-6 字符 + `~` + 1-3 位数字 + 可选扩展名（PROGRA~1、ARCHIV~2.MP4）
+# 整段匹配（前后是路径分隔符或边界），不误判合法目录 `archive~1`
+_SHORT_NAME_RE = re.compile(
+    r"(?i)(?:^|[\\/])[A-Z0-9]{1,6}~\d{1,3}(?:\.[A-Z0-9]{1,3})?(?:[\\/]|$)"
+)
+
+
+def _resolve_safe(p: Path) -> Path | None:
+    """p → 解析后的绝对路径；不安全返 None（resolve 失败 / UNCUTE `\\?\\` / 8.3 短名 / 路径外）。
+
+    `_is_within_data_root` 和 `_safe_data_rel` 共用此解析结果，避免重复 resolve + is_relative_to。
+    """
+    try:
+        p_abs = p.resolve()
+    except OSError:
+        return None
+    s = str(p_abs)
+    if "\\?\\" in s or _SHORT_NAME_RE.search(s):
+        return None
+    try:
+        if not p_abs.is_relative_to(_resolve_data_root()):
+            return None
+    except OSError:
+        return None
+    return p_abs
+
+
+def _is_within_data_root(p: Path) -> bool:
+    """校验 p 解析后是否仍在 data_root 内（防路径穿越 + Windows 8.3 / UNC）。"""
+    return _resolve_safe(p) is not None
+
+
+def _cleanup_material_files(file_rel: str | None,
+                            cover_rel: str | None = None,
+                            avatar_rel: str | None = None) -> None:
+    r"""统一清理素材物理文件（任务 #592：撤销入库 / 删除素材复用）。
+
+    删除 file_rel（视频本体）+ cover_rel（封面）+ avatar_rel（头像），
+    然后 best-effort 清空 file_rel 的父目录（force 一级清理）。
+    入参路径都是相对 data 根的字符串（material.file_path / cover_url / author_avatar）；
+    任何字段为空（None/''/目录不存在）跳过；删不到的文件静默吞 OSError。
+
+    安全：所有 rel 通过 `_resolve_safe` 校验（防 caller 传『../../../xxx』路径穿越
+    + UNC `\\?\` 设备路径 + Windows 8.3 短名 + symlink 跳出 data_root）。
+    校验失败跳过并 WARNING 日志。
+    """
+    data_dir = get_data_dir()
+    rels = [r for r in (file_rel, cover_rel, avatar_rel) if r]
+    for rel in rels:
+        p = _resolve_safe(data_dir / rel)
+        if p is None:
+            logger.warning(
+                "[清理] rel 校验失败（路径穿越 / UNC / 8.3 短名），跳过删除 rel={}",
+                rel,
+            )
+            continue
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+    if file_rel:
+        parent_abs = _resolve_safe(data_dir / file_rel)
+        if parent_abs is not None:
+            _cleanup_empty_dir(parent_abs.parent, remove_files=True)
+        else:
+            logger.warning("[清理] 父目录校验失败，跳过目录清理 rel={}", file_rel)
+
+
+def _safe_data_rel(p: Path) -> str | None:
+    """Path → 相对 data_dir 字符串（正斜杠）；不在内返 None。
+
+    与 _resolve_safe 同一套校验（UNC `\\?\\` / 8.3 短名 / 路径外 → None）。
+    用于调用 _cleanup_material_files 时统一计算 file_rel，避免重复 try/except。
+    复用 _resolve_safe 解析（不重复 resolve + is_relative_to）；relative_to
+    不会抛 ValueError（_resolve_safe 已 is_relative_to 校验通过）。
+    """
+    p_abs = _resolve_safe(p)
+    if p_abs is None:
+        return None
+    return str(p_abs.relative_to(_resolve_data_root())).replace("\\", "/")
+
+
+def _transcode_video_to_mp4(src_path: Path) -> Path | None:
+    """任意视频统一转 mp4（#592）。
+
+    - 视频流优先 `-c:v copy`（无重编开销）
+    - 有 audio 轨 → `-c:a aac` 重编音频（保证容器内 aac 统一）
+    - 无 audio 轨 → 加 anullsrc stereo44100 静音轨（#592 补全元数据要求）
+    - 产物 = src_path 同目录 `<stem>_transcoded.mp4`
+    - 失败返 None（产物文件若已部分生成会被 unlink）
+    """
+    from app.core.ffmpeg import FFMPEG, run_cmd, probe_media
+    info = probe_media(str(src_path))
+    has_audio = False
+    if info:
+        for s in info.get("streams", []) or []:
+            if s.get("codec_type") == "audio":
+                has_audio = True
+                break
+    out_path = src_path.with_name(src_path.stem + "_transcoded.mp4")
+    if has_audio:
+        cmd = [
+            FFMPEG, "-y", "-i", str(src_path),
+            "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart",
+            str(out_path),
+        ]
+    else:
+        cmd = [
+            FFMPEG, "-y", "-i", str(src_path),
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-c:v", "copy", "-c:a", "aac", "-shortest",
+            "-map", "0:v:0", "-map", "1:a:0", "-movflags", "+faststart",
+            str(out_path),
+        ]
+    result = run_cmd(cmd)
+    if result is None or result.returncode != 0 or not out_path.exists():
+        out_path.unlink(missing_ok=True)
+        tail = ""
+        if result is not None and result.stderr:
+            tail_lines = [ln for ln in result.stderr.strip().splitlines() if ln.strip()][-3:]
+            tail = "\n".join(tail_lines)
+        logger.warning("[转码] 视频→mp4 失败 src={} has_audio={} tail=\n{}",
+                       src_path.name, has_audio, tail)
+        return None
+    return out_path
+
+
+def _transcode_audio_to_mp3(src_path: Path) -> Path | None:
+    """任意音频统一转 mp3（#592，libmp3lame q=2）。"""
+    from app.core.ffmpeg import FFMPEG, run_cmd
+    out_path = src_path.with_name(src_path.stem + "_transcoded.mp3")
+    cmd = [
+        FFMPEG, "-y", "-i", str(src_path),
+        "-c:a", "libmp3lame", "-q:a", "2",
+        str(out_path),
+    ]
+    result = run_cmd(cmd)
+    if result is None or result.returncode != 0 or not out_path.exists():
+        out_path.unlink(missing_ok=True)
+        tail = ""
+        if result is not None and result.stderr:
+            tail_lines = [ln for ln in result.stderr.strip().splitlines() if ln.strip()][-3:]
+            tail = "\n".join(tail_lines)
+        logger.warning("[转码] 音频→mp3 失败 src={} tail=\n{}", src_path.name, tail)
+        return None
+    return out_path
 
 
 def _infer_image_ext(url: str, default: str = ".webp") -> str:
@@ -724,6 +895,7 @@ def _run_pull_round(task_id: str, info) -> str:
         max_count = 100
     max_count = max(1, min(1000, max_count))
     account = d.query_one("SELECT * FROM account WHERE id=? AND deleted=0", (task["account_id"],))
+    account_id=account["id"]  # 缓存供阶段 B 详情抓取走 storage_state
     if not account or account["status"] in ("invalid", "disabled"):
         _write_pull_log(task_id, 0, 0, "账号登录态失效，跳过本轮")
         return "账号登录态失效，跳过本轮"
@@ -876,6 +1048,8 @@ def _run_pull_round(task_id: str, info) -> str:
                 # 支持取消信号立即唤醒，同时让 progress 模板反映倒计时。
                 from app.services.task_service import interruptible_sleep
                 import time as _time
+                # 顶层 cancel-friendly sleep（切片前先做一次整体等待；cancel 时立即唤醒）
+                interruptible_sleep(wait_sec, info)
                 _wait_start = _time.time()
                 while _time.time() - _wait_start < wait_sec:
                     _remaining = int(wait_sec - (_time.time() - _wait_start))
@@ -1028,11 +1202,19 @@ def _run_pull_round(task_id: str, info) -> str:
 
 
 def _extract_local_cover(video_path: Path, material_id: str,
-                         material_type: str = "video") -> str:
-    """从本地视频抽取首秒帧作为封面（分辨率=视频原生分辨率；#364 落 material/<type>/<date>/<id>/）。
+                         material_type: str = "video",
+                         duration_ms: int | None = None) -> str:
+    """从本地视频抽取首帧作为封面（分辨率=视频原生分辨率；#364 落 material/<type>/<date>/<id>/）。
+
+    自适应 seek（fix：iPhone 录的极短预览 < 1s 时 seek=1.0 会落到视频外 → mjpeg encoder EOF
+    失败 → rc=-22，封面永远抽不到）：
+    - duration_ms < 1000 → seek=0（首帧）
+    - 1000 ≤ duration_ms < 3000 → seek = duration_ms / 2（中段）
+    - duration_ms ≥ 3000 → seek = 1.0
+    - duration_ms 缺失（兼容老调用）→ seek = 1.0（保持原行为）
 
     返回相对 data 根的路径（material/<type>/<date>/<id>/<id>_cover.jpg）；
-    失败返回空串，调用方回退 CDN 封面。
+    失败返回空串，调用方按各自兜底策略（upload 撤回入库，pull/share 走 CDN 兜底）。
     """
     from app.core.ffmpeg import extract_frame
     rel = _build_material_cover_path(material_type, material_id, ".jpg")
@@ -1040,12 +1222,22 @@ def _extract_local_cover(video_path: Path, material_id: str,
     try:
         abs_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        logger.debug("[封面] 缓存目录创建失败 material_id={} err={}", material_id, e)
+        logger.warning("[封面] 缓存目录创建失败 material_id={} err={}", material_id, e)
         return ""
-    if extract_frame(str(video_path), str(abs_path), seek_seconds=1.0):
+
+    if duration_ms is None or duration_ms <= 0:
+        seek_s = 1.0
+    elif duration_ms < 1000:
+        seek_s = 0.0  # 短视频取首帧（避免 seek 落到视频外）
+    elif duration_ms < 3000:
+        seek_s = duration_ms / 2000.0  # 1-3s 取中点（首帧可能黑场）
+    else:
+        seek_s = 1.0
+
+    if extract_frame(str(video_path), str(abs_path), seek_seconds=seek_s):
         return rel
-    logger.debug("[封面] 本地抽帧失败 material_id={} video={} → 回退 CDN 封面",
-                 material_id, video_path.name)
+    logger.warning("[封面] 本地抽帧失败 material_id={} video={} duration_ms={} seek={:.2f}s",
+                   material_id, video_path.name, duration_ms, seek_s)
     return ""
 
 
@@ -1252,6 +1444,7 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
 
     仅下载抖音 music 节点的 play_url 直链（纯 BGM 源文件，不含作者人声）；
     版权受限曲目无直链 → 直接跳过。同一首原声多视频共用 music.mid，按其去重。
+    #592 统一转 mp3：原格式非 mp3 → ffmpeg 转码（libmp3lame q=2）。
     任何失败只记日志，不影响视频入库结果。
     """
     m = video.get("music") or {}
@@ -1266,10 +1459,10 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
             "SELECT id FROM material WHERE source_ref=? AND deleted=0", (music_id,)):
         return
     material_id = new_id()
-    # 扩展名从直链提取，取不到默认 mp3
+    # 扩展名从直链提取（#592 改：内联 tuple 改用顶层 MUSIC_EXTS，避免漏改）
     ext = ".mp3"
     low = url.split("?")[0].lower()
-    for e in (".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"):
+    for e in MUSIC_EXTS:
         if low.endswith(e):
             ext = e
             break
@@ -1278,17 +1471,25 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
     try:
         client.download_video(url, str(save_path))
     except BaseException:
-        # #P1-1：下载失败清理残文件 + 空目录，避免磁盘垃圾
-        save_path.unlink(missing_ok=True)
-        _cleanup_empty_dir(save_path.parent)
+        # #P1-1-#592：下载失败统一走 helper 清理
+        _cleanup_material_files(_safe_data_rel(save_path))
         raise
+    # #592 统一转 mp3：原格式非 mp3 → ffmpeg 转码
+    if ext != ".mp3":
+        transcoded = _transcode_audio_to_mp3(save_path)
+        if transcoded is None:
+            _cleanup_material_files(_safe_data_rel(save_path))
+            logger.warning("[BGM] 转 mp3 失败 music_id={} → 跳过入库", music_id)
+            return
+        # 用转码产物替换源文件，统一存 mp3
+        save_path.unlink(missing_ok=True)
+        transcoded.rename(save_path.with_suffix(".mp3"))
+        save_path = save_path.with_suffix(".mp3")
+        ext = ".mp3"
     md5 = _md5_of_file(save_path)
     # MD5 兜底去重（music_id 缺失时同一文件可能重复入库）
     if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
-        save_path.unlink(missing_ok=True)
-        # MD5 重时目录可能还含 cover（_download_and_ingest 之前已下完封面）
-        # 传 remove_files=True 把 cover 等孤儿一起清掉，避免磁盘垃圾。
-        _cleanup_empty_dir(save_path.parent, remove_files=True)
+        _cleanup_material_files(_safe_data_rel(save_path))
         return
     # ffprobe 探测时长（失败回退接口给的 duration）
     probe = extract_media_info(probe_media(str(save_path))) \
@@ -1300,6 +1501,7 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
     if cover_url:
         from app.core.douyin.avatar_cache import download_to
         cover_rel = download_to(cover_url, _build_material_cover_path("music", material_id, cover_ext))
+    file_rel = str(save_path.relative_to(get_data_dir())).replace("\\", "/")
     d.insert("material", {
         "id": material_id,
         "title": m.get("title") or "未知原声",
@@ -1310,7 +1512,7 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
         "source_type": source_type,
         "source_ref": music_id or None,
         "file_md5": md5,
-        "file_path": str(save_path.relative_to(get_data_dir())).replace("\\", "/"),
+        "file_path": file_rel,
         "duration_ms": probe.get("duration_ms") or m.get("duration_ms") or None,
         "author_nickname": m.get("author") or None,
         # 音频直链落库（详情溯源展示；带签名会过期）
@@ -1390,9 +1592,9 @@ def _download_music_ingest(music: dict, category_id: str, client,
     - 用途：分享链接直接入音乐库（非视频附属 BGM）
     - 入库字段：author_nickname 用音乐作者（music.author）而非视频作者
     - share_url 必填（原声聚合页链接）
+    - #592 统一转 mp3（原格式非 mp3 → ffmpeg 转码）
     """
     from app.db.utils import new_id
-    from app.core.douyin.avatar_cache import cache_cover
 
     music_id = music.get("music_id") or ""
     title = music.get("title") or "未知原声"
@@ -1400,10 +1602,10 @@ def _download_music_ingest(music: dict, category_id: str, client,
     if not download_url:
         raise DouyinClientError("音乐直链为空，版权受限曲目无法下载")
 
-    # 扩展名从直链提取
+    # 扩展名从直链提取（#592：内联 tuple 改顶层 MUSIC_EXTS）
     ext = ".mp3"
     low = download_url.split("?")[0].lower()
-    for e in (".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"):
+    for e in MUSIC_EXTS:
         if low.endswith(e):
             ext = e
             break
@@ -1415,18 +1617,26 @@ def _download_music_ingest(music: dict, category_id: str, client,
     try:
         client.download_video(download_url, str(save_path))
     except BaseException:
-        # #P1-1：下载失败清理残文件 + 空目录，避免磁盘垃圾
-        save_path.unlink(missing_ok=True)
-        _cleanup_empty_dir(save_path.parent)
+        # #P1-1-#592：下载失败统一走 helper 清理
+        _cleanup_material_files(_safe_data_rel(save_path))
         raise
+
+    # #592 统一转 mp3：原格式非 mp3 → ffmpeg 转码
+    if ext != ".mp3":
+        transcoded = _transcode_audio_to_mp3(save_path)
+        if transcoded is None:
+            _cleanup_material_files(_safe_data_rel(save_path))
+            return ""
+        save_path.unlink(missing_ok=True)
+        transcoded.rename(save_path.with_suffix(".mp3"))
+        save_path = save_path.with_suffix(".mp3")
+        ext = ".mp3"
 
     md5 = _md5_of_file(save_path)
     # MD5 兜底去重
     d = get_db()
     if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
-        save_path.unlink(missing_ok=True)
-        # MD5 重时目录可能还含 cover，传 remove_files=True 清掉 cover 孤儿。
-        _cleanup_empty_dir(save_path.parent, remove_files=True)
+        _cleanup_material_files(_safe_data_rel(save_path))
         return ""
 
     # ffprobe 探测时长（失败回退接口给的 duration）
@@ -1441,6 +1651,7 @@ def _download_music_ingest(music: dict, category_id: str, client,
         from app.core.douyin.avatar_cache import download_to
         cover_rel = download_to(cover_url, _build_material_cover_path("music", material_id, cover_ext))
 
+    file_rel = str(save_path.relative_to(get_data_dir())).replace("\\", "/")
     d.insert("material", {
         "id": material_id,
         "title": title,
@@ -1451,7 +1662,7 @@ def _download_music_ingest(music: dict, category_id: str, client,
         "source_type": source_type,
         "source_ref": music_id or None,
         "file_md5": md5,
-        "file_path": str(save_path.relative_to(get_data_dir())).replace("\\", "/"),
+        "file_path": file_rel,
         "duration_ms": probe.get("duration_ms") or music.get("duration_ms") or None,
         # 任务 #132：音乐作者（非视频作者）
         "author_nickname": music.get("author") or None,
@@ -1580,10 +1791,21 @@ def _download_and_ingest(video: dict, category_id: str, client,
     try:
         _download_with_retry()
     except BaseException:
-        # #P1-1：下载失败清理残文件 + 空目录
-        save_path.unlink(missing_ok=True)
-        _cleanup_empty_dir(save_path.parent)
+        # #P1-1-#592：下载失败统一走 helper 清理
+        _cleanup_material_files(_safe_data_rel(save_path))
         raise
+
+    # #592：统一转 mp4 + 补全元数据（无音频轨时加 anullsrc 静音轨）
+    # 转码失败的统一路径：撤销入库（清理文件 + 返回 ""）
+    transcoded = _transcode_video_to_mp4(save_path)
+    if transcoded is None:
+        _cleanup_material_files(_safe_data_rel(save_path))
+        logger.warning("[拉取] 视频转 mp4 失败 video_id={} → 撤销入库",
+                       video.get("video_id"))
+        return ""
+    # 用转码产物替换原下载文件，统一存 mp4
+    save_path.unlink(missing_ok=True)
+    transcoded.rename(save_path)
 
     # 内容检测（字幕/主播人脸）：下载后、入库前按需过滤；命中则清理下载文件后返回空串
     need_subtitle = bool(conditions and conditions.get("filter_subtitle"))
@@ -1618,15 +1840,14 @@ def _download_and_ingest(video: dict, category_id: str, client,
     md5 = _md5_of_file(save_path)
     # ffprobe 探测（失败字段置空，F-03-R2）
     probe = extract_media_info(probe_media(str(save_path))) if save_path.stat().st_size > 1024 else {}
-    # 封面：优先本地抽帧（分辨率=视频原生分辨率，与预览一致）；CDN 封面作兜底
-    cover_rel = _extract_local_cover(save_path, material_id, "video")
+    # #592 封面：仅本地抽帧，失败 → 撤销入库（删文件 + 不调 CDN 兜底）
+    cover_rel = _extract_local_cover(save_path, material_id, "video",
+                                     duration_ms=probe.get("duration_ms") if probe else None)
     if not cover_rel:
-        # #364：CDN 兜底封面下载到 material/video/<date>/<id>/<id>_cover.<ext>
-        from app.core.douyin.avatar_cache import download_to
-        cover_url = video.get("cover_url", "")
-        if cover_url:
-            cover_ext = _infer_image_ext(cover_url, default=".webp")
-            cover_rel = download_to(cover_url, _build_material_cover_path("video", material_id, cover_ext))
+        _cleanup_material_files(_safe_data_rel(save_path))
+        logger.warning("[拉取] 封面抽帧失败 video_id={} → 撤销入库",
+                       video.get("video_id"))
+        return ""
     # #364：作者头像下载到 material/video/<date>/<id>/<id>_avatar.<ext>
     avatar_url = video.get("author_avatar", "")
     avatar_rel = ""
@@ -2067,8 +2288,8 @@ def upload_files(file_paths: list[str], category_id: str) -> dict:
 def _upload_single_file(raw: str, category_id: str) -> dict:
     """单文件上传入库（供同步上传与异步任务共用）。
 
-    返回:
-        {"file", "ok", "message", "material_id"}
+    #592 统一：视频 → mp4（c:v copy + 补静音轨）；音频 → mp3（libmp3lame）。
+    返回 {"file", "ok", "message", "material_id"}；失败时已用 helper 删 video + cover + 父目录。
     """
     from app.db.utils import new_id
     d = get_db()
@@ -2101,16 +2322,40 @@ def _upload_single_file(raw: str, category_id: str) -> dict:
         return {"file": src.name, "ok": False,
                 "message": f"已存在（素材：{dup['title']}）", "material_id": dup["id"]}
     material_id = new_id()
-    dest = _build_material_path(material_type, category_id, material_id, src.stem, ext)
+    # #592 目标后缀按类型统一：视频 mp4 / 音频 mp3
+    target_ext = ".mp4" if material_type == "video" else ".mp3"
+    dest = _build_material_path(material_type, category_id, material_id, src.stem, target_ext)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
-    _probe_and_save(material_id, src.stem, material_type, category_id, dest,
-                    "upload", None, None, md5)
-    # 视频上传：抽取本地帧作为封面（与拉取/分享来源保持一致）
+    # #592 转码：上传格式 ≠ 目标格式 → ffmpeg 转码（视频 copy 流 + aac / 补静音轨；音频 mp3）
+    if ext != target_ext:
+        transcoder = _transcode_video_to_mp4 if material_type == "video" else _transcode_audio_to_mp3
+        transcoded = transcoder(dest)
+        if transcoded is None:
+            # 转码失败：删已拷贝的源 + 清空父目录 → 不入库
+            _cleanup_material_files(_safe_data_rel(dest))
+            return {"file": src.name, "ok": False,
+                    "message": f"格式转码失败（{ext}→{target_ext}），素材不入库",
+                    "material_id": None}
+        # 用转码产物替换 copy 的源文件（统一存 target_ext）
+        dest.unlink(missing_ok=True)
+        transcoded.rename(dest)
+    saved = _probe_and_save(material_id, src.stem, material_type, category_id, dest,
+                            "upload", None, None, md5)
+    # 视频上传：抽取本地帧作为封面；失败 → 整体不入库（撤回 INSERT + 删 video/cover/目录）
     if material_type == "video":
-        cover_rel = _extract_local_cover(dest, material_id, "video")
+        duration_ms = saved.get("duration_ms") if saved else None
+        cover_rel = _extract_local_cover(dest, material_id, "video",
+                                         duration_ms=duration_ms)
         if cover_rel:
             d.execute("UPDATE material SET cover_url=? WHERE id=?", (cover_rel, material_id))
+        else:
+            # 抽帧失败：撤回入库 → 用 helper 统一清理（删 dest + 抽帧可能生成的 cover + 父目录）
+            d.execute("DELETE FROM material WHERE id=?", (material_id,))
+            _cleanup_material_files(_safe_data_rel(dest))
+            return {"file": src.name, "ok": False,
+                    "message": f"封面抽帧失败（duration_ms={duration_ms}ms），素材不入库",
+                    "material_id": None}
     return {"file": src.name, "ok": True, "message": "入库成功", "material_id": material_id}
 
 
@@ -2188,16 +2433,20 @@ def update_material(material_id: str, title: str | None, category_id: str | None
 
 
 def delete_material(material_id: str, keep_file: bool = False) -> None:
-    """删除素材（引用提示由前端承担；引用处置为素材缺失占位）。"""
+    """删除素材（引用提示由前端承担；引用处置为素材缺失占位）。
+
+    keep_file=False 时统一删 video + cover + avatar + 清空父目录（#592）。
+    """
     d = get_db()
-    row = d.query_one("SELECT file_path FROM material WHERE id=? AND deleted=0", (material_id,))
+    row = d.query_one(
+        "SELECT file_path, cover_url, author_avatar FROM material WHERE id=? AND deleted=0",
+        (material_id,))
     if not row:
         raise ValueError("素材不存在")
     # 片段/BGM 引用处置：引用记录保留（生成时校验文件存在性，缺失跳过）
     d.soft_delete_by_id("material", material_id)
     if not keep_file:
-        f = get_data_dir() / row["file_path"]
-        f.unlink(missing_ok=True)
+        _cleanup_material_files(row["file_path"], row["cover_url"], row["author_avatar"])
 
 
 def relocate_material(material_id: str, new_abs_path: str) -> None:

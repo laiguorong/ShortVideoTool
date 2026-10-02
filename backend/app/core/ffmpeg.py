@@ -240,6 +240,12 @@ def probe_media(file_path: str) -> Optional[dict]:
 def extract_media_info(info: dict) -> dict:
     """从 probe_media 结果提取常用字段。
 
+    iPhone MOV / Android 部分视频会把 tkhd Display Matrix 旋转元数据写在
+    stream.side_data_list（side_data_type="Display Matrix", rotation=±90/±270）。
+    此时 stream.width/height 是 sensor 原始维度（横向录制），需按 rotation 对调
+    后才是用户视觉方向——否则 upload 竖屏视频被误判为横屏，封面 object-contain
+    黑边，分类按 orientation 过滤时被排掉（fix #590/#591）。
+
     参数:
         info: probe_media 返回的 dict
     返回:
@@ -263,6 +269,18 @@ def extract_media_info(info: dict) -> dict:
                 out["height"] = int(stream.get("height", 0)) or None
             except (TypeError, ValueError):
                 pass
+            # 读 side_data_list 中的 Display Matrix rotation（iPhone MOV / 部分安卓）
+            rotation = 0
+            for sd in stream.get("side_data_list", []) or []:
+                if sd.get("side_data_type") == "Display Matrix":
+                    try:
+                        rotation = int(sd.get("rotation", 0))
+                    except (TypeError, ValueError):
+                        rotation = 0
+                    break
+            # ±90 / ±270 时 sensor w/h 与视觉 w/h 对调
+            if abs(rotation) in (90, 270) and out["width"] and out["height"]:
+                out["width"], out["height"] = out["height"], out["width"]
             if out["width"] and out["height"]:
                 # 宽高比 > 1 为横屏（需求文档 F-03-R2）
                 out["orientation"] = "horizontal" if out["width"] > out["height"] else "vertical"
@@ -345,4 +363,19 @@ def extract_frame(video_path: str, out_path: str, seek_seconds: float = 1.0) -> 
         out_path,
     ]
     result = run_cmd(cmd)
-    return result is not None and result.returncode == 0 and Path(out_path).exists()
+    if result is not None and result.returncode == 0 and Path(out_path).exists():
+        return True
+    # 失败：把 ffmpeg stderr 末尾摘要暴露到日志（之前完全吞，生产看不见原因）
+    if result is not None and result.stderr:
+        tail_lines = [ln for ln in result.stderr.strip().splitlines() if ln.strip()][-6:]
+        logger.warning(
+            "[抽帧] 失败 seek={seek}s video={video} → ffmpeg 输出末 6 行:\n{tail}",
+            seek=seek_seconds, video=Path(video_path).name, tail="\n".join(tail_lines),
+        )
+    else:
+        logger.warning(
+            "[抽帧] 失败 seek={seek}s video={video} → 无 ffmpeg 输出（result={}）",
+            seek=seek_seconds, video=Path(video_path).name,
+            result="None" if result is None else f"rc={result.returncode}",
+        )
+    return False
