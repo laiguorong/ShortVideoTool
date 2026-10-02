@@ -76,6 +76,8 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
   const [titleRegex, setTitleRegex] = useState('')
   const [shopName, setShopName] = useState('')
   const [orientation, setOrientation] = useState('')
+  // 排序依据：0=综合 / 1=最多点赞 / 2=最新发布（默认 2）
+  const [sortType, setSortType] = useState<0 | 1 | 2>(2)
   // 拉取条件：时间/时长/数量（档位化）
   const [publishRange, setPublishRange] = useState<'any' | '1d' | '7d' | '180d'>('any')
   const [durationRange, setDurationRange] = useState<'any' | 'lt1m' | '1to5m' | 'gt5m'>('any')
@@ -123,6 +125,9 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
         setTitleRegex(c.title_regex || '')
         setShopName(c.shop_name || '')
         setOrientation(c.orientation || '')
+        // 排序依据：缺省/越界按 2=最新发布兜底（与后端 Pydantic 默认对齐）
+        const st = Number(c.sort_type)
+        setSortType(st === 0 || st === 1 || st === 2 ? st : 2)
         // 发布时间档位：旧版 publish_after/publish_before 不再读取
         setPublishRange(c.publish_range || 'any')
         setDurationRange(c.duration_range || 'any')
@@ -142,6 +147,7 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
       // 新建任务：所有字段设默认值
       setName(''); setKeyword(''); setTitleRegex('')
       setShopName(''); setOrientation('')
+      setSortType(2)
       setPublishRange('any'); setDurationRange('any')
       setMaxCount(100)
       setFetchBgm(false); setFilterSubtitle(false); setFilterFace(false)
@@ -179,6 +185,7 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
         title_regex: titleRegex.trim(),
         shop_name: shopName.trim(),
         orientation,
+        sort_type: sortType,
         publish_range: publishRange,
         duration_range: durationRange,
         max_count: maxCount,
@@ -266,6 +273,14 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
             </Field>
             <Field label="门店名称" hint="如：海底捞">
               <input className={inputCls} value={shopName} onChange={(e) => setShopName(e.target.value)} />
+            </Field>
+            <Field label="排序依据" hint="抖音搜索结果排序方式">
+              <select className={inputCls} value={sortType}
+                onChange={(e) => setSortType(Number(e.target.value) as 0 | 1 | 2)}>
+                <option value={0}>综合排序</option>
+                <option value={1}>最多点赞</option>
+                <option value={2}>最新发布</option>
+              </select>
             </Field>
           </div>
           <div className="grid grid-cols-3 gap-3">

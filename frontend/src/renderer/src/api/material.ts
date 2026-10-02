@@ -90,6 +90,8 @@ export interface PullConditions {
   shop_name?: string
   /** 画面方向 vertical / horizontal / 空=不限 */
   orientation?: string
+  /** 排序依据 0=综合 / 1=最多点赞 / 2=最新发布（默认 2） */
+  sort_type?: 0 | 1 | 2
   /** 发布时间档位 any/1d/7d/180d */
   publish_range?: 'any' | '1d' | '7d' | '180d'
   /** 视频时长档位 any/lt1m/1to5m/gt5m */

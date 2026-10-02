@@ -416,6 +416,14 @@ class BrowserSearchSession:
         # 兜底：同 class 内的 :has-text 匹配，class 限定防止误命中面板外文本
         f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("最新发布")',
     ]
+    # 排序方式字面量映射（与 selection.VideoPullConditions.sort_type 对齐）
+    # 0=综合 / 1=最多点赞 / 2=最新发布（默认）。未识别值按"最新发布"兜底。
+    _SORT_TEXT = {
+        0: "综合排序",
+        1: "最多点赞",
+        2: "最新发布",
+    }
+    _SORT_DEFAULT_TEXT = "最新发布"
     _PUBLISH_RANGE_TEXT = {
         "any": "不限",
         "1d": "一天内",
@@ -497,11 +505,24 @@ class BrowserSearchSession:
             logger.info("[筛选] 面板稳定等待异常：{}（继续点选项）", e)
         # 收集每步结果
         steps: list[tuple[str, bool]] = []
-        # 3. 排序依据 = 最新发布（507 强制要求）
+        # 3. 排序依据（0=综合 / 1=最多点赞 / 2=最新发布，默认 2）
         # 用户反馈：抖音 UI 切换有延迟，点完立即下一步会丢点击。点完等
         # 选中态 .HjptjtzN class 出现作为生效信号（最多 1s）。
-        hit = self._click_filter_option(page, self._SORT_LATEST_SELECTORS, "排序=最新发布", debug=debug)
-        steps.append(("排序=最新发布", hit))
+        raw_sort = conditions.get("sort_type")
+        try:
+            sort_type = int(raw_sort) if raw_sort is not None else 2
+        except (TypeError, ValueError):
+            sort_type = 2
+        # 0/1/2 越界或未知值按"最新发布"兜底（与 Pydantic 默认对齐）
+        sort_text = self._SORT_TEXT.get(sort_type, self._SORT_DEFAULT_TEXT)
+        sort_sels = [
+            # 主：精确字面量匹配（避免误命中含该字样的其他文案）
+            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:text-is("{sort_text}")',
+            # 兜底：同 class 内的 :has-text 匹配，class 限定防止误命中面板外文本
+            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{sort_text}")',
+        ]
+        hit = self._click_filter_option(page, sort_sels, f"排序={sort_text}", debug=debug)
+        steps.append((f"排序={sort_text}", hit))
         # 4. 发布时间
         pr = conditions.get("publish_range") or "any"
         text = self._PUBLISH_RANGE_TEXT.get(pr, "不限")
