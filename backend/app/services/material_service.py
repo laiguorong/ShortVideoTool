@@ -1439,25 +1439,43 @@ def _parse_duration_ms(value) -> int | None:
         return None
 
 
-def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
-    """视频入库后同步拉取其背景音轨入音乐库（未分类）。
+def _download_bgm(video: dict, client, source_type: str = "pull",
+                category_id_override: str | None = None) -> dict:
+    """视频入库后同步拉取其背景音轨入音乐库。
+
+    #fix-music-node：BGM 字段统一从 aweme_detail.music 节点读（封面 cover_medium、
+    头像 avatar_medium、音频 play_url）。不再调用 music_detail HTTP 接口。
 
     仅下载抖音 music 节点的 play_url 直链（纯 BGM 源文件，不含作者人声）；
     版权受限曲目无直链 → 直接跳过。同一首原声多视频共用 music.mid，按其去重。
     #592 统一转 mp3：原格式非 mp3 → ffmpeg 转码（libmp3lame q=2）。
-    任何失败只记日志，不影响视频入库结果。
+
+    #fix-music-node：返回 dict（action + material_id + reason）便于调用方排障：
+    - 拉取侧（_process_single_video）：忽略返回值（视频已入库，BGM 是附加产物）
+    - 分享导入侧（_process_video_bgm_only）：用 reason 把真实失败原因带回 share_import_item
+
+    返回:
+        {"action": "new"/"duplicate"/"skipped"/"failed",
+         "material_id": str|None, "reason": str|None}
     """
     m = video.get("music") or {}
     url = m.get("download_url") or ""
     if not url:
-        return
+        return {"action": "skipped", "material_id": None,
+                "reason": "BGM 直链为空（版权受限或无 BGM）"}
     from app.db.utils import new_id
     d = get_db()
     music_id = m.get("music_id") or ""
-    # 按原声 ID 去重：同一首原声已入过库则跳过
-    if music_id and d.query_one(
-            "SELECT id FROM material WHERE source_ref=? AND deleted=0", (music_id,)):
-        return
+    # 按原声 ID 去重：单条 SELECT 拿 (id, title)
+    # 注：单进程内任务队列串行执行，无并发拉取同一 music_id 场景；
+    # 跨进程并发由 material.source_ref UNIQUE 索引兜底（DB 层幂等）。
+    if music_id:
+        existing = d.query_one(
+            "SELECT id, title FROM material WHERE source_ref=? AND deleted=0 LIMIT 1",
+            (music_id,))
+        if existing:
+            return {"action": "duplicate", "material_id": existing["id"],
+                    "reason": f"已存在（素材：{existing['title']}）"}
     material_id = new_id()
     # 扩展名从直链提取（#592 改：内联 tuple 改用顶层 MUSIC_EXTS，避免漏改）
     ext = ".mp3"
@@ -1466,7 +1484,8 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
         if low.endswith(e):
             ext = e
             break
-    save_path = _build_material_path("music", "", material_id, "", ext)
+    cat_id = category_id_override if category_id_override is not None else UNCATEGORIZED_ID
+    save_path = _build_material_path("music", cat_id, material_id, "", ext)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         client.download_video(url, str(save_path))
@@ -1479,19 +1498,18 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
         transcoded = _transcode_audio_to_mp3(save_path)
         if transcoded is None:
             _cleanup_material_files(_safe_data_rel(save_path))
+            reason = f"音频转 mp3 失败（{ext}→mp3）"
             logger.warning("[BGM] 转 mp3 失败 music_id={} → 跳过入库", music_id)
-            return
-        # 用转码产物替换源文件，统一存 mp3
+            return {"action": "failed", "material_id": None, "reason": reason}
         save_path.unlink(missing_ok=True)
         transcoded.rename(save_path.with_suffix(".mp3"))
         save_path = save_path.with_suffix(".mp3")
         ext = ".mp3"
     md5 = _md5_of_file(save_path)
-    # MD5 兜底去重（music_id 缺失时同一文件可能重复入库）
     if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
         _cleanup_material_files(_safe_data_rel(save_path))
-        return
-    # ffprobe 探测时长（失败回退接口给的 duration）
+        return {"action": "skipped", "material_id": None,
+                "reason": f"MD5 重复（{md5}）"}
     probe = extract_media_info(probe_media(str(save_path))) \
         if save_path.stat().st_size > 1024 else {}
     # 封面：#364 下载到 material/music/<date>/<id>/<id>_cover.<ext>
@@ -1501,13 +1519,20 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
     if cover_url:
         from app.core.douyin.avatar_cache import download_to
         cover_rel = download_to(cover_url, _build_material_cover_path("music", material_id, cover_ext))
+    # #fix-music-node：作者头像入库（复用现有 author_avatar 字段）
+    avatar_url = m.get("avatar_url") or ""
+    avatar_ext = _infer_image_ext(avatar_url, default=".webp")
+    avatar_rel = ""
+    if avatar_url:
+        from app.core.douyin.avatar_cache import download_to
+        avatar_rel = download_to(avatar_url, _build_material_avatar_path("music", material_id, avatar_ext))
     file_rel = str(save_path.relative_to(get_data_dir())).replace("\\", "/")
     d.insert("material", {
         "id": material_id,
         "title": m.get("title") or "未知原声",
         "author_title": m.get("title"),
         "type": "music",
-        "category_id": UNCATEGORIZED_ID,  # 入「未分类」虚拟分类
+        "category_id": cat_id,
         "file_size": save_path.stat().st_size,
         "source_type": source_type,
         "source_ref": music_id or None,
@@ -1515,167 +1540,21 @@ def _download_bgm(video: dict, client, source_type: str = "pull") -> None:
         "file_path": file_rel,
         "duration_ms": probe.get("duration_ms") or m.get("duration_ms") or None,
         "author_nickname": m.get("author") or None,
-        # 音频直链落库（详情溯源展示；带签名会过期）
         "download_url": url,
-        # 原声聚合页链接（#45：mid 拼接）
         "share_url": m.get("share_url") or None,
-        # 音乐封面本地缓存相对路径（#43/#44）
         "cover_url": cover_rel or None,
+        # #fix-music-node：作者头像入 author_avatar（复用视频字段）
+        "author_avatar": avatar_rel or None,
     })
     logger.info("[BGM] 已入库音轨「{}」（来源视频 {}）", m.get("title"), video.get("video_id"))
+    return {"action": "new", "material_id": material_id, "reason": None}
 
 
 # ---------- 单音乐统一处理（任务 #132：分享音乐链接入库）----------
 
-def _process_single_music(
-    music: dict,
-    category_id: str,
-    client,
-    *,
-    source: str = "share",
-) -> dict:
-    """单音乐统一处理：去重 → 下载音频 → 入音乐库（任务 #132）。
-
-    分享链接 `/music/{mid}` 解析后走此函数。music 字段来自 `_parse_music_info`：
-    - music_id / title / author / author_id / author_handle
-    - duration_ms / download_url / share_url / cover_url
-
-    返回:
-        {"action": "new"/"duplicate"/"failed", "material_id", "title", "reason"}
-    """
-    music_id = music.get("music_id") or ""
-    title = music.get("title") or "未知原声"
-
-    # 1) 去重（按 music_id；同一首原声已入过库则跳过）
-    if music_id:
-        d = get_db()
-        existing = d.query_one(
-            "SELECT id, title FROM material WHERE source_ref=? AND deleted=0", (music_id,))
-        if existing:
-            return {
-                "action": "duplicate",
-                "material_id": existing["id"],
-                "title": existing.get("title") or title,
-                "reason": f"已存在（素材：{existing['title']}）",
-            }
-
-    # 2) 下载音频 + 入库
-    try:
-        material_id = _download_music_ingest(music, category_id, client, source_type=source)
-    except DouyinClientError as e:
-        return {
-            "action": "failed",
-            "material_id": None,
-            "title": title,
-            "reason": f"抖音接口异常：{e}",
-        }
-    if not material_id:
-        return {
-            "action": "failed",
-            "material_id": None,
-            "title": title,
-            "reason": "音乐下载失败或入库异常",
-        }
-    return {
-        "action": "new",
-        "material_id": material_id,
-        "title": title,
-        "reason": None,
-    }
-
-
-def _download_music_ingest(music: dict, category_id: str, client,
-                          *, source_type: str = "share") -> str:
-    """下载音频并入音乐库（任务 #132）。
-
-    与 `_download_bgm` 的差异：
-    - 用途：分享链接直接入音乐库（非视频附属 BGM）
-    - 入库字段：author_nickname 用音乐作者（music.author）而非视频作者
-    - share_url 必填（原声聚合页链接）
-    - #592 统一转 mp3（原格式非 mp3 → ffmpeg 转码）
-    """
-    from app.db.utils import new_id
-
-    music_id = music.get("music_id") or ""
-    title = music.get("title") or "未知原声"
-    download_url = music.get("download_url") or ""
-    if not download_url:
-        raise DouyinClientError("音乐直链为空，版权受限曲目无法下载")
-
-    # 扩展名从直链提取（#592：内联 tuple 改顶层 MUSIC_EXTS）
-    ext = ".mp3"
-    low = download_url.split("?")[0].lower()
-    for e in MUSIC_EXTS:
-        if low.endswith(e):
-            ext = e
-            break
-
-    material_id = new_id()
-    save_path = _build_material_path("music", category_id, material_id, title, ext)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    # 复用 client.download_video（纯 HTTP UA+Referer，与 BGM 一致）
-    try:
-        client.download_video(download_url, str(save_path))
-    except BaseException:
-        # #P1-1-#592：下载失败统一走 helper 清理
-        _cleanup_material_files(_safe_data_rel(save_path))
-        raise
-
-    # #592 统一转 mp3：原格式非 mp3 → ffmpeg 转码
-    if ext != ".mp3":
-        transcoded = _transcode_audio_to_mp3(save_path)
-        if transcoded is None:
-            _cleanup_material_files(_safe_data_rel(save_path))
-            return ""
-        save_path.unlink(missing_ok=True)
-        transcoded.rename(save_path.with_suffix(".mp3"))
-        save_path = save_path.with_suffix(".mp3")
-        ext = ".mp3"
-
-    md5 = _md5_of_file(save_path)
-    # MD5 兜底去重
-    d = get_db()
-    if d.query_one("SELECT id FROM material WHERE file_md5=? AND deleted=0", (md5,)):
-        _cleanup_material_files(_safe_data_rel(save_path))
-        return ""
-
-    # ffprobe 探测时长（失败回退接口给的 duration）
-    probe = extract_media_info(probe_media(str(save_path))) \
-        if save_path.stat().st_size > 1024 else {}
-
-    # 封面本地缓存（#364：下载到 material/music/<date>/<id>/<id>_cover.<ext>）
-    cover_url = music.get("cover_url") or ""
-    cover_rel = ""
-    if cover_url:
-        cover_ext = _infer_image_ext(cover_url, default=".webp")
-        from app.core.douyin.avatar_cache import download_to
-        cover_rel = download_to(cover_url, _build_material_cover_path("music", material_id, cover_ext))
-
-    file_rel = str(save_path.relative_to(get_data_dir())).replace("\\", "/")
-    d.insert("material", {
-        "id": material_id,
-        "title": title,
-        "author_title": title,
-        "type": "music",
-        "category_id": category_id,
-        "file_size": save_path.stat().st_size,
-        "source_type": source_type,
-        "source_ref": music_id or None,
-        "file_md5": md5,
-        "file_path": file_rel,
-        "duration_ms": probe.get("duration_ms") or music.get("duration_ms") or None,
-        # 任务 #132：音乐作者（非视频作者）
-        "author_nickname": music.get("author") or None,
-        "author_douyin_id": music.get("author_handle") or None,
-        # 音乐直链落库
-        "download_url": download_url,
-        # 原声聚合页链接
-        "share_url": music.get("share_url") or None,
-        # 音乐封面本地缓存
-        "cover_url": cover_rel or None,
-    })
-    logger.info("[音乐导入] 已入库音轨「{}」（music_id={}）", title, music_id)
-    return material_id
+# #fix-music-node：_fetch_music_full / _resolve_music_for_import / _process_single_music
+# / _download_music_ingest 已删除（BGM 字段统一从 music 节点读；分享导入只接视频链接，
+# 走 _process_video_bgm_only 单一入口）。
 
 
 def _download_and_ingest(video: dict, category_id: str, client,
@@ -1918,8 +1797,9 @@ def _process_single_video(
     cookie: str = "",
     account_id: str = "",   # #P0-8：拉取侧补抓详情走 storage_state 路径
     info: Optional[Any] = None,
+    ingest_mode: str = "video",  # #fix-music-node: "video" 下载入库视频 / "bgm_only" 只入 BGM
 ) -> dict:
-    """单视频统一处理：拉取侧补抓详情 → 客户端兜底过滤 → 去重 → 下载入库。
+    """单视频统一处理：拉取侧补抓详情 → 客户端兜底过滤 → 去重 → 下载入库 / 入 BGM。
 
     任务 #131：拉取/分享统一走浏览器抓 detail。
     - 拉取（source='pull'）：video 来自搜索接口（_parse_search_item 输出，author 字段不全
@@ -1929,16 +1809,26 @@ def _process_single_video(
     - 分享（source='share'）：video 来自 _fetch_aweme_detail（已是完整 54 字段 author），
       conditions=None 跳过所有过滤，直接下载入库。
 
+    #fix-music-node ingest_mode:
+    - "video"（默认）：正常下载视频入库 + 拉取侧按 fetch_bgm 同步入 BGM
+    - "bgm_only"：仅入 BGM 到指定分类，不下视频本体（type=music + 视频分享链接用）
+
     参数:
         video: 统一视频字段 dict
-        category_id: 入库分类 ID
+        category_id: 入库分类 ID（ingest_mode="bgm_only" 时是 BGM 的入库分类）
         client: 抖音客户端（提供 _fetch_aweme_detail 公共方法）
         source: 'pull' / 'share'
         conditions: 拉取条件 dict（仅拉取侧传入）
         cookie: 拉取账号 cookie（拉取侧补抓详情用；分享侧用 _share_cookie 自取）
+        info: task_service TaskInfo（拉取 worker 用于上报进度/响应取消）
+        ingest_mode: "video" / "bgm_only"
     返回:
         {"action": "new"/"filtered"/"duplicate"/"failed", "material_id", "title", "reason"}
     """
+    # 0) #fix-music-node bgm_only：跳过视频过滤/去重/抓取，直接入 BGM
+    if ingest_mode == "bgm_only":
+        return _process_video_bgm_only(video, category_id, client, source)
+
     # 1) 客户端兜底过滤（仅拉取侧；分享侧 conditions=None 跳过）
     if conditions is not None and not _match_conditions(video, conditions):
         return {
@@ -1993,6 +1883,50 @@ def _process_single_video(
         "material_id": material_id,
         "title": video.get("title", ""),
         "reason": None,
+    }
+
+
+def _process_video_bgm_only(
+    video: dict,
+    category_id: str,
+    client,
+    source: str,
+) -> dict:
+    """#fix-music-node：分享导入 type=music + 视频链接 → 仅入 BGM，不下视频本体。
+
+    委托 _download_bgm 处理下载/转码/入库/去重，返回 dict.action / material_id / reason。
+    返回格式与 _process_single_video 一致，便于 _process_item 统一处理。
+    """
+    music = video.get("music") or {}
+    music_id = music.get("music_id") or ""
+    title = music.get("title") or "未知原声"
+
+    # #fix-music-node：先按 download_url 短路判断，给用户友好提示
+    if not music.get("download_url"):
+        if not music_id:
+            return {
+                "action": "failed",
+                "material_id": None,
+                "title": title,
+                "reason": "视频无可用背景音乐（无 music_id）",
+            }
+        return {
+            "action": "failed",
+            "material_id": None,
+            "title": title,
+            "reason": "视频 BGM 版权受限无法下载（play_url 直链为空）",
+        }
+
+    # 入库（_download_bgm 内部完成 source_ref 去重 / 转码 / 入库；返回真实 reason）
+    bgm_result = _download_bgm(video, client, source_type=source,
+                                category_id_override=category_id)
+    action_map = {"new": "new", "duplicate": "duplicate",
+                  "skipped": "failed", "failed": "failed"}
+    return {
+        "action": action_map.get(bgm_result["action"], "failed"),
+        "material_id": bgm_result["material_id"],
+        "title": title,
+        "reason": bgm_result["reason"],
     }
 
 
@@ -2181,91 +2115,6 @@ def _run_detail_phase(
 
 
 # ---------- 分享链接导入（F-03.3） ----------
-
-def import_share_links(share_texts: list[str], category_id: str) -> dict:
-    """批量解析分享链接入库（同步执行，逐条结果反馈）。
-
-    任务 #130：与异步分享导入共用 _process_single_video(source='share', conditions=None)，
-    行为完全对齐：跳过客户端兜底 + 字幕/人脸过滤 + BGM 同步。
-    任务 #132：分享链接兼容视频/音乐，按 _source 分流到 _process_single_video 或
-    _process_single_music。
-    任务 #111：按分类 type 分流——音乐分类下导入视频链接时，从 video.music 节点
-    提取 BGM 入音乐库。
-
-    返回:
-        {"results": [{"share_text", "ok", "message", "material_id"}], "success": n, "failed": n}
-    """
-    d = get_db()
-    # 允许 UNCATEGORIZED_ID 作为入库目标（虚拟分类）；其他必须存在且为视频/音乐
-    if category_id != UNCATEGORIZED_ID:
-        cat = d.query_one(
-            "SELECT id, type FROM material_category WHERE id=? AND deleted=0",
-            (category_id,))
-        if not cat:
-            raise ValueError("入库分类不存在")
-        if cat["type"] not in ("video", "music"):
-            raise ValueError("入库分类类型必须为视频或音乐")
-        category_type = cat["type"]
-    else:
-        # 未分类：根据 type 参数决定实体类型（material_service.import_share_links 没有 type 参数，
-        # 调用方应保证入参为 video/music；此处默认 video 兼容既有调用）
-        category_type = "video"
-    client = get_douyin_client()
-    results = []
-    for text in share_texts:
-        text = text.strip()
-        if not text:
-            continue
-        try:
-            resolved = client.resolve_share(text)
-            source = resolved.get("_source") or ""
-            # 任务 #111 + #132：按分类类型 × 实体类型组合分流
-            if category_type == "music" and source == "detail":
-                # 音乐分类 + 视频链接 → 提取视频 BGM 入音乐库
-                music = resolved.get("music") or {}
-                if not music.get("download_url"):
-                    raise DouyinClientError(
-                        "视频无可用背景音乐（版权受限或无 BGM），无法导入音乐分类")
-                result = _process_single_music(music, category_id, client, source="share")
-            elif source == "music_detail":
-                if category_type != "music":
-                    raise DouyinClientError(
-                        f"分类类型为 {category_type}，与音乐分享链接不匹配（应在音乐分类下导入）")
-                result = _process_single_music(resolved, category_id, client, source="share")
-            else:
-                if category_type != "video":
-                    raise DouyinClientError(
-                        f"分类类型为 {category_type}，与视频分享链接不匹配（应在视频分类下导入）")
-                result = _process_single_video(
-                    resolved, category_id, client,
-                    source="share", conditions=None,
-                    # 同步分享导入无 worker info，传 None 让 _download_and_ingest
-                    # 内部降级 time.sleep（不响应取消信号，调用方控制整体超时）
-                    info=None,
-                )
-            action = result["action"]
-            if action == "new":
-                results.append({"share_text": text[:50], "ok": True,
-                                "message": result["title"], "material_id": result["material_id"]})
-            else:
-                # filtered / duplicate / failed → 全部归为 failed 给前端
-                results.append({"share_text": text[:50], "ok": False,
-                                "message": result.get("reason") or "未知失败",
-                                "material_id": result.get("material_id")})
-        except DouyinClientError as e:
-            # 客户端层错误（解析失败/风控/Cookie 失效等）：记录失败原文与原因，便于排障
-            logger.warning("[分享导入] 失败 text={!r}：{}", text[:80], e)
-            results.append({"share_text": text[:50], "ok": False, "message": str(e), "material_id": None})
-        except Exception as e:  # noqa: BLE001
-            # 未知异常：全栈记录（下载/入库/探测等环节出错）
-            logger.exception("[分享导入] 未知异常 text={!r}", text[:80])
-            results.append({"share_text": text[:50], "ok": False, "message": str(e), "material_id": None})
-    return {
-        "results": results,
-        "success": len([r for r in results if r["ok"]]),
-        "failed": len([r for r in results if not r["ok"]]),
-    }
-
 
 # ---------- 本地上传（F-03.4） ----------
 

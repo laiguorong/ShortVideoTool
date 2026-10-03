@@ -231,9 +231,24 @@ class DeleteCategoryRequest(BaseModel):
 
 
 class ImportShareRequest(BaseModel):
-    """分享链接批量导入。"""
+    """分享链接批量导入。
+
+    type 由前端页签决定（视频页签传 video，音乐页签传 music），
+    与 category_id 解耦——未分类下也能按 type 选入库类型。
+    """
     share_texts: list[str] = Field(min_length=1, description="分享文本列表")
-    category_id: str = Field(description="入库分类")
+    category_id: str = Field(
+        description="入库分类（UNCATEGORIZED_ID = '-' 表示虚拟未分类）")
+    type: str = Field(description="入库类型 video/music（由页签决定）")
+
+
+class RetryShareRequest(BaseModel):
+    """分享导入重试请求（#fix-type-param：retry 也需 type，原任务可能不再一致）。
+
+    type 可选：未传时从 share_import_task 表读（v43+ 存了 type）；
+    显式传值可覆盖（兼容老 API 调用方）。
+    """
+    type: str | None = Field(default=None, description="入库类型 video/music（可选；None 时从 task 表读）")
 
 
 class UploadFilesRequest(BaseModel):

@@ -912,7 +912,18 @@ MIGRATIONS: list[tuple[int, str]] = [
     (
         43,
         """
-        -- ============ v43 移除数据中心（F-07 #500）============
+        -- ============ v43 #fix-type-param import-share 加 type 入参 ============
+        -- share_import_task 表加 type TEXT（'video' / 'music'），由前端页签决定，
+        -- 与 category_id 解耦——未分类（id='-'）下也能按 type 选入库类型。
+        -- _apply_v43 幂等检测列存在性后 ADD COLUMN。DEFAULT 'video' 兜底老任务。
+        -- 注意：DDL block 兜底（防止 _apply_v43 函数被改名/删除导致 migration 静默失败）。
+        ALTER TABLE share_import_task ADD COLUMN type TEXT NOT NULL DEFAULT 'video';
+        """,
+    ),
+    (
+        44,
+        """
+        -- ============ v44 移除数据中心（F-07 #500）============
         -- 数据中心功能整体移除，删除三类日快照表。
         -- 工作台不再依赖今日播放/GMV/佣金（dashboard_service 不查这些表）。
         DROP TABLE IF EXISTS video_stats_daily;
@@ -960,10 +971,32 @@ def migrate(database) -> int:
             _apply_v41(database)
         elif version == 42:
             _apply_v42(database)
+        elif version == 43:
+            _apply_v43(database)
         else:
             database.executescript(ddl)
         database.set_user_version(version)
+    # #migration-safety：migrate() 完成后兜底检查关键列（防 migration 静默失败——
+    # 例如 v43 函数被改名后 user_version 已升但列未加；D 盘 user_version=44 但缺 type 列即此场景）。
+    _ensure_critical_columns(database)
     return database.user_version()
+
+
+def _ensure_critical_columns(database) -> None:
+    """兜底检查关键列是否存在，缺失时静默补上。
+
+    仅在 share_import_task.type 上做兜底（v43 实际跑过的 DB 都会走此分支）。
+    不抛错：用户 DB 已 user_version=44 但缺 type 列是已知场景（v43 DDL block 之前是空注释
+    走 executescript 无效），手动补列后业务可继续。
+    """
+    if _has_table(database, "share_import_task") and not _has_column(database, "share_import_task", "type"):
+        try:
+            database.execute(
+                "ALTER TABLE share_import_task ADD COLUMN type TEXT NOT NULL DEFAULT 'video'")
+            from loguru import logger
+            logger.warning("[migration] 兜底补 share_import_task.type 列（v43 静默失败修复）")
+        except Exception:  # noqa: BLE001
+            pass  # 列已存在或其他原因，不影响主流程
 
 
 def _has_table(database, name: str) -> bool:
@@ -1466,3 +1499,19 @@ def _apply_v42(database) -> None:
     """
     if _has_table(database, "publish_task") and not _has_column(database, "publish_task", "started_at"):
         database.execute("ALTER TABLE publish_task ADD COLUMN started_at TEXT")
+
+
+def _apply_v43(database) -> None:
+    """v43：import-share 加 type 入参——share_import_task.type 列。
+
+    前端页签决定 type（video/music），与 category_id 解耦：
+    - 未分类（id='-'）+ type=video → 入视频库
+    - 未分类（id='-'）+ type=music → 入音乐库
+    - 非未分类：cat.type 必须等于 type（不匹配 → 400）
+
+    DEFAULT 'video' 兜底老任务（worker 未读 type 时按 video 走，保持向后兼容）。
+    list_tasks 已 SELECT t.* 自动包含 type，前端展示用。
+    """
+    if _has_table(database, "share_import_task") and not _has_column(database, "share_import_task", "type"):
+        database.execute(
+            "ALTER TABLE share_import_task ADD COLUMN type TEXT NOT NULL DEFAULT 'video'")

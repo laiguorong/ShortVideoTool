@@ -16,7 +16,8 @@ from app.core.douyin.base import DouyinClientError
 from app.db import get_db
 from app.db.utils import new_id, now_str
 from app.services import material_service as ms
-from app.services.task_service import _TaskCancelled, _fmt_hms, raise_for_cancel, task_service
+from app.services.task_service import (
+    TaskInfo, _TaskCancelled, _fmt_hms, raise_for_cancel, task_service)
 
 
 def _detect_kind(share_text: str) -> str:
@@ -35,26 +36,33 @@ def _detect_kind(share_text: str) -> str:
     return "视频"
 
 
-def create_task(category_id: str, share_texts: list[str]) -> str:
+def create_task(category_id: str, share_texts: list[str], type: str) -> str:
     """创建导入任务，立即返回任务 ID。
 
     参数:
-        category_id: 入库分类 ID
+        category_id: 入库分类 ID（UNCATEGORIZED='-' 表示虚拟未分类）
         share_texts: 分享文本列表（每行一条）
+        type: 入库类型 video/music（由前端页签决定，与分类解耦）
     返回:
         任务 ID
+
+    校验：非未分类时，category.type 必须等于 type 入参；
+    未分类跳过分类校验，type 直接决定入库函数。
     """
+    if type not in ("video", "music"):
+        raise ValueError("type 必须为 video 或 music")
+    # #fix-music-node：未分类是视频/音乐各自共享的虚拟分类节点（categories API 按 type 注入），
+    # 允许 UNCATEGORIZED + type=music（与拉取侧自动 BGM 入未分类行为对齐）。
     d = get_db()
-    # 任务 #111：分类必须为视频或音乐类型（决定实体类型入库逻辑）
-    # UNCATEGORIZED_ID 作为入库目标允许（虚拟分类）；否则校验存在与类型
+    # UNCATEGORIZED_ID 作为入库目标允许（虚拟分类，跳过分类校验）；其他校验存在与 type 一致
     if category_id != ms.UNCATEGORIZED_ID:
         cat = d.query_one(
             "SELECT id, type FROM material_category WHERE id=? AND deleted=0",
             (category_id,))
         if not cat:
             raise ValueError("入库分类不存在")
-        if cat["type"] not in ("video", "music"):
-            raise ValueError("入库分类类型必须为视频或音乐")
+        if cat["type"] != type:
+            raise ValueError(f"入库分类类型为 {cat['type']}，与 type={type} 不匹配")
 
     task_id = new_id()
     texts = [t.strip() for t in share_texts if t.strip()]
@@ -62,6 +70,8 @@ def create_task(category_id: str, share_texts: list[str]) -> str:
     d.insert("share_import_task", {
         "id": task_id,
         "category_id": category_id,
+        # #fix-type-param：存 type 供 retry / list_tasks 用（前端页签决定）
+        "type": type,
         "status": "pending",
         "total": len(texts),
         "success_count": 0,
@@ -82,14 +92,17 @@ def create_task(category_id: str, share_texts: list[str]) -> str:
             "update_time": now,
         })
     # PR4 #57：type_label 区分视频/音乐；name 用分类名（share_import_task 无 task_name 列）
+    # #fix-music-node：type_label 用 type 入参（前端页签决定），不用 _detect_kind 推
+    # （type=music + 视频链接会被 _detect_kind 误判为"视频"）
+    type_label = f"素材下载-{'音乐' if type == 'music' else '视频'}"
     first_text = texts[0] if texts else ""
-    type_label = f"素材下载-{_detect_kind(first_text)}"
     cat_row = d.query_one("SELECT name FROM material_category WHERE id=?", (category_id,)) \
         if category_id != ms.UNCATEGORIZED_ID else None
     cat_name = cat_row["name"] if cat_row else "未分类"
     name = f"导入到 {cat_name}"
+    # #fix-type-param：闭包传 type 给 worker（避免 DB 迁移，task 参数已足够）
     task_service.submit(
-        "download", name, lambda info: _run_task(task_id, info),
+        "download", name, lambda info: _run_task(task_id, info, type=type),
         type_label=type_label,
     )
     logger.info("[分享导入] 任务创建 id={} category={} total={}", task_id, category_id, len(texts))
@@ -97,76 +110,48 @@ def create_task(category_id: str, share_texts: list[str]) -> str:
 
 
 def _process_item(item: dict, category_id: str, client,
-                 manual_wait_ms: int = 30000) -> tuple[str, str, Optional[str]]:
+                 manual_wait_ms: int = 30000, type: str = "video",
+                 info: Optional[TaskInfo] = None) -> tuple[str, str, Optional[str]]:
     """处理单条分享：返回 (状态, 消息, material_id)。
 
-    任务 #129：三段日志：分享原文 → 解析后链接 → 处理结果。
-    任务 #130：单视频处理委托给 _process_single_video（与拉取侧共用）。
-    任务 #132：分享链接兼容视频/音乐，按 _source 分流到不同处理函数。
-    任务 #111：按入库分类 type 决定实体类型——音乐分类下导入视频链接，
-              自动从 video.music 节点提取 BGM 入音乐库（与拉取侧 _download_bgm
-              同步入「未分类」逻辑不同：此处入用户选定的分类）。
+    #fix-music-node：分享导入只接视频链接。音乐链接（resolve_share 已抛错）
+    被下方 except DouyinClientError 捕获 → failed "仅支持视频链接导入"。
 
-    四种组合：
-    - 分类=music + 视频链接 → 提取 BGM → _process_single_music
-    - 分类=music + 音乐链接 → _process_single_music
-    - 分类=video + 视频链接 → _process_single_video
-    - 分类=video + 音乐链接 → 拒绝（视频分类不该入音乐）
+    任务 #130：单视频处理委托给 _process_single_video（与拉取侧共用）。
+    #fix-type-param：type 入参直接决定入库类型（前端页签决定），不再从 category_id 推。
+    #fix-music-node ingest_mode：
+    - type=video + 视频链接 → ingest_mode="video"（正常下载入库；导入不触发 BGM 同步）
+    - type=music + 视频链接 → ingest_mode="bgm_only"（只入 BGM，不下视频本体）
+
+    #fix-music-node：info 参数透传，入口处检查取消信号（避免 resolve_share / 下载
+    长时间占用期间用户取消无法响应）。
     """
     raw_text = item["share_text"]
     item_id = item.get("id", "?")
+    # 0) 取消检查（task_service.raise_for_cancel 抛 _TaskCancelled）
+    if info is not None:
+        raise_for_cancel(info)
     # 1) 原文
     logger.info("[分享导入] 原文 item={} text={!r}", item_id, raw_text)
     try:
-        # 任务 #111：按分类 type 决定入库逻辑（音乐 tab 导入视频时提取 BGM）
-        d = get_db()
-        # UNCATEGORIZED_ID 作为入库目标允许（虚拟分类）
-        if category_id == ms.UNCATEGORIZED_ID:
-            category_type = "video"  # 默认走视频入库；具体处理时按分享链接类型自动分流
-        else:
-            cat = d.query_one(
-                "SELECT id, type FROM material_category WHERE id=? AND deleted=0",
-                (category_id,))
-            if not cat:
-                raise DouyinClientError("入库分类不存在")
-            category_type = cat["type"]
+        category_type = type
 
+        # resolve_share 已统一拒绝音乐链接（抛 DouyinClientError → 被下方 except 捕获）
         resolved = client.resolve_share(raw_text, manual_wait_ms=manual_wait_ms)
-        source = resolved.get("_source") or ""
 
-        # 2) 解析后的链接（按分类类型 × 实体类型组合分流）
-        if category_type == "music" and source == "detail":
-            # 音乐分类 + 视频链接 → 提取视频的 BGM 入音乐库（任务 #111）
-            music = resolved.get("music") or {}
-            if not music.get("download_url"):
-                raise DouyinClientError(
-                    "视频无可用背景音乐（版权受限或无 BGM），无法导入音乐分类")
+        # 2) 解析后的链接（按 type 分流 ingest_mode）
+        if category_type == "music":
             logger.info(
-                "[分享导入] 解析后 item={} category=music 实体=video "
-                "→ 提取 BGM music_id={} title={!r}",
+                "[分享导入] 解析后 item={} type=music video_id={} → ingest_mode=bgm_only 仅入 BGM",
                 item_id,
-                music.get("music_id") or "-",
-                (music.get("title") or "")[:50],
+                resolved.get("video_id") or "-",
             )
-            result = ms._process_single_music(music, category_id, client, source="share")
-        elif source == "music_detail":
-            # 音乐分类 + 音乐链接（任务 #132）：直接入音乐库
-            if category_type != "music":
-                raise DouyinClientError(
-                    f"分类类型为 {category_type}，与音乐分享链接不匹配（应在音乐分类下导入）")
-            logger.info(
-                "[分享导入] 解析后 item={} type=music music_id={} share_url={} title={!r}",
-                item_id,
-                resolved.get("music_id") or "-",
-                resolved.get("share_url") or "-",
-                (resolved.get("title") or "")[:50],
+            result = ms._process_single_video(
+                resolved, category_id, client,
+                source="share", conditions=None,
+                ingest_mode="bgm_only",
             )
-            result = ms._process_single_music(resolved, category_id, client, source="share")
         else:
-            # 视频分类 + 视频链接（任务 #130）
-            if category_type != "video":
-                raise DouyinClientError(
-                    f"分类类型为 {category_type}，与视频分享链接不匹配（应在视频分类下导入）")
             logger.info(
                 "[分享导入] 解析后 item={} type=video video_id={} share_url={} title={!r}",
                 item_id,
@@ -175,10 +160,11 @@ def _process_item(item: dict, category_id: str, client,
                 (resolved.get("title") or "")[:50],
             )
             # 任务 #130：单视频处理统一调 material_service._process_single_video
-            # conditions=None → 跳过客户端兜底过滤 + 字幕/人脸过滤 + BGM 同步
+            # conditions=None → 跳过客户端兜底过滤 + 字幕/人脸过滤 + BGM 同步（导入不触发 BGM 入库）
             result = ms._process_single_video(
                 resolved, category_id, client,
                 source="share", conditions=None,
+                ingest_mode="video",
             )
         action = result["action"]
         if action == "new":
@@ -217,10 +203,11 @@ def _update_task_summary(task_id: str, total: int) -> None:
     logger.info("[分享导入] 任务汇总更新 id={} {}", task_id, msg)
 
 
-def _run_task(task_id: str, info=None) -> str:
+def _run_task(task_id: str, info=None, type: str = "video") -> str:
     """后台执行导入任务。
 
     PR4 #57：接入 task_service 队列，info 透传到 _run_task_inner 更新 progress。
+    #fix-type-param：type 由 create_task 闭包传入（前端页签决定），默认 video 兜底老调用。
     任务 #59 P0 #4：显式 return 状态机契约对齐。
     #130：worker 抛 _TaskCancelled 时标 share_import_task.status=cancelled 后 re-raise。
     """
@@ -239,20 +226,23 @@ def _run_task(task_id: str, info=None) -> str:
     has_retried = any(i.get("retry_count", 0) > 0 for i in items)
     manual_wait_ms = 60000 if has_retried else 30000
     try:
-        _run_task_inner(task_id, items, category_id, client, manual_wait_ms, info)
+        _run_task_inner(task_id, items, category_id, client, manual_wait_ms, info, type=type)
     except _TaskCancelled:
         # #130：取消时业务表标 cancelled + 剩余 pending item 一并清理，re-raise 让外层置 info.status
         logger.info("[分享导入] 任务取消 id={}", task_id)
         try:
             d.execute(
-                "UPDATE share_import_task SET status=?, message=?, update_time=? WHERE id=?",
-                ("cancelled", "用户取消", now_str(), task_id))
-            d.execute(
                 "UPDATE share_import_item SET status='cancelled', message='任务已取消', update_time=? "
                 "WHERE task_id=? AND status='pending' AND deleted=0",
                 (now_str(), task_id))
             # #P1-4：取消路径刷 success/failed 计数（前端看到的统计是最新真实值）
+            # #fix-music-node：先 UPDATE status='cancelled' + counts，再用 WHERE status NOT IN
+            # ('cancelled') 保护的 UPDATE 覆写 counts（不会把 cancelled 状态翻回 completed/failed）。
             _update_task_summary(task_id, len(items))
+            d.execute(
+                "UPDATE share_import_task SET status='cancelled', message='用户取消', update_time=? "
+                "WHERE id=? AND status NOT IN ('cancelled')",
+                (now_str(), task_id))
         except Exception as e:  # noqa: BLE001
             logger.error("[分享导入] 取消清理写 DB 失败：{}", e)
         raise
@@ -270,13 +260,17 @@ def _run_task(task_id: str, info=None) -> str:
         # #92：partial 时把前 3 条失败原因拼到 info.message，前端可直观看到失败明细
         if info and final["success_count"] > 0 and final["failed_count"] > 0:
             failed_items = d.query_all(
-                "SELECT share_text, message FROM share_import_item "
+                # #fix-music-node：hint 模板用 it["id"][:8]（id 列必须 SELECT）
+                "SELECT id, share_text, message FROM share_import_item "
                 "WHERE task_id=? AND status='failed' AND deleted=0 LIMIT 3",
                 (task_id,),
             )
             if failed_items:
-                hints = [f"{it['share_text'][:24]}: {it['message'] or '未知'}"
-                         for it in failed_items if it.get("message")]
+                # #fix-music-node：hint 加 item_id 前 8 位避免 share_text 截断撞前缀
+                hints = [
+                    f"[{it['id'][:8]}] {(it['share_text'] or '')[:24]}: {it['message'] or '未知'}"
+                    for it in failed_items if it.get("message")
+                ]
                 if hints:
                     info.message = "部分失败：" + "; ".join(hints)
         if final["success_count"] > 0:
@@ -290,10 +284,11 @@ def _run_task(task_id: str, info=None) -> str:
 
 
 def _run_task_inner(task_id: str, items: list, category_id: str, client,
-                    manual_wait_ms: int = 30000, info=None) -> None:
+                    manual_wait_ms: int = 30000, info=None, type: str = "video") -> None:
     """_run_task 的实际处理循环。
 
     PR4 #57：info 透传，每完成一条 update info.progress。
+    #fix-type-param：type 透传到 _process_item。
     """
     d = get_db()
     import time
@@ -310,7 +305,8 @@ def _run_task_inner(task_id: str, items: list, category_id: str, client,
             if info:
                 info.progress = f"已导入 {done}/{total}，用时 {_fmt_hms(time.time() - start_ts)}"
             continue
-        status, msg, material_id = _process_item(item, category_id, client, manual_wait_ms)
+        status, msg, material_id = _process_item(item, category_id, client,
+                                                  manual_wait_ms, type=type, info=info)
         # 首次执行不增加重试次数，仅手动重试时累加
         inc = 0 if item["status"] == "pending" else 1
         d.execute(
@@ -328,15 +324,22 @@ def _run_task_inner(task_id: str, items: list, category_id: str, client,
     _update_task_summary(task_id, total)
 
 
-def _run_single_item(task_id: str, item_id: str, info=None) -> str:
+def _run_single_item(task_id: str, item_id: str, info=None, type: str = "video") -> str:
     """后台执行单条重试（手动触发）。
 
     PR4 #57：接入 task_service.submit("download", ...)——单条重试也走队列，name 用任务名。
     任务 #59 P0 #5：显式 return "success"/"partial"/"failed" 状态机契约对齐。
+    #fix-type-param：retry 也需 type 入参。
+    #fix-music-node：入口直接 raise_for_cancel（让 _TaskCancelled 自然冒泡到
+    task_service.submit 的 except 分支，info.status="cancelled"——而不是返回
+    "cancelled" 字符串被 task_service 当非法值吞为 success）。
     """
     import time
-    # 任务 #66：统一用 task_service 注入的 start_ts
-    start_ts = info.start_ts or time.time()
+    # 任务 #66：统一用 task_service 注入的 start_ts（无 info 时回退 time.time()）
+    start_ts = (info.start_ts if info else None) or time.time()
+    # #fix-music-node：取消检查直接抛异常（task_service.submit 兜底）
+    if info is not None:
+        raise_for_cancel(info)
     d = get_db()
     task = d.query_one("SELECT * FROM share_import_task WHERE id=? AND deleted=0", (task_id,))
     if not task:
@@ -348,7 +351,8 @@ def _run_single_item(task_id: str, item_id: str, info=None) -> str:
         return "failed"
     client = get_douyin_client()
     # 手动单条重试：人工等待窗口拉长到 60s（应对验证码场景）
-    status, msg, material_id = _process_item(item, task["category_id"], client, manual_wait_ms=60000)
+    status, msg, material_id = _process_item(
+        item, task["category_id"], client, manual_wait_ms=60000, type=type, info=info)
     # 重试次数已在标记重试时累加，此处不再增加
     d.execute(
         "UPDATE share_import_item SET status=?, message=?, material_id=?, update_time=? WHERE id=?",
@@ -388,10 +392,11 @@ def list_items(task_id: str) -> list[dict]:
                               (task_id,))
 
 
-def retry_failed(task_id: str) -> int:
+def retry_failed(task_id: str, type: str | None = None) -> int:
     """重试任务中所有失败的项，返回重试项数。
 
     仅允许 completed/failed 状态的任务发起重试；running/pending 任务不处理。
+    #fix-type-param：type 默认从 task 表读（前端可显式传覆盖；老任务 type='video'）。
     """
     d = get_db()
     task = d.query_one("SELECT * FROM share_import_task WHERE id=? AND deleted=0", (task_id,))
@@ -399,6 +404,11 @@ def retry_failed(task_id: str) -> int:
         raise ValueError("任务不存在")
     if task["status"] not in ("completed", "failed"):
         raise ValueError("任务仍在执行中，无法重试")
+    # 入参 type 优先；None 时从 task 表读（v43+ 存了 type，老任务 DEFAULT 'video'）
+    if type is None:
+        type = task.get("type") or "video"
+    if type not in ("video", "music"):
+        raise ValueError("type 必须为 video 或 music")
 
     failed_items = d.query_all(
         "SELECT * FROM share_import_item WHERE task_id=? AND status='failed' AND deleted=0",
@@ -406,32 +416,46 @@ def retry_failed(task_id: str) -> int:
     if not failed_items:
         return 0
 
-    d.execute("UPDATE share_import_task SET status=?, success_count=0, failed_count=0, message=?, update_time=? WHERE id=?",
-              ("running", "重试中…", now_str(), task_id))
+    # #fix-music-node：UPDATE 加 WHERE status IN 防止旧 worker 终态被覆盖
+    d.execute(
+        "UPDATE share_import_task SET status=?, success_count=0, failed_count=0, message=?, update_time=? "
+        "WHERE id=? AND status IN ('completed', 'failed')",
+        ("running", "重试中…", now_str(), task_id))
     # PR4 #57：走 task_service.submit("download", ...)，name 取分类名（同 create_task）
-    first_text = failed_items[0].get("share_text", "") if failed_items else ""
-    type_label = f"素材下载-{_detect_kind(first_text)}-重试"
+    # #fix-music-node：type_label 用 type 入参，不用 _detect_kind
+    type_label = f"素材下载-{'音乐' if type == 'music' else '视频'}-重试"
     cat_row = d.query_one("SELECT name FROM material_category WHERE id=?", (task["category_id"],)) \
         if task["category_id"] != ms.UNCATEGORIZED_ID else None
     cat_name = cat_row["name"] if cat_row else "未分类"
     name = f"导入到 {cat_name}"
+    # #fix-type-param：闭包传 type 给 worker
     task_service.submit(
-        "download", name, lambda info: _run_task(task_id, info),
+        "download", name, lambda info: _run_task(task_id, info, type=type),
         type_label=type_label,
     )
     logger.info("[分享导入] 发起重试 id={} count={}", task_id, len(failed_items))
     return len(failed_items)
 
 
-def retry_item(task_id: str, item_id: str) -> bool:
+def retry_item(task_id: str, item_id: str, type: str | None = None) -> bool:
     """手动重试单条失败项。
 
     将目标项标记为 pending 并重试次数 +1，后台异步执行。
+    #fix-type-param：type 默认从 task 表读（前端可显式传覆盖）。
+    #fix-music-node：校验 task.status 仅在 completed/failed 时允许重试
+    （避免用户连续点击导致两个 worker 串行入队、计数残留）。
     """
     d = get_db()
     task = d.query_one("SELECT * FROM share_import_task WHERE id=? AND deleted=0", (task_id,))
     if not task:
         raise ValueError("任务不存在")
+    if task["status"] not in ("completed", "failed"):
+        raise ValueError("任务仍在执行中，无法重试")
+    # 入参 type 优先；None 时从 task 表读
+    if type is None:
+        type = task.get("type") or "video"
+    if type not in ("video", "music"):
+        raise ValueError("type 必须为 video 或 music")
     item = d.query_one(
         "SELECT * FROM share_import_item WHERE id=? AND task_id=? AND deleted=0",
         (item_id, task_id))
@@ -443,17 +467,21 @@ def retry_item(task_id: str, item_id: str) -> bool:
     d.execute(
         "UPDATE share_import_item SET status=?, message=?, retry_count=retry_count+1, update_time=? WHERE id=?",
         ("pending", "等待重试", now_str(), item_id))
-    d.execute("UPDATE share_import_task SET status=?, message=?, update_time=? WHERE id=?",
-              ("running", "重试中…", now_str(), task_id))
+    # #fix-music-node：UPDATE 加 WHERE status IN 防止旧 worker 终态被覆盖
+    d.execute(
+        "UPDATE share_import_task SET status=?, message=?, update_time=? "
+        "WHERE id=? AND status IN ('completed', 'failed')",
+        ("running", "重试中…", now_str(), task_id))
     # PR4 #57：单条重试也走 task_service.submit("download", ...)
-    first_text = item.get("share_text", "")
-    type_label = f"素材下载-{_detect_kind(first_text)}-单条重试"
+    # #fix-music-node：type_label 用 type 入参，不用 _detect_kind
+    type_label = f"素材下载-{'音乐' if type == 'music' else '视频'}-单条重试"
     cat_row = d.query_one("SELECT name FROM material_category WHERE id=?", (task["category_id"],)) \
         if task["category_id"] != ms.UNCATEGORIZED_ID else None
     cat_name = cat_row["name"] if cat_row else "未分类"
     name = f"导入到 {cat_name}"
+    # #fix-type-param：闭包传 type 给 worker
     task_service.submit(
-        "download", name, lambda info: _run_single_item(task_id, item_id, info),
+        "download", name, lambda info: _run_single_item(task_id, item_id, info, type=type),
         type_label=type_label,
     )
     logger.info("[分享导入] 单条重试 task={} item={}", task_id, item_id)

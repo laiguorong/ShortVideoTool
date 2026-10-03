@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from app.models.selection import (CreateCategoryRequest, CreateVideoPullTaskRequest,
                                   DeleteCategoryRequest, DeleteMaterialRequest,
                                   ImportShareRequest, MoveCategoryRequest,
+                                  RetryShareRequest,
                                   RelocateMaterialRequest, RenameCategoryRequest,
                                   ToggleRequest, UpdateMaterialRequest,
                                   UpdateVideoPullTaskRequest, UploadFilesRequest)
@@ -180,7 +181,7 @@ def delete_pull_task(task_id: str):
 def import_share(req: ImportShareRequest):
     """创建异步导入任务，立即返回任务 ID。"""
     try:
-        task_id = create_share_import_task(req.category_id, req.share_texts)
+        task_id = create_share_import_task(req.category_id, req.share_texts, req.type)
         return {"task_id": task_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -202,20 +203,26 @@ def get_import_task(task_id: str):
 
 
 @router.post("/import-tasks/{task_id}/retry", summary="重试失败项")
-def retry_import_task(task_id: str):
-    """对任务中失败的分享文本重新执行导入。"""
+def retry_import_task(task_id: str, req: RetryShareRequest):
+    """对任务中失败的分享文本重新执行导入。
+
+    #fix-type-param：retry 也需 type 入参（原任务 type 由前端页签决定）。
+    """
     try:
-        count = retry_share_import_task(task_id)
+        count = retry_share_import_task(task_id, type=req.type)
         return {"ok": True, "retry_count": count}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/import-tasks/{task_id}/items/{item_id}/retry", summary="重试单条失败项")
-def retry_import_item(task_id: str, item_id: str):
-    """对单条失败的分享导入项重新执行导入。"""
+def retry_import_item(task_id: str, item_id: str, req: RetryShareRequest):
+    """对单条失败的分享导入项重新执行导入。
+
+    #fix-type-param：retry 也需 type 入参。
+    """
     try:
-        retry_share_import_item(task_id, item_id)
+        retry_share_import_item(task_id, item_id, type=req.type)
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
