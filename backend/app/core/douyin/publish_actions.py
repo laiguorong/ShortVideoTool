@@ -776,7 +776,7 @@ def sync_publish_video(
     risk_wait_seconds: int = 180,
     reuse_browser_actor: bool = True,
 ) -> dict:
-    """同步版发布视频到抖音：打开创作中心 → 上传 → 填字段 → 点发布 → 拿 item_id。
+    r"""同步版发布视频到抖音：打开创作中心 → 上传 → 填字段 → 点发布 → 拿 item_id。
 
     参数:
         #452：profile_dir 持久化 chromium profile（cookies + localStorage + IndexedDB）
@@ -787,7 +787,7 @@ def sync_publish_video(
         location: POI 门店名（精确匹配 .name-QUhTI4）
         schedule: 定时发布时间 yyyy-MM-dd HH:mm[:ss]；空=立即发布
         allow_save: True/False/None
-        account_dir: 截图输出目录（默认 H:/ShortVideoToolData/log/publish_<ts>）
+        account_dir: 截图输出目录（默认 H:\ShortVideoToolData\log\publish_<ts>）
         headless: True/False/None（None 时读 settings.browser_show_window）
         risk_wait_seconds: 触发风控时最大等待秒数
         reuse_browser_actor: True 用全局 browser_actor；False 独立起 browser（独立实例适合登录窗场景）
@@ -895,7 +895,7 @@ def _publish_via_browser_actor(
         """browser_actor.run 的 actions 回调：完整发布流程。"""
         try:
             # load 比 domcontentloaded 慢 2-5s；60s 充裕覆盖发布页重资源（上传组件 + 富文本 + 草稿）。
-page.goto(UPLOAD_URL, wait_until="load", timeout=60000)
+            page.goto(UPLOAD_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(4000)
             safe_screenshot(page, "step2_enter_upload", account_dir)
 
@@ -1084,7 +1084,7 @@ def _publish_via_independent_browser(
     def _actions(page):
         try:
             # load 比 domcontentloaded 慢 2-5s；60s 充裕覆盖发布页重资源（上传组件 + 富文本 + 草稿）。
-page.goto(UPLOAD_URL, wait_until="load", timeout=60000)
+            page.goto(UPLOAD_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(4000)
             safe_screenshot(page, "step2_enter_upload", account_dir)
             dismiss_unfinished_banner(page, account_dir)

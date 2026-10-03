@@ -30,7 +30,7 @@ ACCOUNTS_ROOT = Path(__file__).resolve().parents[2] / "data" / "accounts"
 def _resolve_accounts_root() -> Path:
     """解析账号目录：优先 get_data_dir() / accounts（与 DB 一致），失败时回退到 ACCOUNTS_ROOT。
 
-    这样开发态（pychark backend）和 Electron 部署态（H:\ShortVideoToolData）都能用。
+    这样开发态（pychark backend）和 Electron 部署态（H:\\ShortVideoToolData）都能用。
     """
     try:
         from app.services.setting_service import get_data_dir
