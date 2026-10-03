@@ -164,10 +164,10 @@ export const materialApi = {
     request<{ ok: boolean }>(`/materials/${id}?keep_file=${keepFile}`, { method: 'DELETE' }),
 
   /** 分享链接批量导入（异步） */
-  importShare: (shareTexts: string[], categoryId: string) =>
+  importShare: (shareTexts: string[], categoryId: string, type: 'video' | 'music') =>
     request<{ task_id: string }>('/materials/import-share', {
       method: 'POST',
-      body: JSON.stringify({ share_texts: shareTexts, category_id: categoryId }),
+      body: JSON.stringify({ share_texts: shareTexts, category_id: categoryId, type }),
     }),
 
   /** 分享导入任务列表 */
@@ -175,6 +175,7 @@ export const materialApi = {
     request<PageResult<{
       id: string
       category_id: string
+      type: 'video' | 'music'
       category_name?: string | null
       status: string
       total: number
@@ -186,7 +187,7 @@ export const materialApi = {
 
   /** 查询分享导入任务进度 */
   getShareImportTask: (taskId: string) => request<{
-    task: { id: string; category_id: string; status: string; total: number; success_count: number; failed_count: number; message: string }
+    task: { id: string; category_id: string; type: 'video' | 'music'; status: string; total: number; success_count: number; failed_count: number; message: string; create_time: string }
     items: { id: string; share_text: string; status: string; message: string; retry_count: number; material_id: string | null }[]
   }>(`/materials/import-tasks/${taskId}`),
 

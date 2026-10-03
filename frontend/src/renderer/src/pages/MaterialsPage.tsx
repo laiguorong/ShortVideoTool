@@ -845,8 +845,9 @@ function ImportShareDialog({ open, onOpenChange, categories, defaultCategoryId, 
   const [text, setText] = useState('')
   const [categoryId, setCategoryId] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  // 入库分类按当前 tab 类型过滤（任务 #132）+ 分类树层级展示（缩进表示层级）；
-// 保留"未分类"虚拟分类作为选项
+  // 入库分类按当前 tab 类型过滤（任务 #132）+ 分类树层级展示（缩进表示层级）。
+  // 与左侧分类列表保持一致：保留"未分类"虚拟节点（UNCATEGORIZED_ID='-'，
+  // categories API 按 type 注入共享虚拟分类）。
   const options = flattenTree(buildTree(categories.filter((c) => c.type === type)))
 
   useEffect(() => {
@@ -861,18 +862,23 @@ function ImportShareDialog({ open, onOpenChange, categories, defaultCategoryId, 
   const reset = () => {
     setText('')
     setSubmitting(false)
+    // #fix-music-node：弹窗重置时清空 categoryId，避免下次打开残留旧 tab 的分类 id
+    setCategoryId('')
   }
 
   const lines = text.split('\n').map((s) => s.trim()).filter(Boolean)
   const submit = async () => {
-    if (!categoryId) return
+    if (!categoryId) {
+      toast('请先选择入库分类', 'info')
+      return
+    }
     if (!lines.length) {
       toast('请输入至少一条分享链接', 'info')
       return
     }
     setSubmitting(true)
     try {
-      await materialApi.importShare(lines, categoryId)
+      await materialApi.importShare(lines, categoryId, type)
       toast(`分享任务已创建（${lines.length} 条），结果到任务队列查看`, 'success')
       reset()
       onOpenChange(false)
@@ -934,8 +940,20 @@ function VideoPlayDialog({ material, open, onOpenChange }: {
   return (
     <Dialog open={open} onOpenChange={onOpenChange} title={material.title} width={520}>
       {src ? (
+        /* #fix-music-load：src 条件渲染避免空 src 误报；autoPlay 保留以符合 UX */
         <video src={src} className="mx-auto max-h-[70vh] w-full rounded-md bg-black" controls autoPlay
-          onError={() => toast('视频加载失败（文件缺失或格式不支持）', 'error')} />
+          onError={(e) => {
+            const err = e.currentTarget.error
+            const code = err?.code ?? -1
+            const reasonMap: Record<number, string> = {
+              1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED',
+            }
+            console.error('[视频播放] 加载失败', {
+              code, reason: reasonMap[code] || `未知(${code})`, src,
+              file_path: material.file_path, file_size: material.file_size, mediaError: err,
+            })
+            toast(`视频加载失败（${reasonMap[code] || '未知'}；${((material.file_size || 0) / 1024).toFixed(1)}KB）`, 'error')
+          }} />
       ) : (
         <div className="flex aspect-9/16 items-center justify-center rounded-md bg-muted text-muted-foreground">
           加载中…
@@ -962,6 +980,30 @@ function MusicPlayDialog({ material, open, onOpenChange }: {
     return () => { alive = false }
   }, [open, material?.file_path])
   if (!material) return null
+  // HTMLMediaElement 错误码：1=ABORTED 2=NETWORK 3=DECODE 4=SRC_NOT_SUPPORTED
+  // 网络层错（2）→ 文件缺失 / 404；解码错（3 / 4）→ 文件格式不支持
+  const handleError = (e: React.SyntheticEvent<HTMLAudioElement>) => {
+    const err = e.currentTarget.error
+    const code = err?.code ?? -1
+    const codeMap: Record<number, string> = {
+      1: 'ABORTED',
+      2: 'NETWORK',
+      3: 'DECODE',
+      4: 'SRC_NOT_SUPPORTED',
+    }
+    const reason = codeMap[code] || `未知(${code})`
+    console.error('[音乐播放] 加载失败', {
+      code, reason, src,
+      file_path: material.file_path,
+      file_size: material.file_size,
+      mediaError: err,
+    })
+    const sizeKb = (material.file_size || 0) / 1024
+    toast(
+      `音乐加载失败（${reason}；${sizeKb.toFixed(1)}KB；路径：${material.file_path}）`,
+      'error',
+    )
+  }
   return (
     <Dialog open={open} onOpenChange={onOpenChange} title={material.title} width={420}>
       <div className="flex flex-col items-center gap-4 py-2">
@@ -969,8 +1011,10 @@ function MusicPlayDialog({ material, open, onOpenChange }: {
         {material.cover_url
           ? <CoverImage material={material} className="h-44 w-44 rounded-xl" />
           : <div className="flex h-44 w-44 items-center justify-center rounded-xl bg-muted text-5xl text-muted-foreground">🎵</div>}
-        <audio src={src} controls autoPlay className="w-full"
-          onError={() => toast('音乐加载失败（文件缺失或格式不支持）', 'error')} />
+        {/* #fix-music-load：src='' 阶段不渲染 audio，避免 onError 误报 SRC_NOT_SUPPORTED
+            （autoplay 策略 + 异步 fileUrl.setSrc 切换触发 error code 4）。
+            autoPlay 仅在 src 设置后挂载时生效，符合"点封面立即播放"UX。 */}
+        {src && <audio src={src} controls autoPlay className="w-full" onError={handleError} />}
       </div>
     </Dialog>
   )
@@ -1034,6 +1078,13 @@ export function MaterialsPage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [keyword, setKeyword] = useState('')
+  // #fix-search-race：debouncedKeyword 用于实际触发列表请求（避免每次按键都请求）。
+  // 用户连续输入时只有最后停顿 300ms 后的关键词才请求；解决"切换条件太快请求叠加"。
+  const [debouncedKeyword, setDebouncedKeyword] = useState('')
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedKeyword(keyword), 300)
+    return () => clearTimeout(t)
+  }, [keyword])
   const [addCatOpen, setAddCatOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   // 拉取任务：panelOpen=列表浮窗；editOpen=创建/编辑弹窗（叠上层，关闭后回浮窗）
@@ -1083,19 +1134,30 @@ export function MaterialsPage() {
     }).catch((e) => console.warn('[Materials] 请求失败:', e))
   }, [tab, selectedCat])
 
+  /** 自增请求序号：旧请求晚返回时丢弃，避免覆盖新结果（解决快速切换条件 race）。
+   * 与 ProjectShopsDrawer.searchReqId 同样思路（#fix-search-race）。 */
+  const listReqId = useRef(0)
   const loadMaterials = useCallback(() => {
     // 任务 tab 不需要素材列表
     if (tab === 'task') return
+    const reqId = ++listReqId.current
     return materialApi.list({
       type: tab,
       category_id: selectedCat,
-      keyword,
+      keyword: debouncedKeyword,
       page: String(page),
       page_size: String(pageSize),
     })
-      .then((r) => setData({ list: r.list, total: r.total }))
-      .catch((e) => console.warn('[Materials] 请求失败:', e))
-  }, [tab, selectedCat, keyword, page, pageSize])
+      .then((r) => {
+        // 旧请求晚返回时丢弃，避免覆盖新筛选条件的结果
+        if (reqId !== listReqId.current) return
+        setData({ list: r.list, total: r.total })
+      })
+      .catch((e) => {
+        if (reqId !== listReqId.current) return
+        console.warn('[Materials] 请求失败:', e)
+      })
+  }, [tab, selectedCat, debouncedKeyword, page, pageSize])
 
   /** 一键刷新：同步 setRefreshing(true)，完成后统一关 loading（任务 tab 由 PullTaskPanel onLoadingChange 关闭） */
   const doRefresh = useCallback(() => {
@@ -1118,7 +1180,7 @@ export function MaterialsPage() {
   useEffect(() => {
     doRefresh()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, selectedCat, keyword, page, pageSize])
+  }, [tab, selectedCat, debouncedKeyword, page, pageSize])
 
   /** 任务 tab 收到 PullTaskPanel load 状态变化通知（用于父级按钮 loading 显示） */
   const onPullLoadingChange = useCallback((v: boolean) => setRefreshing(v), [])
@@ -1238,7 +1300,9 @@ export function MaterialsPage() {
         </div>
         {tab !== 'task' && (
           <input className="ml-4 h-8 w-48 rounded-md border border-border bg-white px-2.5 text-sm" placeholder="搜索标题"
-            value={keyword} onChange={(e) => { setKeyword(e.target.value); setPage(1) }} />
+            value={keyword} onChange={(e) => { setKeyword(e.target.value); setPage(1) }}
+            onCompositionStart={() => {/* IME 拼音中（中文输入法），不打断输入流 */}}
+            onCompositionEnd={() => {/* compositionEnd 后 debouncedKeyword 300ms 内生效 */}} />
         )}
         {/* 三个 tab 都显示刷新按钮；任务 tab 由 PullTaskPanel onLoadingChange 通知 loading 状态 */}
         <Button size="sm" variant="outline" onClick={doRefresh} disabled={refreshing || loading}>
