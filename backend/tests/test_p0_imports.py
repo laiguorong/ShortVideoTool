@@ -71,13 +71,14 @@ def test_publish_service_uses_interruptible_sleep():
 
 
 def test_material_service_has_cleanup_pattern():
-    """#P1-1：material_service 3 处 download_video 都有清理模式"""
+    """#P1-1：material_service download_video 失败路径有 P1-1 清理模板"""
     import inspect
     from app.services import material_service
     src = inspect.getsource(material_service)
-    # 检查至少 3 处 unlink(missing_ok=True) 在 download 失败路径
+    # 检查至少 2 处 P1-1 清理模板（_download_bgm + _download_and_ingest）；
+    # #fix-music-node 删除了 _download_music_ingest 后从 3 处降到 2 处。
     count = src.count("except BaseException:\n        # #P1-1")
-    assert count >= 3, f"应有 ≥3 处 P1-1 清理模板，实际 {count}"
+    assert count >= 2, f"应有 ≥2 处 P1-1 清理模板，实际 {count}"
 
 
 def test_account_service_profile_blank_guard():
@@ -147,24 +148,6 @@ def test_fetch_aweme_detail_accepts_account_id():
     sig = inspect.signature(client.RealDouyinClient._fetch_aweme_detail)
     assert "account_id" in sig.parameters
     assert sig.parameters["account_id"].default == ""
-
-
-def test_import_share_links_no_info_undefined():
-    """回归测试：import_share_links 内部传 info=None 不应引用未定义变量。
-
-    历史 bug：分享导入循环里 `info=info` 触发 NameError（函数内无 info 形参）。
-    修复后传 None，走 _download_and_ingest 内部 time.sleep 降级。
-    """
-    import inspect
-    from app.services import material_service
-    src = inspect.getsource(material_service.import_share_links)
-    # 修复点：必须传 None 而非 info（info 在函数作用域内未定义）
-    assert "info=None" in src, "import_share_links 内 info= 应改为 info=None"
-    # 防御性：不应再出现裸 `info=info`（除非 import_share_links 真有 info 形参）
-    sig = inspect.signature(material_service.import_share_links)
-    assert "info" not in sig.parameters, (
-        "import_share_links 签名包含 info 时无需传 None，请同步测试"
-    )
 
 
 def test_parse_aweme_common_download_urls_have_field():

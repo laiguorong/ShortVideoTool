@@ -39,8 +39,12 @@ def test_download_bgm_exception_cleans_residual():
     assert not save_path.exists(), f"残文件应被清理: {save_path}"
 
 
-def test_download_music_ingest_exception_cleans_residual():
-    """#P1-1：_download_music_ingest 异常时残文件被 unlink"""
+def test_download_bgm_via_share_video_exception_cleans_residual():
+    """#P1-1：_download_bgm 分享导入路径（type=music + 视频）异常时残文件被 unlink
+
+    #fix-music-node：_download_music_ingest 已删除，分享导入 type=music + 视频
+    走 _process_video_bgm_only → _download_bgm。P1-1 清理模板在 _download_bgm 内部。
+    """
     tmp_dir = Path(tempfile.mkdtemp())
     save_path = tmp_dir / "music.m4a"
     save_path.write_bytes(b"y" * 50)
