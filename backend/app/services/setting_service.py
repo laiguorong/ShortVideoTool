@@ -54,8 +54,6 @@ DEFAULT_SETTINGS = {
     "pull_debug": False,                     # 拉取任务慢路径开关：True 时筛选面板每步 2.5s 便于真机观察
     "task_history_max_count": 500,           # #高危-1：内存中保留的终态任务上限（防 OOM）
     "task_history_retention_hours": 24,      # #高危-1：终态任务保留时长（超时即淘汰）
-    # #418：成品视频目录对话框记住的上次选择路径
-    "last_video_dir": "",
 }
 
 

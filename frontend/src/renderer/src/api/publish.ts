@@ -313,9 +313,6 @@ export const publishApi = {
       method: 'POST',
       body: JSON.stringify({ abs_path: absPath }),
     }),
-  // #418：获取上次选择的目录路径
-  getLastVideoDir: () =>
-    request<{ abs_path: string }>('/publish/video-dirs/last'),
 
   /** 任务列表（支持按状态过滤） */
   listTasks: (page = 1, pageSize = 20, status?: string) => {

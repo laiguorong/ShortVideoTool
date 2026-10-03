@@ -5,15 +5,12 @@
 - 路径只能通过 Electron dialog 选择（前端），后端不限制路径（用户本地任意目录）。
 - 合规视频后缀：.mp4 / .mov / .avi / .mkv（白名单）。
 - 发布成功后自动把视频移到目录下 _published/ 子目录；失败仅日志，不阻塞发布。
-- 记住上次选择的目录，下次 dialog defaultPath 用。
 """
 import shutil
 from datetime import datetime
 from pathlib import Path
 
 from loguru import logger
-
-from app.services.setting_service import load_settings, save_settings
 
 # 合规视频后缀白名单
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
@@ -100,11 +97,3 @@ def move_to_published(video_file_path: str) -> str:
         return video_file_path
 
 
-def remember_last_dir(abs_dir_path: str) -> None:
-    """记住上次选择的目录路径（写到 settings.json）。"""
-    save_settings({"last_video_dir": abs_dir_path})
-
-
-def get_last_dir() -> str:
-    """获取上次选择的目录路径；空则返回空串。"""
-    return load_settings().get("last_video_dir", "") or ""

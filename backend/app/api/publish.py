@@ -21,21 +21,13 @@ class ScanVideoDirRequest(BaseModel):
 def scan_video_dir(req: ScanVideoDirRequest):
     """扫描目录返回 {abs_path, dir_name, video_count, video_files[]}。
     失败抛 ValueError → 前端 toast 错误（HTTP 400）。
-    成功后自动 remember 上次路径。
     """
-    from app.services.video_dir_service import scan_video_dir as _scan, remember_last_dir
+    from app.services.video_dir_service import scan_video_dir as _scan
     try:
         info = _scan(req.abs_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    remember_last_dir(req.abs_path)
     return info
-
-
-@router.get("/video-dirs/last", summary="#418 获取上次选择的目录路径")
-def get_last_video_dir():
-    from app.services.video_dir_service import get_last_dir
-    return {"abs_path": get_last_dir()}
 
 
 # ---------- #413 向导三段：草稿 → 预览 → 确认 ----------

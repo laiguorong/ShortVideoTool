@@ -8,7 +8,7 @@
  *       selectedShops/selectedIntros 直接挂在 ProjectDraftState 上；
  *       视频简介改为临时多行文本框（不再调 intros API）；
  *       不再调 /api/selection/shops（wizard 不显示全量店）。 */
-import { Fragment, useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toast'
@@ -96,6 +96,8 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   const [manualIntroTexts, setManualIntroTexts] = useState<Record<string, string>>({})
   // #418：成品视频目录列表
   const [videoDirs, setVideoDirs] = useState<VideoDirEntry[]>([])
+  // #review-fix-2：批量刷新 video_count 的 AbortController（卸载 / editingTask 切换时中断）
+  const scanCtrlRef = useRef<AbortController | null>(null)
   // #418：手动输入门店——按 video_dir.id 索引；key=dir.id, value=textarea 文本（一行一家）
   const [manualShopTexts, setManualShopTexts] = useState<Record<string, string>>({})
   // #450：项目 draft 内嵌 selectedShops/selectedIntros（不再独立 store）
@@ -140,6 +142,13 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   // #442：open=true 时加载 + 重置；open=false 时清空 wizard 状态（关弹即丢）
   // #290 修：仅在 open 切换时跑；不回填任务名（避免覆盖 editingTaskId 的回填）
   useEffect(() => {
+    // #review-fix-2：组件卸载兜底 abort（dialog 父组件卸载时 open=false 路径走不到这里）
+    return () => {
+      scanCtrlRef.current?.abort()
+      scanCtrlRef.current = null
+    }
+  }, [])
+  useEffect(() => {
     if (!open) {
       // 关闭 wizard：清所有用户态，避免下次打开残留上次选择
       setSelAccounts([])
@@ -155,6 +164,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       setEditingTaskIdHandled(null)  // #290：清回填标记
       setInitialPayloadHandled(null)  // #453：清复制模式回填标记，避免重复复制同一源命中缓存
       setManualIntroTexts({})  // 视频简介-按项目一一对应：清手动 intro
+      // #review-fix-2：dialog 关闭时中断未完成的批量扫描
+      scanCtrlRef.current?.abort()
+      scanCtrlRef.current = null
       return
     }
     setStep(1)
@@ -287,6 +299,42 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       try {
         const vds = (p.video_dirs || []) as VideoDirEntry[]
         setVideoDirs(vds)
+        // #fix-video-count-refresh：复制任务（#453）透传的视频目录含旧 video_count 缓存，
+        // 首次显示时并发重新扫描每个目录更新数量，不阻塞用户操作。
+        // #review-fix-2：组件卸载 / editingTask 切换时 abort，避免 unmounted setState warning。
+        // #review-fix-3：scan 失败时记录 warning 日志（保留旧 video_count，confirm 阶段硬阻塞兜底）。
+        scanCtrlRef.current?.abort()
+        const ctrl = new AbortController()
+        scanCtrlRef.current = ctrl
+        if (vds.length > 0) {
+          void Promise.allSettled(
+            vds.map(async (vd) => {
+              if (ctrl.signal.aborted) return null
+              try {
+                const info = await publishApi.scanVideoDir(vd.abs_path)
+                if (ctrl.signal.aborted) return null
+                return { id: vd.id, video_count: info.video_count }
+              } catch (e) {
+                // 静默失败但留日志——目录可能已被用户移走，UI 保留旧 video_count；
+                // 后续 confirm / build_schedule 阶段会再 hard-check（abs_path 不存在 → 报错）
+                console.warn(
+                  `[PublishWizard] video_count 刷新失败，目录不可达: ${vd.abs_path}`,
+                  e,
+                )
+                return null
+              }
+            }),
+          ).then((results) => {
+            if (ctrl.signal.aborted) return
+            const updates = results.flatMap((r) =>
+              r.status === 'fulfilled' && r.value ? [r.value] : [])
+            if (updates.length === 0) return
+            setVideoDirs((cur) => cur.map((d) => {
+              const u = updates.find((x) => x.id === d.id)
+              return u ? { ...d, video_count: u.video_count } : d
+            }))
+          })
+        }
         const shops = (p.manual_shops || {}) as Record<string, ShopDraftEntry[]>
         const texts: Record<string, string> = {}
         for (const v of vds) texts[v.id] = (shops[v.id] || []).map((s) => s.name).join('\n')
@@ -843,12 +891,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                   onClick={async () => {
                     // 阶段 1：系统目录对话框（用户可能取消，不算异常）
                     setVideoDirBusy('selecting')
-                    let defaultPath: string | undefined
-                    try {
-                      const last = await publishApi.getLastVideoDir()
-                      defaultPath = last.abs_path || undefined
-                    } catch { /* ignore */ }
-                    const p = await window.electronAPI.openDirectory(defaultPath)
+                    // 取当前 videoDirs 最后一个的 abs_path 作为 dialog 起点（纯内存 hint，不持久化）
+                    const lastAbs = videoDirs.length > 0 ? videoDirs[videoDirs.length - 1].abs_path : undefined
+                    const p = await window.electronAPI.openDirectory(lastAbs)
                     if (!p) { setVideoDirBusy(null); return }
                     // 阶段 2：API 扫描（耗时 100ms~数秒，按目录视频数）
                     setVideoDirBusy('scanning')
