@@ -13,6 +13,7 @@ from loguru import logger
 
 from app.core import crypto, notifier
 from app.core.douyin import get_douyin_client, LoginInvalidError, DouyinClientError
+from app.core.douyin.browser import _ANTI_BOT_INIT_SCRIPT
 from app.core.douyin.avatar_cache import cache_avatar, cache_account_avatar
 from app.core import task_scheduler
 from app.db import get_db
@@ -237,9 +238,8 @@ def check_account(account_id: str) -> dict:
         )
         try:
             page = ctx.new_page()
-            page.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
+            # 用完整反爬 + 顶部警示条（顶部位置默认；其他浏览器用 _make_anti_bot_init_script("center") 等）
+            page.add_init_script(_ANTI_BOT_INIT_SCRIPT)
             page.goto("https://creator.douyin.com/creator-micro/home",
                       timeout=30000, wait_until="domcontentloaded")
             # 3. 等 DOM 资料卡 selector（与 login_window 同一 selector）

@@ -148,13 +148,15 @@ class RealDouyinClient(DouyinClient):
     # ---------- 分享链接解析 ----------
 
     def resolve_share(self, share_text: str, manual_wait_ms: int = 30000) -> dict:
-        """解析分享文本：识别 URL 类型 → 视频走 _fetch_aweme_detail，音乐走 _fetch_music_detail。
+        """解析分享文本：仅支持视频链接，音乐链接一律拒绝。
 
-        任务 #132：分享链接可能是 `/video/{vid}` 也可能是 `/music/{mid}`：
-        - 视频链接：开浏览器拦 `/aweme/v1/web/aweme/detail/`（任务 #131 验证匿名可拿全字段）
-        - 音乐链接：纯 HTTP 调 `/aweme/v1/web/music/detail/`（实测免签匿名）
+        #fix-music-node：分享导入只接视频链接（/video/{vid} 或 /note/{id}）。
+        音乐链接（/music/{mid}）抛 DouyinClientError，由 _process_item 写 failed 状态。
 
-        短链 302 后根据最终 URL 的路径（`/video/{vid}` 或 `/music/{mid}`）分流。
+        视频链接走 _fetch_aweme_detail（开浏览器拦 /aweme/v1/web/aweme/detail/，
+        任务 #131 验证匿名可拿全字段）。
+
+        短链 302 后根据最终 URL 的路径分流；解析到 /music/... 路径直接拒绝。
         """
         from curl_cffi import requests as creq
 
@@ -163,13 +165,17 @@ class RealDouyinClient(DouyinClient):
         # 1. 提取链接（短码可含连字符，如 5Ob-LbF5RLM；漏 - 会截断短码导致降级跳首页）
         m = re.search(r"https?://v\.douyin\.com/[\w-]+/?", share_text)
         if not m:
-            # 任务 #132：先识别音乐链接，再识别视频链接
+            # #fix-music-node：音乐链接直接拒绝
             m_music = re.search(r"https?://www\.douyin\.com/music/(\d+)", share_text)
             if m_music:
-                return self._fetch_music_detail(m_music.group(1))
-            m_video = re.search(r"https?://www\.douyin\.com/video/(\d+)", share_text)
+                logger.info("[分享解析] 拒绝音乐长链 text={!r:.60} music_id={}",
+                            share_text, m_music.group(1))
+                raise DouyinClientError(
+                    "仅支持视频链接导入，音乐链接请到视频页导入（自动抽取 BGM 入音乐库）")
+            m_video = re.search(r"https?://www\.douyin\.com/(?:video|note)/(\d+)", share_text)
             if m_video:
-                return self._fetch_aweme_detail(m_video.group(1))
+                kind = "note" if "/note/" in m_video.group(0) else "video"
+                return self._fetch_aweme_detail(m_video.group(1), url_kind=kind)
             raise DouyinClientError("分享文本中未识别到抖音链接")
         else:
             # 2. 短链解析（任务 #132 改造）：
@@ -177,39 +183,30 @@ class RealDouyinClient(DouyinClient):
             #    避免跟随到 `iesdouyin.com` 跨域触发 DNS 解析超时（实测偶发 3-7s）。
             #    Location 形态：
             #    - https://www.douyin.com/video/{vid}
-            #    - https://www.iesdouyin.com/share/music/{mid}?from_ssr=1  （移动端域名）
-            #    - https://www.douyin.com/music/{mid}
-            #    三种都从 Location 抽 ID（music / video / share/music 三类正则）。
+            #    - https://www.douyin.com/note/{id}（图文）
+            #    - https://www.iesdouyin.com/share/music/{mid}?from_ssr=1  （音乐，#fix-music-node 拒绝）
             video_id = ""
             music_id = ""
-            hops: list[str] = []  # 记录每轮最终地址（排查"未解析到视频 ID"用）
+            hops: list[str] = []
             mobile_ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
-            # 匹配 iesdouyin / www.douyin 域名下的 ID：
-            # - /video/{id}（PC 视频页）
-            # - /note/{id}（图文）
-            # - /music/{id}（PC 音乐页）
-            # - /share/video/{id}（移动端视频分享）
-            # - /share/music/{id}（移动端音乐分享）
+                         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17_0 Mobile/15E148 Safari/604.1")
             id_pattern = re.compile(
                 r"(?:iesdouyin\.com|www\.douyin\.com)/(?:video|note|music|share/(?:video|music))/(\d+)")
             for ua in (UA, mobile_ua):
                 last_err: Exception | None = None
                 resp = None
-                # 最多重试 3 次：第 1 次 + 2 次重试（间隔 1s / 2s 递增）
                 for attempt in range(3):
                     try:
-                        # 关键：不跟随 302，只读 Location 头；避免跨域 DNS
                         resp = creq.get(m.group(0),
                                         headers={**_HEADERS, "User-Agent": ua},
                                         impersonate="chrome",
                                         allow_redirects=False, timeout=15)
                         last_err = None
                         break
-                    except Exception as e:  # noqa: BLE001 网络层失败
+                    except Exception as e:
                         last_err = e
                         if attempt < 2:
-                            wait_s = 1 + attempt  # 1s, 2s
+                            wait_s = 1 + attempt
                             logger.warning(
                                 "[分享解析] 短链请求失败 text={!r:.60} url={} ua={} attempt={} err={} → 等待 {}s 重试",
                                 share_text, m.group(0)[:120],
@@ -225,28 +222,28 @@ class RealDouyinClient(DouyinClient):
                         share_text, m.group(0)[:120], last_err,
                     )
                     raise DouyinClientError(f"短链请求失败：{last_err}") from last_err
-                # Location 解析（不跟随 302）
                 location = resp.headers.get("Location") or resp.headers.get("location") or ""
                 hops.append(f"{resp.status_code} -> {location[:140]}")
-                # 任务 #132：从 Location 抽 music_id / video_id
                 m_loc = id_pattern.search(location)
                 if m_loc:
                     target_id = m_loc.group(1)
-                    # 区分 video vs music：路径含 /music 段（含 share/music）
+                    # #fix-music-node：解析到 /music/ 路径直接拒绝
                     if "/music" in location:
                         music_id = target_id
                     else:
                         video_id = target_id
                     break
-                # 桌面 UA 偶发被短链服务降级跳首页（无 ID）→ 换移动 UA 重试一轮
+            # #fix-music-node：音乐链接拒绝（包括短链跳音乐页）
             if music_id:
-                logger.info("[分享解析] 短链跳音乐页 text={!r:.60} → music_id={}",
+                logger.info("[分享解析] 拒绝音乐链接 text={!r:.60} music_id={}",
                             share_text, music_id)
-                return self._fetch_music_detail(music_id)
+                raise DouyinClientError(
+                    "仅支持视频链接导入，音乐链接请到视频页导入（自动抽取 BGM 入音乐库）")
             if not video_id:
-                logger.warning("[分享解析] 短链跳转未解析到视频/音乐 ID text={!r:.60} hops={}",
+                logger.warning("[分享解析] 短链跳转未解析到视频 ID text={!r:.60} hops={}",
                                share_text, " | ".join(hops))
-                raise DouyinClientError(f"短链跳转异常：未解析到视频/音乐 ID（{hops[-1][:80] if hops else m.group(0)[:80]}）")
+                raise DouyinClientError(
+                    f"短链跳转异常：未解析到视频 ID（{hops[-1][:80] if hops else m.group(0)[:80]}）")
 
         # 3. 视频详情：开浏览器加载视频页，拦截 detail XHR（页面自己算签名，绕过 403）
         # 任务 #131：_fetch_aweme_detail 默认匿名即可拿全字段，无需账号 cookie
@@ -255,7 +252,8 @@ class RealDouyinClient(DouyinClient):
         return self._fetch_aweme_detail(video_id, manual_wait_ms=manual_wait_ms)
 
     def _fetch_in_page(self, page, video_id: str, timeout_ms: int = 20000,
-                       manual_wait_ms: int = 0) -> list[dict]:
+                       manual_wait_ms: int = 0,
+                       url_kind: str = "video") -> list[dict]:
         """#161：阶段 B 复用阶段 A page 抓详情。
 
         在传入 page 上注册响应拦截器 → page.goto 详情 URL → event-driven 等 detail XHR 落库。
@@ -307,7 +305,8 @@ class RealDouyinClient(DouyinClient):
             for attempt in range(2):
                 try:
                     page.goto(
-                        f"https://www.douyin.com/video/{video_id}",
+                        # #fix-music-node：note 链接走 /note/{id}（避免强行打开 /video/{id} → 404）
+                        f"https://www.douyin.com/{url_kind}/{video_id}",
                         timeout=timeout_ms, referer="https://www.douyin.com/",
                         wait_until="load",  # ← 等资源全加载（图片/脚本/字体）
                     )
@@ -360,7 +359,8 @@ class RealDouyinClient(DouyinClient):
     def _fetch_aweme_detail(self, video_id: str, cookie: str = "",
                             manual_wait_ms: int = 0,
                             account_id: str = "",
-                            page=None) -> dict:
+                            page=None,
+                            url_kind: str = "video") -> dict:
         """公共方法（任务 #131）：通过浏览器拦 detail XHR 拿视频完整数据。
 
         拉取侧 + 分享侧共用：搜索列表 `aweme_info` author 节点字段值不可信（follower=0），
@@ -378,14 +378,19 @@ class RealDouyinClient(DouyinClient):
         # 冲突 + asyncio loop 冲突。**page 复用时 account_id 不生效**——profile 由 page 所在
         # context 决定（阶段 A 创建时已绑定账号 profile）。
 
+        #fix-music-node：url_kind 决定打开的详情页 URL 类型：
+        - "video"（默认）：https://www.douyin.com/video/{id} → 普通视频
+        - "note"：https://www.douyin.com/note/{id} → 图文（任务 #fix-music-node 修 note 链接 404）
+
         参数:
-            video_id: 抖音视频 ID（短链 302 解析后 / 搜索列表直接拿）
+            video_id: 抖音视频/图文 ID（短链 302 解析后 / 搜索列表直接拿）
             cookie: 账号登录态（默认空串=匿名；任务 #131 验证匿名可拿全字段）
             manual_wait_ms: 人工等待窗口毫秒数（0 响应时让人过验证码，>0 进入等待）。
                 分享导入手动重试时通常传 30000~60000（30s~60s）。
             account_id: 账号 ID（#fix-unify-profile-storage：传时走 accounts/<id>/profile/）。
                 page 复用路径下不生效。
             page: 复用阶段 A 的 Playwright page（None 时回退到 BrowserActor 独立 launch）
+            url_kind: "video" / "note"（#fix-music-node）
         返回:
             统一视频字段 dict（_parse_detail_item 输出）
         异常:
@@ -408,10 +413,13 @@ class RealDouyinClient(DouyinClient):
                 # launch_persistent_context（撞同 profile_dir lock）。
                 # timeout 20000：wait_until=load 比 domcontentloaded 慢 2-5s，需扩上限。
                 bodies = self._fetch_in_page(page, video_id, timeout_ms=20000,
-                                              manual_wait_ms=manual_wait_ms)
+                                              manual_wait_ms=manual_wait_ms,
+                                              url_kind=url_kind)
             else:
+                # #fix-music-node：note 链接走 /note/{id}（避免被强行打开 /video/{id} → 404）
+                detail_url = f"https://www.douyin.com/{url_kind}/{video_id}"
                 bodies = browser_actor.run(
-                    f"https://www.douyin.com/video/{video_id}",
+                    detail_url,
                     capture=lambda u: "/aweme/v1/web/aweme/detail/" in u,
                     cookies=cookies, user_data_dir=user_data_dir,
                     timeout_ms=20000, manual_wait_ms=manual_wait_ms,
@@ -423,10 +431,16 @@ class RealDouyinClient(DouyinClient):
             msg = str(e) or repr(e)
             reason = f"详情页加载失败：{msg}" if msg else (
                 f"详情页加载失败（{type(e).__name__}，无消息，建议稍后重试）")
-            # 全栈打印（traceback 整链）：定位 share_import 后台线程 + 浏览器层 race 真因
-            logger.exception(
-                "[详情获取] 浏览器层异常 video_id={} reason={} type={} args={}",
-                video_id, reason, type(e).__name__, e.args)
+            # #fix-browser-closed：浏览器被用户手动关闭（TargetClosedError）属于用户主动操作，
+            # 静默 WARNING 不刷 traceback；其他异常仍走 logger.exception 全栈打印。
+            if "closed" in msg.lower() or "TargetClosedError" in type(e).__name__:
+                logger.warning(
+                    "[详情获取] 浏览器已关闭 video_id={} type={}",
+                    video_id, type(e).__name__)
+            else:
+                logger.exception(
+                    "[详情获取] 浏览器层异常 video_id={} reason={} type={} args={}",
+                    video_id, reason, type(e).__name__, e.args)
             raise DouyinClientError(reason) from e
         for body in bodies:
             aw = body.get("aweme_detail") or {}
@@ -578,47 +592,6 @@ class RealDouyinClient(DouyinClient):
             return {"success": False, "online_video_id": None,
                     "message": f"发布异常：{msg}"}
 
-    # ---------- 音乐详情（任务 #132：纯 HTTP 免签）----------
-
-    def _fetch_music_detail(self, music_id: str, cookie: str = "") -> dict:
-        """公共方法（任务 #132）：纯 HTTP 调 `/aweme/v1/web/music/detail/` 拿 music_info。
-
-        实测：匿名免签即可拿到完整 music_info（title/owner/play_url/cover/duration），
-        不需要浏览器路径。分享链接 `https://www.douyin.com/music/{mid}` 走此方法，
-        仅入音乐库不入视频库。
-
-        参数:
-            music_id: 抖音原声 ID（mid / id_str）
-            cookie: 账号登录态（默认空串=匿名；匿名即可拿全字段）
-        返回:
-            统一音乐字段 dict（_parse_music_info 输出）
-        异常:
-            DouyinClientError: 接口失败 / status_code 非 0 / music_info 缺失
-        """
-        from curl_cffi import requests as creq
-        url = f"https://www.douyin.com/aweme/v1/web/music/detail/?music_id={music_id}"
-        headers = {**_HEADERS, "Cookie": cookie} if cookie else _HEADERS
-        rate_limiter.acquire()
-        try:
-            resp = creq.get(url, headers=headers, impersonate="chrome", timeout=15)
-        except Exception as e:  # noqa: BLE001 网络层失败
-            rate_limiter.report_failure()
-            raise DouyinClientError(f"音乐详情请求失败：{e}") from e
-        try:
-            body = resp.json()
-        except Exception as e:  # noqa: BLE001 非 JSON
-            rate_limiter.report_failure()
-            raise DouyinClientError(f"音乐详情响应非 JSON：{e}") from e
-        if body.get("status_code") not in (0, None):
-            rate_limiter.report_failure()
-            raise DouyinClientError(f"音乐详情接口异常：{body.get('status_code')} {body.get('msg', '')[:80]}")
-        mi = body.get("music_info")
-        if not isinstance(mi, dict) or not mi:
-            rate_limiter.report_failure()
-            raise DouyinClientError("音乐详情返回 music_info 为空")
-        rate_limiter.report_success()
-        return _parse_music_info(mi, music_id)
-
 
 # ---------- 模块内工具函数 ----------
 
@@ -645,6 +618,10 @@ def _parse_music(aw: dict) -> dict:
 
     抖音曲库/视频原声都挂在 music 节点；版权受限曲目 play_url 为空 → 返回空 dict，
     下游据此跳过 BGM 拉取（不报错、不影响视频入库）。
+
+    字段来源（#fix-music-node）：统一从 music 节点读，不再走 music_detail HTTP 接口。
+    - 封面：music.cover_medium.url_list[0]，无则降级 cover_thumb
+    - 头像：music.avatar_medium.url_list[0]（音乐作者头像，非视频作者）
     """
     m = aw.get("music") or {}
     play_list = ((m.get("play_url") or {}).get("url_list")) or []
@@ -663,6 +640,21 @@ def _parse_music(aw: dict) -> dict:
     # duration/audition_duration 单位均为秒（实测 111 = 1分51秒），转毫秒统一
     duration = int(m.get("duration") or m.get("audition_duration") or 0) * 1000
     music_id = str(m.get("mid") or "")
+    # 封面：cover_large → cover_medium → cover_thumb 降级（与 _parse_music_info 对齐；
+    # #fix-music-node：aweme.music 节点通常无 cover_large，但部分曲库形态会有）
+    cover_url = ""
+    for ck in ("cover_large", "cover_medium", "cover_thumb"):
+        cu = ((m.get(ck) or {}).get("url_list")) or []
+        if cu and cu[0]:
+            cover_url = cu[0]
+            break
+    cover_url = _normalize_image_url(cover_url) if cover_url else ""
+    # 作者头像：avatar_medium
+    avatar_url = ""
+    au = ((m.get("avatar_medium") or {}).get("url_list")) or []
+    if au and au[0]:
+        avatar_url = au[0]
+    avatar_url = _normalize_image_url(avatar_url) if avatar_url else ""
     return {
         # music.mid 是原声/曲目的唯一 ID（同一首原声多视频共用，用于去重）
         "music_id": music_id,
@@ -672,67 +664,29 @@ def _parse_music(aw: dict) -> dict:
         "download_url": url,
         # 原声聚合页链接（mid 拼接，#45）
         "share_url": f"https://www.douyin.com/music/{music_id}" if music_id else "",
-        # 音乐封面：related_music_anchor.extra 为 JSON 字符串（#43），
-        # medium_cover_urls[0] 为封面（#44）；heic Chromium 不显示 → 换 .jpeg 后缀
-        "cover_url": _music_cover_url(aw),
-    }
-
-
-def _music_cover_url(aw: dict) -> str:
-    """从 related_music_anchor.extra 提取音乐封面 URL（JSON 字符串需先 parse，#43）。
-
-    抖音图床按扩展名出格式（实测 .heic/.jpeg/.webp 均可），统一换 .jpeg 保证浏览器可显示。
-    """
-    try:
-        extra = ((aw.get("related_music_anchor") or {}).get("extra")) or ""
-        data = json.loads(extra) if isinstance(extra, str) else (extra or {})
-        urls = data.get("medium_cover_urls") or []
-        url = str(urls[0]) if urls else ""
-        return url.replace(".heic", ".jpeg") if url else ""
-    except (json.JSONDecodeError, TypeError, IndexError):
-        return ""
-
-
-def _parse_music_info(mi: dict, fallback_id: str) -> dict:
-    """解析音乐详情接口的 music_info → 统一音乐字段（任务 #132）。
-
-    与 `_parse_music`（aweme.music 节点）的差异：
-    - music_info 是顶级音乐页接口的完整结构（69 字段），含 owner_id/owner_nickname/owner_handle
-    - aweme.music 节点是视频附属结构（也含 title/play_url 但 author 是字符串而非 owner_*）
-
-    返回字段与现有音乐库 material 表列对齐：
-    - music_id / title / author / duration_ms / download_url / share_url / cover_url
-    - 额外带 _source='music_detail' 标记，便于入库时区分 BGM 来源 vs 纯音乐导入
-    """
-    mid = str(mi.get("id_str") or mi.get("id") or fallback_id or "").strip()
-    play_list = ((mi.get("play_url") or {}).get("url_list")) or []
-    download_url = play_list[0] if play_list else ""
-    # owner_nickname 是音乐作者（非视频作者）
-    author = (mi.get("owner_nickname") or "").strip()
-    if not author and isinstance(mi.get("author"), str):
-        author = mi["author"].strip()
-    # duration 单位秒
-    duration = int(mi.get("duration") or mi.get("audition_duration") or 0) * 1000
-    # 封面优先 cover_large → cover_medium → cover_thumb
-    cover_url = ""
-    for ck in ("cover_large", "cover_medium", "cover_thumb", "cover_hd"):
-        cu = ((mi.get(ck) or {}).get("url_list")) or []
-        if cu:
-            cover_url = cu[0]
-            break
-    cover_url = cover_url.replace(".heic", ".jpeg") if cover_url else ""
-    return {
-        "music_id": mid,
-        "title": (mi.get("title") or "").strip() or "未知原声",
-        "author": author,
-        "author_id": str(mi.get("owner_id") or ""),
-        "author_handle": str(mi.get("owner_handle") or ""),
-        "duration_ms": duration,
-        "download_url": download_url,
-        "share_url": f"https://www.douyin.com/music/{mid}" if mid else "",
+        # 封面/头像：直接从 music 节点读（统一路径，不再走 music_detail）
         "cover_url": cover_url,
-        "_source": "music_detail",
+        "avatar_url": avatar_url,
     }
+
+
+def _normalize_image_url(url: str) -> str:
+    """音乐封面 URL 路径段 `.heic` → `.jpeg`（大小写不敏感，#封面空白修复）。
+
+    参考 `avatar_cache.py` 头像 URL 漂移修复（行 87）：抖音图床扩展名按需切换，
+    `.heic` 在 Chromium / Webkit 上不可解码 → 统一换 `.jpeg` 保证浏览器显示。
+
+    只动 path 段（`?` 前）的 `.heic` 后缀，query 参数里的 `.heic` 是签名/参数值
+    不应误伤。
+    """
+    if not url:
+        return url
+    if "?" in url:
+        path, query = url.split("?", 1)
+    else:
+        path, query = url, ""
+    path = re.sub(r"\.heic\b", ".jpeg", path, flags=re.IGNORECASE)
+    return f"{path}?{query}" if query else path
 
 
 def _parse_aweme_common(aw: dict, fallback_id: str, source: str) -> Optional[dict]:

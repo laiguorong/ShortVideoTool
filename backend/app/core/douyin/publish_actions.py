@@ -811,16 +811,14 @@ def sync_publish_video(
 
     account_dir.mkdir(parents=True, exist_ok=True)
 
-    # 解析 headless
+    # 解析 headless：完全尊重系统配置 browser_show_window。
+    # 之前 risk_wait_seconds > 0 时强制 headed 覆盖了用户配置，与「跟系统配置」原则冲突；
+    # 用户选择「A. 完全尊重 setting」，风控期弹窗不可见由用户自行权衡（失败可手动重试）。
     if headless is None:
         try:
             headless = not load_settings().get("browser_show_window", False)
         except Exception:
             headless = True
-    # #E2E：风险等待 > 0 时强制 headed（用户必须能看到验证弹窗）
-    if risk_wait_seconds > 0:
-        headless = False
-        logger.info("[publish] 启用 headed 浏览器（risk_wait_seconds={}）", risk_wait_seconds)
 
     if reuse_browser_actor:
         return _publish_via_browser_actor(
@@ -896,7 +894,8 @@ def _publish_via_browser_actor(
     def _actions(page):
         """browser_actor.run 的 actions 回调：完整发布流程。"""
         try:
-            page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60000)
+            # load 比 domcontentloaded 慢 2-5s；60s 充裕覆盖发布页重资源（上传组件 + 富文本 + 草稿）。
+page.goto(UPLOAD_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(4000)
             safe_screenshot(page, "step2_enter_upload", account_dir)
 
@@ -1084,7 +1083,8 @@ def _publish_via_independent_browser(
 
     def _actions(page):
         try:
-            page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60000)
+            # load 比 domcontentloaded 慢 2-5s；60s 充裕覆盖发布页重资源（上传组件 + 富文本 + 草稿）。
+page.goto(UPLOAD_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(4000)
             safe_screenshot(page, "step2_enter_upload", account_dir)
             dismiss_unfinished_banner(page, account_dir)

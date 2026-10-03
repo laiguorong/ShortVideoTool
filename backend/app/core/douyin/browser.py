@@ -25,9 +25,10 @@ from typing import Callable, Optional
 from loguru import logger
 
 # 反自动化注入脚本（页面加载前注入，清 webdriver / chrome runtime / languages / plugins）
-# #140：顺带注入固定顶部警示条（headed 用户可见，headless 无害），MutationObserver 保活防 SPA 重渲染清掉
+# #140：顺带注入顶部警示条（headed 用户可见，headless 无害），MutationObserver 保活防 SPA 重渲染清掉
 # #451：抖音 2025+ 指纹检测升级，需同时覆盖 webdriver / cdc_ / chrome.runtime / WebGL vendor
-_ANTI_BOT_INIT_SCRIPT = (
+# 警示条位置可配置（top/center/bottom），默认 top（顶部）。由 _make_anti_bot_init_script 函数按需生成。
+_ANTI_BOT_BASE = (
     # 1. navigator.webdriver = false（覆盖 Playwright 默认 true）
     "Object.defineProperty(navigator, 'webdriver', {get: () => false});"
     "delete Navigator.prototype.webdriver;"
@@ -98,17 +99,32 @@ _ANTI_BOT_INIT_SCRIPT = (
     "if (p && p.name === 'notifications') return Promise.resolve({state: Notification.permission});"
     "return _q.call(navigator.permissions, p);"
     "}; }"
-    # 8. 顶部警示条（保留 #140）
+)
+
+# 警示条 CSS（按 position 切：top/center/bottom）
+# - top：粘顶，下方圆角（贴合屏幕顶部边缘）
+# - center：屏幕中央，全圆角（浮层样式）
+# - bottom：粘底，上方圆角（贴合屏幕底部边缘）
+_BANNER_CSS = {
+    "top": "top:0;left:50%;transform:translateX(-50%);"
+           "border-top:none;border-radius:0 0 8px 8px;",
+    "center": "top:50%;left:50%;transform:translate(-50%,-50%);"
+              "border-radius:8px;",
+    "bottom": "bottom:0;left:50%;transform:translateX(-50%);"
+              "border-bottom:none;border-radius:8px 8px 0 0;",
+}
+
+# 警示条 JS 模板（{css} 由 _make_anti_bot_init_script 按 position 填充）
+_BANNER_JS_TEMPLATE = (
     "(function(){"
     "var T='⚠ 请不要手动关闭本窗口，系统处理完会自动关闭！';"
     "function up(){var b=document.body;if(!b)return;"
     "var e=document.getElementById('__tw');"
     "if(!e){e=document.createElement('div');e.id='__tw';"
-    "e.style.cssText='position:fixed;top:0;left:50%;transform:translateX(-50%);"
-    "width:fit-content;max-width:100vw;height:48px;line-height:48px;"
+    "e.style.cssText='position:fixed;{css}width:fit-content;max-width:100vw;height:48px;line-height:48px;"
     "font:16px/48px sans-serif;padding:0 24px;box-sizing:border-box;"
-    "background:#fef3c7;color:#92400e;border:1px solid #f59e0b;border-top:none;"
-    "border-radius:0 0 8px 8px;white-space:nowrap;z-index:100;"
+    "background:#fef3c7;color:#92400e;border:1px solid #f59e0b;"
+    "white-space:nowrap;z-index:100;"
     "pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.12)';"
     "e.textContent=T;}"
     "if(b.firstChild!==e)b.insertBefore(e,b.firstChild);}"
@@ -116,6 +132,26 @@ _ANTI_BOT_INIT_SCRIPT = (
     "new MutationObserver(up).observe(document.documentElement,{childList:true,subtree:false});"
     "})();"
 )
+
+
+def _make_anti_bot_init_script(position: str = "top") -> str:
+    """构造反自动化 + 警示条 init script。
+
+    参数:
+        position: 警示条位置。'top'（顶部，默认）/ 'center'（中央）/ 'bottom'（底部）。
+                 未知值 fallback 到 'top'。
+    返回:
+        拼接好的 JS 字符串，可直接传给 page.add_init_script()。
+    """
+    css = _BANNER_CSS.get(position, _BANNER_CSS["top"])
+    banner_js = _BANNER_JS_TEMPLATE.replace("{css}", css)
+    return _ANTI_BOT_BASE + banner_js
+
+
+# 默认 top 位置（向后兼容旧调用：page.add_init_script(_ANTI_BOT_INIT_SCRIPT)）
+# 7 处历史调用 + publish_actions.py 都引用 _ANTI_BOT_INIT_SCRIPT。
+# 需其他位置用 _make_anti_bot_init_script("center") / "bottom" 工厂函数。
+_ANTI_BOT_INIT_SCRIPT = _make_anti_bot_init_script("top")
 
 # 浏览器通用 UA（与登录窗抓会话时的 UA 保持一致，降低风控）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -499,7 +535,7 @@ class BrowserActor:
                         pass
                 page.on("response", _on_response)
 
-                page.goto(url, timeout=timeout_ms, referer=referer, wait_until="domcontentloaded")
+                page.goto(url, timeout=timeout_ms, referer=referer, wait_until="load")
                 page.wait_for_timeout(2000)
                 if actions:
                     actions(page)
@@ -558,7 +594,7 @@ class BrowserActor:
                     pass
             page.on("response", _on_response)
 
-            page.goto(url, timeout=timeout_ms, referer=referer, wait_until="domcontentloaded")
+            page.goto(url, timeout=timeout_ms, referer=referer, wait_until="load")
             page.wait_for_timeout(2000)  # 等 XHR 首屏发出
             if actions:
                 actions(page)
@@ -663,7 +699,7 @@ class BrowserActor:
             logger.info("[浏览器] 打开登录窗（headless={}, timeout={}s, profile={}）：{}",
                         headless, timeout_s, user_data_dir.name, url)
             try:
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.goto(url, timeout=40000, wait_until="load")
             except Exception as exc:
                 logger.warning("[浏览器] 登录页初始导航异常（可能需用户手动操作）: {}", exc)
 
@@ -689,7 +725,7 @@ class BrowserActor:
                 if home_url not in current_url:
                     logger.info("[浏览器] 登录成功后停在 {}，主动跳 home 拿 profile", current_url)
                     try:
-                        page.goto(home_url, timeout=15000, wait_until="domcontentloaded")
+                        page.goto(home_url, timeout=25000, wait_until="load")
                     except Exception as exc:
                         logger.warning("[浏览器] 主动跳 home 失败: {}", exc)
                         continue
@@ -728,7 +764,7 @@ class BrowserActor:
                         # 不在 home → 立即强制跳（避免反复跳转残留）
                         logger.info("[浏览器] 监测到跳转 {}，强制回 home 拿 profile", cur)
                         try:
-                            page.goto(home_url, timeout=10000, wait_until="domcontentloaded")
+                            page.goto(home_url, timeout=20000, wait_until="load")
                         except Exception as exc:
                             logger.warning("[浏览器] 强制跳 home 失败: {}", exc)
                         home_stable_ticks = 0
@@ -737,7 +773,7 @@ class BrowserActor:
                 if home_url not in page.url:
                     logger.warning("[浏览器] 15s 内未稳定在 home，最后一次强制")
                     try:
-                        page.goto(home_url, timeout=15000, wait_until="domcontentloaded")
+                        page.goto(home_url, timeout=25000, wait_until="load")
                     except Exception as exc:
                         logger.warning("[浏览器] 最终强制跳 home 失败: {}", exc)
 
@@ -1011,7 +1047,7 @@ class BrowserSession:
     def _initial_goto(self) -> None:
         """首次 goto（持父级 _run_lock 调用一次，避免与 run() 并发）。"""
         self._page.goto(self._goto_url, timeout=self._timeout_ms,
-                        referer=self._referer, wait_until="domcontentloaded")
+                        referer=self._referer, wait_until="load")
         # 等首屏 XHR 发完（拦截器才能注册）
         self._page.wait_for_timeout(2000)
 

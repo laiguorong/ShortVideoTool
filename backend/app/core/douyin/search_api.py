@@ -48,6 +48,45 @@ class SearchBlockedError(Exception):
     """搜索接口被风控拦截（浏览器拦截或 status_code!=0）。"""
 
 
+def _is_browser_closed_err(e: Exception) -> bool:
+    """检测异常是否源于浏览器被关闭（TargetClosedError / "closed" 消息）。
+
+    #fix-browser-closed-stop：调用方据此判断是否中断后续流程（抛 SearchBlockedError）
+    还是按普通 UI 失败降级（warning + 继续）。浏览器关闭时降级继续会触发连串抛错，
+    应尽早中断让上层捕获并清理 ctx/pw_cm。
+    """
+    msg = str(e) or ""
+    if "closed" in msg.lower():
+        return True
+    name = type(e).__name__
+    return "TargetClosedError" in name or "BrowserClosed" in name
+
+
+def _raise_if_browser_closed(e: Exception, where: str) -> None:
+    """检测到浏览器关闭：抛 SearchBlockedError 中断后续（不让兜底继续）。
+
+    #fix-browser-closed-stop：调用方 try/except 内先调用本 helper，
+    #若不是浏览器关闭则 silent return 让原 swallow 逻辑（warning + 继续）执行。
+    """
+    if _is_browser_closed_err(e):
+        raise SearchBlockedError(
+            f"浏览器已关闭（{where}）：{e}"
+        ) from e
+
+
+def _safe_wait_or_raise(page, ms: int, where: str) -> None:
+    """wait_for_timeout 安全封装：浏览器关闭 → 抛错中断，其他异常 → swallow 静默。
+
+    #fix-browser-closed-stop：统一 5 处 wait_for_timeout swallow 块的样板代码。
+    调用方拿到 None 即「已完成或已被 swallow」，无需再处理。
+    """
+    try:
+        page.wait_for_timeout(ms)
+    except Exception as e:
+        _raise_if_browser_closed(e, where)
+        # 非 closed 异常 swallow：旧路径 swallow + 继续（不再刷 warning）
+
+
 _SEARCH_URL = "https://www.douyin.com/aweme/v1/web/search/item/"
 
 
@@ -92,7 +131,7 @@ class BrowserSearchSession:
         if self._page is not None:
             return
         from playwright.sync_api import sync_playwright
-        from app.core.douyin.browser import UA, browser_actor
+        from app.core.douyin.browser import UA, browser_actor, _make_anti_bot_init_script
         # #P0-11：BrowserActor detail path 在同线程持有 sync_playwright runtime，
         # dispatcher loop 持续 running（_tls.playwright 不关）→ 当前线程
         # asyncio.get_running_loop() 返回 is_running=True 的 loop。
@@ -128,6 +167,8 @@ class BrowserSearchSession:
             ],
         )
         self._page = self._ctx.new_page()
+        # 搜索浏览器警示条位置默认 center（中央浮层，不挡搜索框/筛选面板）
+        self._page.add_init_script(_make_anti_bot_init_script("center"))
         # 一次性注册监听器（避免多次 on() 累积导致重复 append 错位）
         self._page.on("response", self._on_response)
         # 2026-09-30 v2：导航到抖音首页（建立登录态 + 搜索框 DOM），
@@ -135,7 +176,7 @@ class BrowserSearchSession:
         # 直跳 search/<keyword> 会被风控识别为爬虫（缺 keyboard event 指纹）。
         try:
             self._page.goto(
-                "https://www.douyin.com/", wait_until="domcontentloaded", timeout=30_000,
+                "https://www.douyin.com/", wait_until="load", timeout=40_000,
             )
             logger.debug(
                 "[搜索] 已加载抖音首页 url={}", self._page.url,
@@ -321,10 +362,17 @@ class BrowserSearchSession:
                 _time, start_count,
             )
         except Exception as e:
-            logger.warning(
-                "[搜索翻页] 翻页异常退出 pages={} err={}（返回已捕获部分结果）",
-                len(self._captured) - start_count, str(e)[:120],
-            )
+            err_msg = str(e)[:120]
+            # #fix-browser-closed：浏览器被用户手动关闭时降级为 INFO，不刷 WARNING 噪音
+            if "closed" in err_msg.lower():
+                logger.info(
+                    "[搜索翻页] 浏览器已关闭 pages={}（返回已捕获部分结果）",
+                    len(self._captured) - start_count)
+            else:
+                logger.warning(
+                    "[搜索翻页] 翻页异常退出 pages={} err={}（返回已捕获部分结果）",
+                    len(self._captured) - start_count, err_msg,
+                )
             return len(self._captured) - start_count
 
 
@@ -465,6 +513,12 @@ class BrowserSearchSession:
         try:
             return self._apply_filters_inner(page, conditions, debug=debug)
         except Exception as e:
+            # #fix-browser-closed-stop：浏览器已关闭 → 抛错中断，不再降级继续。
+            # 否则后续 _poll_captured_until / _scroll_until 全部抛 Page closed 噪音。
+            if _is_browser_closed_err(e):
+                raise SearchBlockedError(
+                    f"浏览器已关闭（筛选中断）：{e}"
+                ) from e
             logger.warning("[筛选] 面板操作意外异常：{}（按无筛选拉取）", e)
             return False
 
@@ -489,20 +543,21 @@ class BrowserSearchSession:
         try:
             btn.hover()
         except Exception as e:
+            # #fix-browser-closed-stop：浏览器关闭时中断，不再走「按无筛选拉取」
+            _raise_if_browser_closed(e, "筛选按钮 hover")
             logger.info("[筛选] 筛选按钮 hover 失败 {}（按无筛选拉取）", e)
             return False
         # 2. 等面板容器出现
         try:
             page.wait_for_selector(self._FILTER_PANEL_SELECTOR, timeout=3_000)
-        except Exception:
+        except Exception as e:
+            # 区分浏览器关闭（中断）和"找不到面板"（降级继续）
+            _raise_if_browser_closed(e, "等筛选面板")
             logger.info("[筛选] hover 后筛选面板未弹出（按无筛选拉取）")
             return False
         # 防御：wait_for_timeout 在 page 异常断开时会抛 Error: Page closed，
         # 包 try/except 后继续后续步骤（按部分生效拉取），不让单点故障阻断整个筛选。
-        try:
-            page.wait_for_timeout(500)
-        except Exception as e:
-            logger.info("[筛选] 面板稳定等待异常：{}（继续点选项）", e)
+        _safe_wait_or_raise(page, 500, "面板稳定等待")
         # 收集每步结果
         steps: list[tuple[str, bool]] = []
         # 3. 排序依据（0=综合 / 1=最多点赞 / 2=最新发布，默认 2）
@@ -523,6 +578,13 @@ class BrowserSearchSession:
         ]
         hit = self._click_filter_option(page, sort_sels, f"排序={sort_text}", debug=debug)
         steps.append((f"排序={sort_text}", hit))
+        # #fix-filter-interval：每对相邻筛选间固定停顿 2s。
+        # 用户反馈：抖音 UI 切换有延迟，相邻两项间隔过短会丢点击；
+        # 固定 2s 间隔让 React 状态稳定 / DOM 选中态 class 完全渲染。
+        # 注意：v5 wheel 路径下筛选切换不重发 XHR（XHR 只在首次 search + wheel 触发），
+        # 此处 2s 不是等 XHR，是给 React 状态稳定的固定节奏。
+        # 4 项 3 个间隔，共约 6s 等待（点击 + 2s × 3）。
+        _safe_wait_or_raise(page, 2000, "筛选间隔1")
         # 4. 发布时间
         pr = conditions.get("publish_range") or "any"
         text = self._PUBLISH_RANGE_TEXT.get(pr, "不限")
@@ -531,6 +593,7 @@ class BrowserSearchSession:
         ]
         hit = self._click_filter_option(page, range_sels, f"发布时间={text}", debug=debug)
         steps.append((f"发布时间={text}", hit))
+        _safe_wait_or_raise(page, 2000, "筛选间隔2")
         # 5. 视频时长
         dr = conditions.get("duration_range") or "any"
         dur_text = self._DURATION_TEXT.get(dr, "不限")
@@ -539,15 +602,17 @@ class BrowserSearchSession:
         ]
         hit = self._click_filter_option(page, dur_sels, f"视频时长={dur_text}", debug=debug)
         steps.append((f"视频时长={dur_text}", hit))
+        _safe_wait_or_raise(page, 2000, "筛选间隔3")
         # 6. 内容形式 = 视频（精确匹配字面量，避免命中含「视」字选项如「图文/视频」）
         hit = self._click_filter_option(page, self._CONTENT_VIDEO_SELECTORS, "内容形式=视频", debug=debug)
         steps.append(("内容形式=视频", hit))
         # 7. 把鼠标移开收起面板（不影响后续搜索结果滚动）
         try:
             page.mouse.move(700, 500)
-            page.wait_for_timeout(300)
-        except Exception:
-            pass
+        except Exception as e:
+            _raise_if_browser_closed(e, "mouse.move 收起面板")
+            logger.info("[筛选] 鼠标移开失败 {}（不影响后续）", e)
+        _safe_wait_or_raise(page, 300, "收起面板")
         # 一次性汇总
         parts = []
         for name, ok in steps:
@@ -608,11 +673,16 @@ class BrowserSearchSession:
                         if ok:
                             page.wait_for_timeout(settle_ms)
                             return True
-                    except Exception:
+                    except Exception as e:
+                        # #fix-browser-closed-stop：浏览器关闭中断，不再 swallow 继续
+                        _raise_if_browser_closed(e, f"等选中态[{desc}]")
                         continue
                 page.wait_for_timeout(100)
-        except Exception:
-            pass
+        except SearchBlockedError:
+            # 内层 _raise_if_browser_closed 已转 SearchBlockedError，原样透传不包装（避免丢异常链）
+            raise
+        except Exception as e:
+            _raise_if_browser_closed(e, f"等选中态[{desc}]")
         return False
 
     def search_all_for_ids(
@@ -762,16 +832,57 @@ class BrowserSearchSession:
         logger.debug(
             "[搜索] 已定位搜索框 selector={}", used_selector,
         )
+        # #fix-search-dom-wait：显式等搜索框 DOM 渲染完成（state=visible），
+        # 给到最长 5s 停顿。命中即停，正常 1-3s（首页 hydration 时间）。
+        # 解决「页面没加载完就 type 导致关键词被 React state 初始化覆盖丢失」。
+        # 浏览器关闭时中断而非 fallback 继续。
+        try:
+            page.wait_for_selector(
+                used_selector,
+                state="visible",
+                timeout=5_000,
+            )
+        except Exception as e:
+            _raise_if_browser_closed(e, "等搜索框 DOM")
+            # 找不到：仅在 warning 留痕，继续走下面逻辑（selector 链可能误判可见性）
+            logger.warning("[搜索] wait_for_selector 搜索框超时（5s），按 fallback 继续")
         # 真实 mouse 序列：move → click（触发 focus + mousedown + mouseup + click）
-        page.mouse.move(cx, cy)
-        page.mouse.click(cx, cy)
-        page.wait_for_timeout(500)
-        # 真实键盘输入：每个字符派发 keydown/keypress/keyup/input 事件
-        page.keyboard.type(keyword, delay=80)
-        page.wait_for_timeout(500)
-        # 真实键盘 Enter（触发 form submit / keyboard event 链）
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(1500)
+        # #fix-browser-closed-stop：DOM 等到后、click 前用户关浏览器 → Page closed，
+        # 必须经 closed 检测链转 SearchBlockedError 中断。
+        try:
+            page.mouse.move(cx, cy)
+            page.mouse.click(cx, cy)
+        except Exception as e:
+            _raise_if_browser_closed(e, "点击搜索框")
+            raise SearchBlockedError(f"点击搜索框失败：{e}") from e
+        # #fix-search-typing：等搜索框获得焦点（页面可能未加载完，500ms 硬等不够）。
+        # React 受控 input 在 hydration 完成前，type 进 DOM 的字符会被 React state 初始化覆盖丢失。
+        # 等 activeElement === 搜索框 + 额外 200ms 让 React 接管 onChange 后再输入。
+        try:
+            page.wait_for_function(
+                "(sel) => document.activeElement && document.activeElement.matches(sel)",
+                arg=used_selector, timeout=5000,
+            )
+            _safe_wait_or_raise(page, 200, "focus 后等 React 接管")
+        except Exception as e:
+            # #fix-browser-closed-stop：浏览器关闭时中断（不要兜底继续输入）
+            _raise_if_browser_closed(e, "等搜索框 focus")
+            # 兜底：等不到 focus 仍按旧路径走（不要因等待失败中断搜索）
+            logger.warning("[搜索] 等搜索框 focus 超时（5s），按 fallback 继续")
+            _safe_wait_or_raise(page, 500, "focus 兜底等待")
+        # #fix-browser-closed-stop：type/Enter/wait_for_timeout 全阶段补 closed 检测。
+        # 用户在 type 进行中关浏览器 → keyboard.type 抛 closed 时也要中断，
+        # 不应再走 swallow / outer fallback 继续输入。
+        try:
+            # 真实键盘输入：每个字符派发 keydown/keypress/keyup/input 事件
+            page.keyboard.type(keyword, delay=80)
+            _safe_wait_or_raise(page, 500, "type 后等待")
+            # 真实键盘 Enter（触发 form submit / keyboard event 链）
+            page.keyboard.press("Enter")
+            _safe_wait_or_raise(page, 1500, "Enter 后等待")
+        except Exception as e:
+            _raise_if_browser_closed(e, "输入阶段")
+            raise SearchBlockedError(f"输入阶段失败：{e}") from e
         # A4: 「已发起搜索」改 DEBUG。「启动浏览器」INFO 已覆盖关键事件，
         # 用户视角从 material_service 的 progress「搜索阶段：翻页采集中...」
         # 感知搜索在跑，此条仅留 trace 供排障。
