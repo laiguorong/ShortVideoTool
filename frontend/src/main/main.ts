@@ -124,14 +124,8 @@ function getDevBackendDir(): string {
 function getBundledBackendBinary(): string | null {
   if (isDev) return null
   const exeName = os.platform() === 'win32' ? 'shortvideo-backend.exe' : 'shortvideo-backend'
-  // 兼容两种产物布局：
-  // - onefile（旧）：<resources>/backend/shortvideo-backend.exe
-  // - onedir（新）：<resources>/backend/shortvideo-backend/shortvideo-backend.exe + _internal/
-  const candidates = [
-    path.join(process.resourcesPath, 'backend', exeName),
-    path.join(process.resourcesPath, 'backend', 'shortvideo-backend', exeName),
-  ]
-  return candidates.find((p) => fs.existsSync(p)) ?? null
+  const candidate = path.join(process.resourcesPath, 'backend', exeName)
+  return fs.existsSync(candidate) ? candidate : null
 }
 
 /** 探活：端口上是否已有本工具后端在跑（health 接口可达即复用） */
@@ -205,7 +199,7 @@ async function startBackend(dataDir: string | null = null) {
     // #382：stdio 改为 'pipe' 以捕获 stderr，弹窗可展示真实失败原因
     const dataDirArg = dataDir ? ['--data-dir', dataDir] : []
     // 指向 extraResources 拷入的 chromium 目录，避免走默认 %LOCALAPPDATA%\ms-playwright
-    const msPlaywrightPath = path.join(path.dirname(bundled), 'ms-playwright')
+    const msPlaywrightPath = path.join(path.dirname(bundled), 'assets', 'ms-playwright')
     logDev(`[Main] 启动内置后端: ${bundled} --port ${BACKEND_PORT}${dataDir ? ` --data-dir ${dataDir}` : ''} (PLAYWRIGHT_BROWSERS_PATH=${msPlaywrightPath})`)
     backendProcess = spawn(
       bundled,
