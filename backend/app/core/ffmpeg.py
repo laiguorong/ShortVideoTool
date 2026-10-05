@@ -22,11 +22,16 @@ from loguru import logger
 
 
 def _find_tool(name: str) -> str:
-    """查找可执行工具：PyInstaller 临时目录 → exe 同目录 → backend/assets/ffmpeg → PATH。"""
+    """查找可执行工具（参考 ms-playwright 复制风格，ffmpeg 由 electron-builder extraResources 复制到 resources/backend/ffmpeg/）：
+    - 打包：_MEIPASS → exe 同目录 → exe 同目录/ffmpeg（extraResources）→ PATH
+    - 开发：脚本目录 → backend/assets/ffmpeg → PATH
+    """
     if getattr(sys, "frozen", False):
         candidates = [
             Path(sys._MEIPASS) / name,
             Path(sys.executable).parent / name,
+            # extraResources 复制目标：<install>/resources/backend/ffmpeg/
+            Path(sys.executable).parent / "ffmpeg" / name,
         ]
     else:
         candidates = [

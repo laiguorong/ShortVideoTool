@@ -67,13 +67,15 @@ def get_app_dir() -> Path:
 
 
 def init_app_dirs() -> Path:
-    """初始化应用目录：建 config/ 与 models/（幂等）。"""
+    """初始化应用目录：建 config/（幂等）+ 设全局 APP_DIR/APP_CONFIG_DIR/APP_MODELS_DIR 指向。
+
+    models/face/ 由 _download_face_model 按需创建（media_inspect.py）。
+    """
     global APP_DIR, APP_CONFIG_DIR, APP_MODELS_DIR
     APP_DIR = Path.cwd()
     APP_CONFIG_DIR = APP_DIR / "config"
     APP_MODELS_DIR = APP_DIR / "models"
     APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    (APP_MODELS_DIR / "face").mkdir(parents=True, exist_ok=True)
     return APP_DIR
 
 

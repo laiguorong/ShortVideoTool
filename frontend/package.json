@@ -62,6 +62,10 @@
       {
         "from": "../backend/assets/ms-playwright",
         "to": "backend/ms-playwright"
+      },
+      {
+        "from": "../backend/assets/ffmpeg",
+        "to": "backend/ffmpeg"
       }
     ],
     "win": {
