@@ -67,6 +67,34 @@ const hasSingleInstanceLock = app.requestSingleInstanceLock()
 let _logFilePath: string | null = null
 let _logFileDate = ''
 
+/** 匹配 ANSI 控制序列（CSI + OSC），顶层常量避免每次调用重新编译正则
+ * - CSI: ESC [ <params 0x30-0x3F> <intermediates 0x20-0x2F> <final 0x40-0x7E>
+ * - OSC: ESC ] <payload> BEL 或 ESC ] <payload> ESC \
+ *   payload 排除 BEL 与 ESC，匹配到终止符为止，避免吃后续内容 */
+const ANSI_RE = /\x1b\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g
+
+/** 剥离 ANSI 控制序列（CSI 颜色 + cursor 控制 + OSC 标题），文件日志保留纯文本 */
+function _stripAnsi(s: string): string {
+  return s.replace(ANSI_RE, '')
+}
+
+/** ISO 8601 本地时间 + 时区偏移：YYYY-MM-DDTHH:mm:ss.SSS+08:00。
+ * 用 getFullYear 等本地字段（不用 toISOString 避免拿到 UTC），与后端 loguru `{time}ZZ` 对齐。 */
+function _localIsoStamp(d: Date): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  const ss = String(d.getSeconds()).padStart(2, '0')
+  const ms = String(d.getMilliseconds()).padStart(3, '0')
+  const offsetMin = -d.getTimezoneOffset()
+  const sign = offsetMin >= 0 ? '+' : '-'
+  const abs = Math.abs(offsetMin)
+  const tzStr = `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`
+  return `${y}-${m}-${day}T${hh}:${mm}:${ss}.${ms}${tzStr}`
+}
+
 function _ensureLogFile(): string | null {
   // app 可能尚未 ready（被外部 require 时），延迟初始化
   if (!app.isReady()) return null
@@ -77,8 +105,8 @@ function _ensureLogFile(): string | null {
     const logDir = path.join(app.getPath('logs'), 'shortvideo-tool')
     fs.mkdirSync(logDir, { recursive: true })
     const file = path.join(logDir, `main-${ymd}.log`)
-    // 启动时追加一行分隔，方便 grep
-    fs.appendFileSync(file, `\n--- start ${now.toISOString()} (isDev=${isDev}) ---\n`, 'utf8')
+    // 启动时追加一行分隔，方便 grep；时间戳格式与 _writeLog 一致
+    fs.appendFileSync(file, `\n--- start ${_localIsoStamp(now)} (isDev=${isDev}) ---\n`, 'utf8')
     _logFilePath = file
     _logFileDate = ymd
     return file
@@ -89,7 +117,10 @@ function _ensureLogFile(): string | null {
 }
 
 function _writeLog(level: 'INFO' | 'WARN' | 'ERROR', message: string): void {
-  const line = `[${new Date().toISOString()}] [${level}] ${message}\n`
+  // 文件日志 strip ANSI + 折叠内部换行：保持每条日志一行，便于 grep/解析
+  // console 走 errorDev 原始 message（含 ANSI 与换行，dev 终端展示更直观）
+  const singleLine = _stripAnsi(message).replace(/[\r\n]+/g, ' ')
+  const line = `[${_localIsoStamp(new Date())}] [${level}] ${singleLine}\n`
   const file = _ensureLogFile()
   if (file) {
     try { fs.appendFileSync(file, line, 'utf8') } catch { /* 写失败不阻塞 */ }
@@ -173,10 +204,14 @@ async function startBackend(dataDir: string | null = null) {
   // Node.js 端按 UTF-8 解码会乱码。强制 PYTHONIOENCODING=utf-8 走 UTF-8 字节流，
   // Electron 主进程侧 .toString() 默认 UTF-8 解码正确。
   // PyInstaller 打包的 exe 同样识别此 env。
+  // 仅 Windows 平台需要强制：POSIX 下 Python 3.12 启动本就 UTF-8，加 '1' 无意义但可能影响 subprocess.Popen 默认编码语义。
+  const isWin = process.platform === 'win32'
+  // PEP 540 规定 PYTHONUTF8 值必须是字符串 '1'/'0'，数字会被 Python 静默忽略
+  const PYTHONUTF8_VALUE = '1'
   const backendEnv: NodeJS.ProcessEnv = {
     ...process.env,
     PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',  // #179：同时启用 UTF-8 mode（PEP 540），覆盖 open()/sys.stdout 默认编码
+    ...(isWin ? { PYTHONUTF8: PYTHONUTF8_VALUE } : {}),  // #179：PEP 540 UTF-8 mode，覆盖 open()/sys.stdout 默认编码
     SHORTVIDEO_TOOL_RUNTIME: '1',  // #data-dir-relaunch：标记 Electron 主进程 spawn 的后端，
     // 后端 _args 只在此标记为 1 时才信任 env 透传的 SHORTVIDEO_DATA_DIR（避免测试/CI 污染）
   }
@@ -207,6 +242,7 @@ async function startBackend(dataDir: string | null = null) {
       {
         cwd: path.dirname(bundled),
         stdio: ['ignore', 'pipe', 'pipe'],
+        // baseEnv 已含 PYTHONUTF8（仅 Windows，见 backendEnv 构造处），无需重复
         env: { ...baseEnv, PLAYWRIGHT_BROWSERS_PATH: msPlaywrightPath },
       },
     )
@@ -222,18 +258,30 @@ async function startBackend(dataDir: string | null = null) {
     )
   }
 
-  backendProcess.stdout?.on('data', (data) => logDev(`[Backend] ${data.toString().trim()}`))
+  backendProcess.stdout?.on('data', (data) => {
+    // 按 \n 拆：data 事件可能合并多条 stdout 行，保留中间换行会导致
+    // 写入日志文件时后续行变成裸 ANSI 序列（无 [Backend] 包装，文本编辑器渲染为方框）
+    // 只按 \n 拆（不用 /\r?\n/）：后端 _safe_stderr_sink 走 sys.stderr TextIOWrapper 写 \n，
+    // Python 默认 binary mode 不做 \n → \r\n 转译
+    for (const line of data.toString().split('\n')) {
+      if (line) logDev(`[Backend] ${line}`)
+    }
+  })
   // #382：stderr 累积到全局 buffer，启动失败弹窗展示（替换原 dev-only log）
   backendProcess.stderr?.on('data', (data) => {
     const text = data.toString()
-    backendStderrBytes += text.length
-    backendStderrBuffer.push(text)
+    // 剥 ANSI 后入 buffer，弹窗展示纯文本（避免 `[32m...[0m` 字面渲染）
+    const sanitized = _stripAnsi(text)
+    backendStderrBytes += sanitized.length
+    backendStderrBuffer.push(sanitized)
     // #109：原 join('').length 是 O(n²)；改按 totalBytes 判定，超过限制按 FIFO 丢弃。
     while (backendStderrBytes > STDERR_BUFFER_LIMIT && backendStderrBuffer.length > 0) {
       const dropped = backendStderrBuffer.shift()!
       backendStderrBytes -= dropped.length
     }
-    errorDev(`[Backend] ${text.trim()}`)
+    for (const line of sanitized.split('\n')) {
+      if (line) errorDev(`[Backend] ${line}`)
+    }
   })
   backendProcess.on('error', (error) => errorDev(`[Backend] 启动失败: ${error.message}`))
   backendProcess.on('close', (code) => {
@@ -469,8 +517,13 @@ async function handleBackendStartupFailure(): Promise<boolean> {
   errorDev(`[Main] 后端启动失败，stderr 最近 ${lastStderr.length} 字符：\n${lastStderr.slice(-4096)}`)
 
   // 检测是否是 ffmpeg/libx264 环境问题（#382：明确告知用户修复方式）
-  const stderrText = lastStderr.toLowerCase()
-  const isFfmpegMissing = stderrText.includes('未找到 ffmpeg') || stderrText.includes('libx264')
+  // 精确匹配后端 ffmpeg.py:303-338 三条 RuntimeError 短语，避免撞成功日志 `[启动检查] ffmpeg + libx264 实测通过`
+  // 不带 `[启动检查]` 前缀：Windows GBK pipe 场景下中文可能被乱码解出，单靠精确短语命中更稳
+  const stderrText = lastStderr
+  const isFfmpegMissing =
+    stderrText.includes('未找到 ffmpeg') ||
+    stderrText.includes('ffmpeg 无法执行') ||
+    stderrText.includes('不支持 libx264')
   let detail = '后端服务启动失败，请检查后端日志获取详情。'
   if (isFfmpegMissing) {
     detail =

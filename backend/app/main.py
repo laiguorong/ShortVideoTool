@@ -47,6 +47,21 @@ if getattr(sys, "frozen", False):
     import os
     os.chdir(Path(sys.executable).parent)
 
+# [乱码根因修复] PyInstaller bootloader（Windows）会强制把 sys.stdout/stderr 编码重置为 GetACP() = gbk/cp936，
+# 即使 env PYTHONUTF8=1 + PYTHONIOENCODING=utf-8 都传到了 utf8_mode 仍是 0。
+# 必须在写任何日志前 reconfigure，否则 logger sink 写出字节按 cp936 编码 → Node 端 UTF-8 解码乱码。
+if getattr(sys, "frozen", False):
+    try:
+        if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        # stdin 同处理：未来若加交互 CLI（如 input()）不会被 cp936 阻塞
+        if sys.stdin and hasattr(sys.stdin, 'reconfigure'):
+            sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:  # noqa: BLE001 reconfigure 失败不阻塞启动
+        pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -271,7 +286,7 @@ def _init_logger() -> None:
     # 任务 #73：自定义函数 sink 不会自动应用 colorize，需显式 colorize=True
     # （loguru 已在 format 阶段注入 ANSI 转义序列，Windows 已通过 os.system("") 开 VT）
     logger.add(_safe_stderr_sink, level="DEBUG", colorize=True, format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSSZZ}</green> | "
         "<level>{level: <8}</level> | "
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
         "<level>{message}</level>"

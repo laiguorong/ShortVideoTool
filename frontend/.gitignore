@@ -2,6 +2,8 @@ node_modules/
 dist/
 release/
 *.log
+# 根目录 stale 编译产物（vite 当前输出在 dist/main/main.js，根目录 main.js 不是构建产物）
+/main.js
 # ============ 调试残留 ============
 /publish_progress.png
 /task_queue_progress.png
