@@ -920,11 +920,51 @@ function ImportShareDialog({ open, onOpenChange, categories, defaultCategoryId, 
 
 
 
-/** 视频浮窗播放（点封面预览；文件经 /api/files/material/ 回源流式播放） */
-function VideoPlayDialog({ material, open, onOpenChange }: {
+/** 预览对话框通用 hook：管 list + current + index + prev/next + close。
+ *  - setCurrent 用 functional 形式避免闭包过期
+ *  - index = -1 时 prev/next 视为已弹窗失效（data 异常），关闭由调用方处理
+ *  - close 同时清 current + 子 Dialog 状态（move/delete）防残留
+ *  - prev/next 取 list 最新对象（不是 current 旧引用），保证 file_status/cover_url 实时同步
+ *  - onCleanup 在首次调用时闭包，传 setState 函数引用即可，无需 useCallback 包裹 */
+function usePlayNav<T extends { id: string }>(
+  list: T[],
+  current: T | null,
+  setCurrent: React.Dispatch<React.SetStateAction<T | null>>,
+  onCleanup: () => void,
+) {
+  const index = current ? list.findIndex((x) => x.id === current.id) : -1
+  const prev = () => setCurrent((cur) => {
+    const i = list.findIndex((x) => x.id === cur?.id)
+    return i > 0 ? list[i - 1] : cur
+  })
+  const next = () => setCurrent((cur) => {
+    const i = list.findIndex((x) => x.id === cur?.id)
+    return i >= 0 && i < list.length - 1 ? list[i + 1] : cur
+  })
+  const close = () => { setCurrent(null); onCleanup() }
+  return { index, hasPrev: index > 0, hasNext: index >= 0 && index < list.length - 1, prev, next, close }
+}
+
+/** 预览对话框宽度（video 16:9 横屏 / music 1:1 方形封面） */
+const PLAY_DIALOG_WIDTH = { video: 560, music: 460 }
+
+/** 视频浮窗播放（点封面预览；文件经 /api/files/material/ 回源流式播放）
+ *  工具栏：改分类 / 删除 / 上一个 / 下一个 — 在弹窗内直接操作 */
+function VideoPlayDialog({
+  material, list, index, hasPrev, hasNext, open, onOpenChange,
+  onChangeCategory, onDelete, onPrev, onNext,
+}: {
   material: Material | null
+  list: Material[]
+  index: number  // material 在 list 里的位置，-1 表示无效
+  hasPrev: boolean
+  hasNext: boolean
   open: boolean
   onOpenChange: (v: boolean) => void
+  onChangeCategory: () => void
+  onDelete: () => void
+  onPrev: () => void
+  onNext: () => void
 }) {
   const [src, setSrc] = useState('')
   useEffect(() => {
@@ -938,10 +978,28 @@ function VideoPlayDialog({ material, open, onOpenChange }: {
   }, [open, material?.file_path])
   if (!material) return null
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} title={material.title} width={520}>
+    <Dialog open={open} onOpenChange={onOpenChange} title={material.title} width={PLAY_DIALOG_WIDTH.video}
+      footer={
+        <div className="flex w-full items-center justify-between gap-2">
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={onChangeCategory}>改分类</Button>
+            <Button variant="outline" size="sm" className="!text-danger" onClick={onDelete}>删除</Button>
+          </div>
+          <div className="flex items-center gap-2">
+            {list.length > 1 && (
+              <span className="text-xs text-muted-foreground">
+                {index < 0 ? `? / ${list.length}` : `${index + 1} / ${list.length}`}
+              </span>
+            )}
+            <Button variant="outline" size="sm" disabled={!hasPrev} onClick={onPrev}>‹ 上一个</Button>
+            <Button variant="outline" size="sm" disabled={!hasNext} onClick={onNext}>下一个 ›</Button>
+          </div>
+        </div>
+      }
+    >
       {src ? (
         /* #fix-music-load：src 条件渲染避免空 src 误报；autoPlay 保留以符合 UX */
-        <video src={src} className="mx-auto max-h-[70vh] w-full rounded-md bg-black" controls autoPlay
+        <video src={src} className="mx-auto max-h-[60vh] w-full rounded-md bg-black" controls autoPlay
           onError={(e) => {
             const err = e.currentTarget.error
             const code = err?.code ?? -1
@@ -963,11 +1021,23 @@ function VideoPlayDialog({ material, open, onOpenChange }: {
   )
 }
 
-/** 音乐浮窗播放（点列表封面触发；文件经 /api/files/ 回源流式播放，#50） */
-function MusicPlayDialog({ material, open, onOpenChange }: {
+/** 音乐浮窗播放（点列表封面触发；文件经 /api/files/ 回源流式播放，#50）
+ *  工具栏：改分类 / 删除 / 上一个 / 下一个 */
+function MusicPlayDialog({
+  material, list, index, hasPrev, hasNext, open, onOpenChange,
+  onChangeCategory, onDelete, onPrev, onNext,
+}: {
   material: Material | null
+  list: Material[]
+  index: number
+  hasPrev: boolean
+  hasNext: boolean
   open: boolean
   onOpenChange: (v: boolean) => void
+  onChangeCategory: () => void
+  onDelete: () => void
+  onPrev: () => void
+  onNext: () => void
 }) {
   const [src, setSrc] = useState('')
   useEffect(() => {
@@ -981,15 +1051,11 @@ function MusicPlayDialog({ material, open, onOpenChange }: {
   }, [open, material?.file_path])
   if (!material) return null
   // HTMLMediaElement 错误码：1=ABORTED 2=NETWORK 3=DECODE 4=SRC_NOT_SUPPORTED
-  // 网络层错（2）→ 文件缺失 / 404；解码错（3 / 4）→ 文件格式不支持
   const handleError = (e: React.SyntheticEvent<HTMLAudioElement>) => {
     const err = e.currentTarget.error
     const code = err?.code ?? -1
     const codeMap: Record<number, string> = {
-      1: 'ABORTED',
-      2: 'NETWORK',
-      3: 'DECODE',
-      4: 'SRC_NOT_SUPPORTED',
+      1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED',
     }
     const reason = codeMap[code] || `未知(${code})`
     console.error('[音乐播放] 加载失败', {
@@ -1005,7 +1071,25 @@ function MusicPlayDialog({ material, open, onOpenChange }: {
     )
   }
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} title={material.title} width={420}>
+    <Dialog open={open} onOpenChange={onOpenChange} title={material.title} width={PLAY_DIALOG_WIDTH.music}
+      footer={
+        <div className="flex w-full items-center justify-between gap-2">
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={onChangeCategory}>改分类</Button>
+            <Button variant="outline" size="sm" className="!text-danger" onClick={onDelete}>删除</Button>
+          </div>
+          <div className="flex items-center gap-2">
+            {list.length > 1 && (
+              <span className="text-xs text-muted-foreground">
+                {index < 0 ? `? / ${list.length}` : `${index + 1} / ${list.length}`}
+              </span>
+            )}
+            <Button variant="outline" size="sm" disabled={!hasPrev} onClick={onPrev}>‹ 上一个</Button>
+            <Button variant="outline" size="sm" disabled={!hasNext} onClick={onNext}>下一个 ›</Button>
+          </div>
+        </div>
+      }
+    >
       <div className="flex flex-col items-center gap-4 py-2">
         {/* 大封面（无封面显示音符占位） */}
         {material.cover_url
@@ -1095,6 +1179,15 @@ export function MaterialsPage() {
   const [playTarget, setPlayTarget] = useState<Material | null>(null)
   // 音乐播放浮窗目标（点列表封面触发，#50）
   const [playMusicTarget, setPlayMusicTarget] = useState<Material | null>(null)
+
+  // 视频/音乐预览弹窗导航：list 用当前 data.list 实时算（与"当前页实际数量"同步），
+  // 不再锁定弹窗打开时的 list 快照——这样翻页/筛选/排序变化时 prev/next 总数立即更新。
+  const playNav = usePlayNav(data.list, playTarget, setPlayTarget, () => {
+    setMoveCatTarget(null); setDeleteTarget(null)
+  })
+  const playMusicNav = usePlayNav(data.list, playMusicTarget, setPlayMusicTarget, () => {
+    setMoveCatTarget(null); setDeleteTarget(null)
+  })
   const [deleteCatTarget, setDeleteCatTarget] = useState<TreeNode | null>(null)
   // 分类管理模式：树节点显示 修改/删除/上移/下移/左移/右移
   const [catManage, setCatManage] = useState(false)
@@ -1152,6 +1245,9 @@ export function MaterialsPage() {
         // 旧请求晚返回时丢弃，避免覆盖新筛选条件的结果
         if (reqId !== listReqId.current) return
         setData({ list: r.list, total: r.total })
+        // 兜底关闭孤儿预览弹窗：当前 playTarget 不在新列表里（被其他 tab/筛选/分页剔除）
+        if (playTarget && !r.list.some((m) => m.id === playTarget.id)) setPlayTarget(null)
+        if (playMusicTarget && !r.list.some((m) => m.id === playMusicTarget.id)) setPlayMusicTarget(null)
       })
       .catch((e) => {
         if (reqId !== listReqId.current) return
@@ -1431,7 +1527,9 @@ export function MaterialsPage() {
                 onClick={(e) => {
                   if (manageMode) return
                   e.stopPropagation()
-                  if (m.type === 'video' && m.file_status === 'normal') setPlayTarget(m)
+                  if (m.type === 'video' && m.file_status === 'normal') {
+                    setPlayTarget(m)
+                  }
                   else setDetailTarget(m)
                 }}>
                 <CoverImage material={m} className="h-full w-full rounded-md" />
@@ -1501,7 +1599,9 @@ export function MaterialsPage() {
                 onClick={(e) => {
                   if (manageMode) return
                   e.stopPropagation()
-                  if (m.file_status === 'normal') setPlayMusicTarget(m)
+                  if (m.file_status === 'normal') {
+                    setPlayMusicTarget(m)
+                  }
                   else setDetailTarget(m)
                 }}>
                 {m.cover_url
@@ -1547,12 +1647,51 @@ export function MaterialsPage() {
       </div>
       )}
 
-      {/* 视频浮窗播放 */}
-      <VideoPlayDialog material={playTarget} open={!!playTarget}
-        onOpenChange={(v) => !v && setPlayTarget(null)} />
-      {/* 音乐浮窗播放（#50） */}
-      <MusicPlayDialog material={playMusicTarget} open={!!playMusicTarget}
-        onOpenChange={(v) => !v && setPlayMusicTarget(null)} />
+      {/* 视频浮窗播放（带改分类/删除/上下一个工具栏） */}
+      <VideoPlayDialog
+        material={playTarget}
+        list={data.list}
+        index={playNav.index}
+        hasPrev={playNav.hasPrev}
+        hasNext={playNav.hasNext}
+        open={!!playTarget}
+        onOpenChange={(v) => { if (!v) playNav.close() }}
+        onChangeCategory={() => {
+          // 互斥：开改分类时清掉残留的 delete 状态，反之亦然
+          setDeleteTarget(null)
+          if (playTarget) setMoveCatTarget(playTarget)
+          else setMoveCatTarget(null)
+        }}
+        onDelete={() => {
+          setMoveCatTarget(null)
+          if (playTarget) setDeleteTarget(playTarget)
+          else setDeleteTarget(null)
+        }}
+        onPrev={playNav.prev}
+        onNext={playNav.next}
+      />
+      {/* 音乐浮窗播放（#50 + 工具栏） */}
+      <MusicPlayDialog
+        material={playMusicTarget}
+        list={data.list}
+        index={playMusicNav.index}
+        hasPrev={playMusicNav.hasPrev}
+        hasNext={playMusicNav.hasNext}
+        open={!!playMusicTarget}
+        onOpenChange={(v) => { if (!v) playMusicNav.close() }}
+        onChangeCategory={() => {
+          setDeleteTarget(null)
+          if (playMusicTarget) setMoveCatTarget(playMusicTarget)
+          else setMoveCatTarget(null)
+        }}
+        onDelete={() => {
+          setMoveCatTarget(null)
+          if (playMusicTarget) setDeleteTarget(playMusicTarget)
+          else setDeleteTarget(null)
+        }}
+        onPrev={playMusicNav.prev}
+        onNext={playMusicNav.next}
+      />
 
       <MaterialDetailDialog material={detailTarget} open={!!detailTarget}
         onOpenChange={(v) => !v && setDetailTarget(null)}
@@ -1572,9 +1711,15 @@ export function MaterialsPage() {
           await materialApi.update(moveCatTarget.id, { category_id: cid })
           toast('已移动', 'success')
           const catName = flattenTree(buildTree(categories)).find((f) => f.node.id === cid)?.node.name || ''
-          // 当前详情若为同一素材，同步分类显示
+          // 同步：详情弹窗 + 视频/音乐预览弹窗若指向同一素材，更新 category_id
           if (detailTarget?.id === moveCatTarget.id) {
-            setDetailTarget({ ...detailTarget, category_id: cid, category_name: catName })
+            setDetailTarget((cur) => cur ? { ...cur, category_id: cid, category_name: catName } : null)
+          }
+          if (playTarget?.id === moveCatTarget.id) {
+            setPlayTarget((cur) => cur ? { ...cur, category_id: cid, category_name: catName } : null)
+          }
+          if (playMusicTarget?.id === moveCatTarget.id) {
+            setPlayMusicTarget((cur) => cur ? { ...cur, category_id: cid, category_name: catName } : null)
           }
           loadMaterials()
           loadCategories()
@@ -1603,9 +1748,13 @@ export function MaterialsPage() {
         content={`确定删除素材「${deleteTarget?.title}」？被项目引用处将显示素材缺失。`}
         onConfirm={async () => {
           if (!deleteTarget) return
+          const deletedId = deleteTarget.id
           try {
-            await materialApi.remove(deleteTarget.id)
+            await materialApi.remove(deletedId)
             toast('已删除', 'success')
+            // 同步关闭对应的预览弹窗，避免 src 指向已删文件 404
+            if (playTarget?.id === deletedId) setPlayTarget(null)
+            if (playMusicTarget?.id === deletedId) setPlayMusicTarget(null)
             loadMaterials()
             loadCategories()
           } catch (e) { toast((e as Error).message, 'error') }
