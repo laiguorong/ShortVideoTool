@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useAppStore, type Page } from '@/store/useAppStore'
 import { settingApi, taskApi } from '@/api/setting'
+import { getBaseUrl } from '@/api/client'
 import { ToastContainer, toast } from '@/components/ui/toast'
 import { cn } from '@/lib/utils'
 import { DashboardPage } from '@/pages/DashboardPage'
@@ -12,6 +13,7 @@ import { CreationPage } from '@/pages/CreationPage'
 import { PublishPage } from '@/pages/PublishPage'
 import { RecordsPage } from '@/pages/RecordsPage'
 import { TasksPage } from '@/pages/TasksPage'
+import { StartupPage } from '@/pages/StartupPage'
 import { RiskNoticeDialog } from '@/components/shared/RiskNotice'
 
 /** 导航配置（界面交互设计 9.1.1） */
@@ -63,7 +65,8 @@ export function PlaceholderPage({ title }: { title: string }) {
 
 export default function App() {
   const { page, setPage, sidebarCollapsed, toggleSidebar, backendReady, setBackendReady,
-          unreadCount, taskSummary, setTaskSummary, setNotifications, riskConfirmed, setRiskConfirmed } =
+          unreadCount, taskSummary, setTaskSummary, setNotifications, riskConfirmed, setRiskConfirmed,
+          startupComplete, setStartupComplete } =
     useAppStore()
   const [healthLoading, setHealthLoading] = useState(true)
 
@@ -71,29 +74,55 @@ export default function App() {
   useEffect(() => {
     let timer: number | undefined
     let failCount = 0
+    let stopped = false
     const poll = async () => {
+      if (stopped) return
+      // 加 AbortController + 5s 超时，防止 fetch 在网络层无限 hang（之前不带超时，后端死锁时会卡住）
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), 5000)
       try {
-        await settingApi.riskConfirmed() // 任意接口即可探活
+        // 用专用 health 探活（不依赖 DB），避免在 startupComplete 前调业务接口触发 500
+        // 之前用 settingApi.riskConfirmed() 探活会在 DB 未 init 时抛 RuntimeError
+        await fetch(`${await getBaseUrl()}/health`, { signal: controller.signal })
         setBackendReady(true)
         setHealthLoading(false)
       } catch (e) {
         // #112：原 catch {} 静默，后端真挂时无限重试无任何线索；
-        // dev 输出错误便于排查；连续 10 次失败 toast 提示用户
+        // dev 输出错误便于排查；连续 10 次失败 toast 提示用户并停止轮询
         if (import.meta.env.DEV) console.warn('[App] 后端就绪轮询失败:', e)
         failCount += 1
         if (failCount === 10) {
-          toast('后端响应异常，请重启程序', 'error')
+          toast('后端响应异常', 'error', {
+            // 重试按钮：恢复轮询，让用户在不动 app 的前提下恢复
+            action: {
+              label: '重试',
+              onClick: () => {
+                stopped = false
+                failCount = 0
+                poll()
+              },
+            },
+            duration: Infinity,
+          })
+          stopped = true  // 停止轮询，等用户点重试
+          window.clearTimeout(timeoutId)
+          return
         }
         timer = window.setTimeout(poll, 1000)
+      } finally {
+        window.clearTimeout(timeoutId)
       }
     }
     poll()
-    return () => window.clearTimeout(timer)
+    return () => {
+      stopped = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [setBackendReady])
 
-  // 就绪后：轮询任务概览（5s）+ 通知未读数（30s）
+  // 后端就绪且 7 步启动检查完成后才轮询业务接口（避免启动页阶段无效请求）
   useEffect(() => {
-    if (!backendReady) return
+    if (!backendReady || !startupComplete) return
     const loadTasks = () => taskApi.summary().then(setTaskSummary).catch((e) => console.warn('[App] 请求失败:', e))
     const loadNotices = () =>
       settingApi
@@ -108,16 +137,16 @@ export default function App() {
       window.clearInterval(t1)
       window.clearInterval(t2)
     }
-  }, [backendReady, setTaskSummary, setNotifications])
+  }, [backendReady, startupComplete, setTaskSummary, setNotifications])
 
-  // 首次启动风险告知
+  // 首次启动风险告知（启动检查通过后再问）
   useEffect(() => {
-    if (!backendReady) return
+    if (!backendReady || !startupComplete) return
     settingApi
       .riskConfirmed()
       .then((r) => setRiskConfirmed(r.confirmed))
       .catch((e) => console.warn('[App] 请求失败:', e))
-  }, [backendReady, setRiskConfirmed])
+  }, [backendReady, startupComplete, setRiskConfirmed])
 
   if (healthLoading) {
     return (
@@ -126,6 +155,11 @@ export default function App() {
         <div className="text-sm text-muted-foreground">正在启动后端服务…</div>
       </div>
     )
+  }
+
+  // 后端存活但启动检查未完成 → 显示 7 步检查页
+  if (!startupComplete) {
+    return <StartupPage onComplete={() => setStartupComplete(true)} />
   }
 
   return (

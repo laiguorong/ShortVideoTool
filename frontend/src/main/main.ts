@@ -513,32 +513,7 @@ async function handleBackendStartupFailure(): Promise<boolean> {
   await new Promise((r) => setTimeout(r, 200))
   const lastStderr = backendStderrBuffer.join('')
 
-  // #110：完整 stderr 写错误日志文件，便于用户反馈时附日志
-  errorDev(`[Main] 后端启动失败，stderr 最近 ${lastStderr.length} 字符：\n${lastStderr.slice(-4096)}`)
-
-  // 检测是否是 ffmpeg/libx264 环境问题（#382：明确告知用户修复方式）
-  // 精确匹配后端 ffmpeg.py:303-338 三条 RuntimeError 短语，避免撞成功日志 `[启动检查] ffmpeg + libx264 实测通过`
-  // 不带 `[启动检查]` 前缀：Windows GBK pipe 场景下中文可能被乱码解出，单靠精确短语命中更稳
-  const stderrText = lastStderr
-  const isFfmpegMissing =
-    stderrText.includes('未找到 ffmpeg') ||
-    stderrText.includes('ffmpeg 无法执行') ||
-    stderrText.includes('不支持 libx264')
-  let detail = '后端服务启动失败，请检查后端日志获取详情。'
-  if (isFfmpegMissing) {
-    detail =
-      '本工具依赖 ffmpeg + libx264 编码器。\n\n' +
-      '检测到环境不满足：\n' +
-      '• ffmpeg 可执行文件缺失\n' +
-      '• 或 ffmpeg 不支持 libx264 编码器\n\n' +
-      '请按以下步骤修复：\n' +
-      '1. 确认 backend/assets/ffmpeg/ffmpeg.exe 存在\n' +
-      '2. 确认 ffmpeg 是带 libx264 的版本（运行 ffmpeg -encoders | grep libx264）\n' +
-      '3. 如缺失 libx264，请重新安装 FFmpeg 或单独编译 libx264\n\n' +
-      '修复后重新启动本程序。'
-  }
-
-  // 写独立启动错误文件（含 stderr 全量 + 关键 env + 进程状态），便于用户反馈问题
+  // 写启动错误日志（含 stderr 全量 + 关键 env + 进程状态），便于用户反馈问题
   const errorLogPath = await writeStartupErrorLog('后端启动失败', {
     isDev,
     env: {
@@ -558,54 +533,44 @@ async function handleBackendStartupFailure(): Promise<boolean> {
     stderr_total: lastStderr,
     stderr_tail: lastStderr.slice(-800),
   })
+  errorDev(`[Main] 后端启动失败，stderr 最近 ${lastStderr.length} 字符：\n${lastStderr.slice(-4096)}`)
 
-  // 错误框 detail 末尾追加日志路径（不论写成功与否都引导用户去 logs 目录）
+  // 错误框 detail 末尾追加日志路径
   const logHint = errorLogPath
     ? `\n\n详细信息已写入日志：\n${errorLogPath}`
     : `\n\n详细信息请查看主进程日志：\n${path.join(app.getPath('logs'), 'shortvideo-tool', 'main-*.log')}`
 
-  // #data-dir-relaunch：错误框加重试按钮——首次启动 on_startup 含 2 个 ffmpeg subprocess
-  // + 数据迁移，首次跑 10-20s 才监听端口，30s 超时仍可能不够；给用户一次"再等 30s"机会
+  // 启动页 (StartupPage) 会通过 /api/startup/check 给出结构化错误。
+  // 这里只负责让用户知道后端进程没起来 + 让出选择（退出）。
   const choice = await dialog.showMessageBox({
     type: 'error',
-    title: '启动失败',
+    title: '后端服务无法启动',
     message: '后端服务无法启动',
-    detail: detail + (lastStderr ? `\n\n后端输出：\n${lastStderr.slice(-800)}` : '') + logHint,
-    buttons: ['再等一会', '退出'],
+    detail:
+      '后端进程在 30 秒内未能响应健康检查。\n\n' +
+      '可能原因：端口被占用 / 后端进程启动失败 / 数据目录不可访问。\n\n' +
+      '详细诊断信息将通过启动页 7 步检查展示。' +
+      logHint,
+    buttons: ['继续启动（查看诊断）', '退出'],
     defaultId: 0,
     cancelId: 1,
     noLink: true,
   })
 
   if (choice.response === 0) {
-    // 再探活 30s（首次启动 ffmpeg 检查卡 ~20s 时给用户兜底）
-    logDev('[Main] 用户选择「再等一会」，重探活 30s')
-    if (await waitForBackendReady(30000)) {
-      logDev('[Main] 重探活成功，后端已就绪')
-      return true
-    }
-    logWarn('[Main] 重探活仍失败，弹窗用户选第二个「再等一会」可能无限循环，强制退出')
-    // 兜底：再弹一次（不再加重试按钮，避免死循环）
-    await dialog.showMessageBox({
-      type: 'error',
-      title: '启动失败',
-      message: '后端服务仍无法启动',
-      detail: '已等待超过 60 秒仍未就绪。\n请检查后端日志后重试。' + logHint,
-      buttons: ['确定'],
-      defaultId: 0,
-      noLink: true,
-    })
+    // 用户选"继续启动" → 不要杀后端，让 StartupPage 接管诊断
+    // 原因：杀后端后 7 步 check 第一步就 fail（init_data_dir / settings 都依赖后端活着），
+    //      用户只能重启，等于强制退出。保留后端让 StartupPage 跑出真实失败步骤的原因更友好。
+    logDev('[Main] 用户选择继续启动，启动页将展示诊断信息')
+    return true
   }
 
-  // 退出前：杀掉后端进程树 + 清端口（用户/模型加"进程还挂着 → 自动结束掉"）
-  // 旧版只 stopBackend（SIGTERM）+ app.quit，进程可能挂死留僵尸。
+  // 用户选"退出" → 杀进程 + 退
   isQuitting = true
   await forceKillBackend()
-  // 兜底等端口释放（forceKillBackend 内 taskkill 是 fire-and-forget，
-  // LISTENING 状态可能在进程退出后还有 100-200ms 残留）
   const portFree = await waitForPortFree(BACKEND_PORT, 3000)
   if (!portFree) {
-    logWarn(`[Main] forceKillBackend 后端口 ${BACKEND_PORT} 3s 仍未释放，可能有手动启的孤儿`)
+    logWarn(`[Main] forceKillBackend 后端口 ${BACKEND_PORT} 3s 仍未释放`)
   }
   app.quit()
   return false
@@ -927,16 +892,30 @@ if (!hasSingleInstanceLock) {
       app.exit(1)
       return
     }
-    await startBackend(dataDir)
-    // #382：等待后端就绪，10 秒内 health 不通则视为启动失败
-    const ready = await waitForBackendReady(30000)
-    if (!ready) {
-      errorDev('[Main] 后端启动超时，30s 内 health 未通，触发错误弹窗（带重试）')
+
+    // 先创建主窗口 — 启动页立即显示（"正在启动后端..."），不等后端
+    // Renderer 加载后 App.tsx health 探活每秒 1 次，后端起来后自动接续 6 步 check
+    // 后端启动失败时 Renderer 显示启动页 + 真实失败原因，比弹错误框友好
+    logDev('[Main] 创建主窗口（启动页先显示，后端后台启动）')
+    createWindow()
+
+    // 后台 spawn 后端 + 等 health 就绪（并行窗口显示，不阻塞 UI）
+    try {
+      await startBackend(dataDir)
+    } catch (e) {
+      errorDev('[Main] startBackend 抛错:', e)
+      // 与 waitForBackendReady 失败路径对称：走错误弹窗让用户选择
       const recovered = await handleBackendStartupFailure()
       if (!recovered) return
     }
-    // 后端就绪后创建主窗口（延迟 1.5s 让 health 完全稳定）
-    setTimeout(createWindow, 1500)
+    const ready = await waitForBackendReady(30000)
+    if (!ready) {
+      errorDev('[Main] 后端启动超时，30s 内 health 未通，触发错误弹窗')
+      // 用户选"继续启动"会保留后端，让启动页展示真实失败原因
+      const recovered = await handleBackendStartupFailure()
+      if (!recovered) return
+    }
+    logDev('[Main] 后端就绪，启动页将自动接续 6 步检查')
   })
 
   app.on('window-all-closed', () => {

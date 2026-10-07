@@ -7,7 +7,7 @@
  */
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { Button } from '@/components/ui/button'
-import { Dialog } from '@/components/ui/dialog'
+import { Dialog, ConfirmDialog } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toast'
 import { cn } from '@/lib/utils'
 import { selectionApi, type Shop } from '@/api/selection'
@@ -39,6 +39,8 @@ export function ProjectShopsDrawer({ project, open, onOpenChange }: Props) {
   const [busyId, setBusyId] = useState<string | null>(null)
   /** 全局操作锁（UI 渲染用）：网络慢时防止并发 add/remove 导致 sort_order 冲突 */
   const [busy, setBusy] = useState(false)
+  const [confirmRemoveLast, setConfirmRemoveLast] = useState(false)
+  const [pendingRemoveShopId, setPendingRemoveShopId] = useState<string | null>(null)
   /** ref 锁（同步访问）：state 异步更新，连点两次都会读到旧值导致锁失效 */
   const busyRef = useRef(false)
   /** 搜索请求序号：每次新搜索递增，旧请求晚返回时通过序号丢弃避免覆盖 */
@@ -198,12 +200,23 @@ export function ProjectShopsDrawer({ project, open, onOpenChange }: Props) {
     }
   })
 
-  /** 移除：弹 confirm 在 lock 外做（confirm 阻塞不应持有锁） */
+  /** 移除：弹 confirm 在 lock 外做（confirm 阻塞不应持有锁）
+   *  弹 confirm 时也设 busy 占位（防 confirm 期间用户连点别的"移除"按钮并发穿透） */
   const removeShop = (shopId: string) => {
     if (busyRef.current) return
     if (bound.length === 1) {
-      if (!window.confirm('当前项目仅剩最后 1 个门店绑定，移除后将无法发布，确认？')) return
+      // 弹 ConfirmDialog（避免最后 1 个门店被静默移除导致后续无法发布）
+      setBusyId(shopId)  // 占位 — confirm 关闭时（onConfirm 或 onOpenChange=false）会清
+      setPendingRemoveShopId(shopId)
+      setConfirmRemoveLast(true)
+      return
     }
+    doRemove(shopId)
+  }
+
+  /** 实际执行移除（被 removeShop / ConfirmDialog onConfirm 复用）
+   *  withLock + busy 守卫：先检查再 setBusy，避免与其它 in-flight 移除并发 */
+  const doRemove = (shopId: string) => {
     return withLock(async () => {
       if (!project) return
       setBusyId(shopId)
@@ -362,6 +375,23 @@ export function ProjectShopsDrawer({ project, open, onOpenChange }: Props) {
           </div>
         )}
       </div>
+
+      {/* 最后 1 个门店移除确认（避免静默移除导致后续无法发布）
+        - onOpenChange 关闭时清 pending ID（避免下次弹 confirm 看到 stale 值）
+        - onConfirm 真正执行前再做一次 bound.find 校验（防 bound 已被并发改动） */}
+      <ConfirmDialog
+        open={confirmRemoveLast}
+        onOpenChange={(v) => { setConfirmRemoveLast(v); if (!v) setPendingRemoveShopId(null) }}
+        title="移除最后 1 个门店" danger
+        content="当前项目仅剩最后 1 个门店绑定，移除后将无法发布，确认？"
+        onConfirm={() => {
+          const id = pendingRemoveShopId
+          setConfirmRemoveLast(false)
+          setPendingRemoveShopId(null)
+          // bound 已变（含并发删过）则跳过 — 用户看到 UI 与预期不符会重试
+          if (id && bound.some((x) => x.shop_id === id)) doRemove(id)
+          else toast('门店列表已变更，请刷新重试', 'info')
+        }} />
     </Dialog>
   )
 }

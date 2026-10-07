@@ -293,49 +293,11 @@ def extract_media_info(info: dict) -> dict:
     return out
 
 
-# ---------- h264 编码器检查（任务 #381：固定 libx264，启动期检查）----------
+# ---------- h264 编码器（启动期检查由 app.core.startup_checks.check_ffmpeg 处理）----------
 
-# 工具依赖 H.264 编码。默认使用 libx264，移除运行期降级逻辑。
-# 启动期通过 check_ffmpeg_env() 实测 libx264 可用，不可用直接抛 RuntimeError 中断应用。
+# 工具依赖 H.264 编码。固定 libx264，移除运行期降级逻辑。
+# 启动期实测逻辑已迁到 app.core.startup_checks.check_ffmpeg（返 CheckResult 不抛）。
 H264_ENCODER = "libx264"
-
-
-def check_ffmpeg_env() -> None:
-    """启动期检查：ffmpeg 可执行 + libx264 编码器可用（#381）。
-
-    不可用直接抛 RuntimeError，中断 FastAPI 启动。
-    调用方应在应用 on_startup 事件中调用，确保环境问题在用户操作前暴露。
-    """
-    import shutil
-    # 1. ffmpeg 可执行文件存在
-    if not shutil.which(FFMPEG) and not Path(FFMPEG).exists():
-        raise RuntimeError(
-            f"[启动检查] 未找到 ffmpeg 可执行文件：{FFMPEG}\n"
-            "请确认 backend/assets/ffmpeg/ffmpeg.exe 存在，或将 ffmpeg 加入 PATH。"
-        )
-
-    # 2. ffmpeg 能跑起来
-    ver = run_cmd([FFMPEG, "-hide_banner", "-version"], timeout=10)
-    if ver is None or ver.returncode != 0:
-        raise RuntimeError(
-            f"[启动检查] ffmpeg 无法执行（rc={ver.returncode if ver else 'None'}）\n"
-            "请检查 ffmpeg 二进制是否损坏或被杀毒软件拦截。"
-        )
-
-    # 3. libx264 编码器实测：5s 黑盒编一帧，rc=0 才算通过
-    test_cmd = [
-        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.04",
-        "-c:v", "libx264", "-frames:v", "1", "-f", "null", "-",
-    ]
-    test = run_cmd(test_cmd, timeout=10)
-    if test is None or test.returncode != 0:
-        raise RuntimeError(
-            "[启动检查] ffmpeg 不支持 libx264 编码器\n"
-            "本工具依赖 H.264 编码，请重新安装带 libx264 的 ffmpeg。"
-        )
-
-    logger.info("[启动检查] ffmpeg + libx264 实测通过")
 
 
 def get_h264_encoder() -> str:

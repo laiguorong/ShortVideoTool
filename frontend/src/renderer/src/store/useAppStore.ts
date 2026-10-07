@@ -84,6 +84,10 @@ interface AppState {
   /** 首次启动风险告知 */
   riskConfirmed: boolean
   setRiskConfirmed: (v: boolean) => void
+
+  /** 启动检查是否完成（7 步全 ok 后切 true，进入主界面） */
+  startupComplete: boolean
+  setStartupComplete: (v: boolean) => void
 }
 
 export const useAppStore = create<AppState>()((set) => ({
@@ -108,4 +112,7 @@ export const useAppStore = create<AppState>()((set) => ({
 
   riskConfirmed: true,
   setRiskConfirmed: (riskConfirmed) => set({ riskConfirmed }),
+
+  startupComplete: false,
+  setStartupComplete: (startupComplete) => set({ startupComplete }),
 }))

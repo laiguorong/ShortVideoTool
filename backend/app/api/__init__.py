@@ -3,7 +3,7 @@
 
 from fastapi import APIRouter
 
-from app.api import accounts, creation, dashboard, files, materials, publish, publish_intro, selection, settings, tasks
+from app.api import accounts, creation, dashboard, files, materials, publish, publish_intro, selection, settings, startup, tasks
 
 api_router = APIRouter()
 api_router.include_router(accounts.router)
@@ -16,6 +16,7 @@ api_router.include_router(publish_intro.router)
 api_router.include_router(settings.router)
 api_router.include_router(tasks.router)
 api_router.include_router(files.router)
+api_router.include_router(startup.router)
 
 
 

@@ -178,14 +178,13 @@ def init_data_dir(data_dir: Path | None = None) -> Path:
     参数:
         data_dir: 显式指定（--data-dir / SHORTVIDEO_DATA_DIR env / 测试用）；
                   None = 按默认策略解析（首次启动挑最大盘根 + 落 settings.json）
+
+    失败语义：mkdir 失败时不修改全局 DATA_DIR（保持旧值），避免后续 check 走错路径。
     """
     global DATA_DIR
     if data_dir is None:
         data_dir = resolve_default_data_dir()
-    # 显式参数场景不写 settings.json：
-    #  - 测试 fixture init_data_dir(tmp/"data") 会污染 settings.json 指向临时目录
-    #  - 前端选择持久化由 spawn env 透传保证（每次主进程启动从 userData JSON 读 → env → 后端）
-    DATA_DIR = data_dir
+    # 先验证路径可写，失败抛 RuntimeError 但不改 DATA_DIR（保持旧值）
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -194,6 +193,8 @@ def init_data_dir(data_dir: Path | None = None) -> Path:
         raise RuntimeError(
             f"数据目录不可用：{data_dir}（{e.strerror or e}）"
         ) from e
+    # mkdir 成功后再赋 DATA_DIR（保证全局状态与磁盘一致）
+    DATA_DIR = data_dir
     for sub in DATA_SUB_DIRS:
         (data_dir / sub).mkdir(parents=True, exist_ok=True)
     # #361：老版本 data_dir/config + data_dir/models/face 迁到应用目录

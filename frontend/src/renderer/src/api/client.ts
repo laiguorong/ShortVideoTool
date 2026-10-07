@@ -1,6 +1,19 @@
-/** 后端 HTTP 客户端基础封装（参考 VideoMatrix client.ts 模式）。 */
+/**
+ * 后端 HTTP 客户端基础封装（参考 VideoMatrix client.ts 模式）。
+ *
+ * 路径契约（重要！两端任一改路径会立即 404，不会静默错位）：
+ * - getBaseUrl() 返回的 baseUrl **已包含** `/api` 后缀
+ * - 所有 API 模块调用 request() 时 path **不要再加** `/api/` 前缀
+ *   - 正确：`request('/startup/state')` → `http://host:port/api/startup/state`
+ *   - 错误：`request('/api/startup/state')` → `http://host:port/api/api/startup/state` → 404
+ * - 改 baseUrl 时请同步检查所有 API 模块的 path
+ */
 
-const getBaseUrl = async (): Promise<string> => {
+/**
+ * 获取后端 baseUrl（含 /api 后缀）。
+ * 被 startup check / health 探活等共用，改路径前缀请同步所有 API 模块。
+ */
+export const getBaseUrl = async (): Promise<string> => {
   if (window.electronAPI) {
     const port = await window.electronAPI.getBackendPort()
     return `http://127.0.0.1:${port}/api`
@@ -28,8 +41,6 @@ function formatApiError(detail: unknown, fallback: string): string {
   }
   return fallback
 }
-
-/** 后端 HTTP 客户端基础封装（参考 VideoMatrix client.ts 模式）。 */
 
 /** 错误分类——用于 UI 区分 toast 样式（业务红 / 鉴权红 / 限流黄 / 系统红 / 网络黄 / 校验红） */
 export type ApiErrorKind = 'business' | 'validation' | 'system' | 'network' | 'auth' | 'throttle'

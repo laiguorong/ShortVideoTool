@@ -1079,7 +1079,8 @@ function ShotCard({ shot, shots, index, onChanged, highlightClipIds }: {
   const [playClip, setPlayClip] = useState<Clip | null>(null)
   const [moveOpen, setMoveOpen] = useState(false)
   const [moveTarget, setMoveTarget] = useState('')
-  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false)
+  const [deleteShotOpen, setDeleteShotOpen] = useState(false)
   const dragRef = useRef(false)
   const [prompt, promptDialog] = usePrompt()
 
@@ -1163,7 +1164,7 @@ function ShotCard({ shot, shots, index, onChanged, highlightClipIds }: {
             if (v && v !== shot.name) creationApi.renameShot(shot.id, v).then(onChanged)
           }}>重命名</Button>
           <Button variant="outline" size="sm" className="!text-danger"
-            onClick={() => { if (window.confirm(`删除分镜「${shot.name}」及其全部片段？`)) creationApi.deleteShot(shot.id).then(onChanged) }}>
+            onClick={() => setDeleteShotOpen(true)}>
             删除
           </Button>
           <Button variant={manageMode ? 'primary' : 'outline'} size="sm"
@@ -1187,7 +1188,7 @@ function ShotCard({ shot, shots, index, onChanged, highlightClipIds }: {
           <Button variant="outline" size="sm" disabled={busy || !selected.size} onClick={() => doBatch('retry_render')}>重新渲染</Button>
           <Button variant="outline" size="sm" disabled={busy || !selected.size} onClick={() => setMoveOpen(true)}>移动到其他分镜</Button>
           <Button variant="outline" size="sm" className="!text-danger" disabled={busy || !selected.size}
-            onClick={() => setDeleteOpen(true)}>删除</Button>
+            onClick={() => setBatchDeleteOpen(true)}>删除</Button>
           <Button variant="ghost" size="sm" onClick={exitManage}>退出管理</Button>
         </div>
       )}
@@ -1335,9 +1336,19 @@ function ShotCard({ shot, shots, index, onChanged, highlightClipIds }: {
       </Dialog>
 
       {/* 批量删除确认 */}
-      <ConfirmDialog open={deleteOpen} onOpenChange={setDeleteOpen} title="批量删除片段" danger
+      <ConfirmDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen} title="批量删除片段" danger
         content={`确定删除选中的 ${selected.size} 个片段？对应的片段文件将一并删除。`}
         onConfirm={() => doBatch('delete')} />
+
+      {/* 整分镜删除确认：用 ref 锁 shot，避免 confirm 期间 React 重渲染让 shot prop 变而误删 */}
+      <ConfirmDialog open={deleteShotOpen} onOpenChange={setDeleteShotOpen} title="删除分镜" danger
+        content={`确定删除分镜「${shot.name}」及其全部片段？片段文件将一并删除，操作不可恢复。`}
+        onConfirm={async () => {
+          try {
+            await creationApi.deleteShot(shot.id)
+            onChanged()
+          } catch (e) { toast((e as Error).message, 'error') }
+        }} />
 
       {promptDialog}
     </div>
@@ -1461,6 +1472,9 @@ function ProjectEditor({ projectId, onClose, resolutionPresets }: {
   const [materialManageMode, setMaterialManageMode] = useState(false)
   const [deletingMaterials, setDeletingMaterials] = useState(false)
   const [confirmDeleteMaterials, setConfirmDeleteMaterials] = useState(false)
+  const [confirmClearBgms, setConfirmClearBgms] = useState(false)
+  /** 弹清空 BGM 确认时的快照（避免 confirm 期间 picker 改动导致实际清空与预期不一致） */
+  const [bgmsSnapshot, setBgmsSnapshot] = useState<BgmItem[]>([])
 
   const load = useCallback(async () => {
     // #409：返回 Promise，调用方可 await；确保 detail 已 setState 后再让调用方继续
@@ -1697,6 +1711,18 @@ function ProjectEditor({ projectId, onClose, resolutionPresets }: {
             } catch (e) { toast((e as Error).message, 'error') }
             finally { setDeletingMaterials(false) }
           }} />
+
+        {/* 清空背景音乐确认 — 弹 confirm 时快照 bgms 到 local（避免 confirm 期间通过 picker 加/删导致实际清空与弹窗时不一致） */}
+        <ConfirmDialog open={confirmClearBgms} onOpenChange={setConfirmClearBgms} title="清空背景音乐" danger
+          content={`确定清空全部 ${bgmsSnapshot.length} 个背景音乐？`}
+          onConfirm={async () => {
+            try {
+              await Promise.all(bgmsSnapshot.map((b) => creationApi.removeBgm(projectId, b.material_id)))
+              toast('背景音乐已清空', 'success')
+              load()
+            } catch (e) { toast((e as Error).message, 'error') }
+            setBgmsSnapshot([])
+          }} />
       </div>
 
       {/* 右：配置栏（#406 可折叠） */}
@@ -1727,12 +1753,7 @@ function ProjectEditor({ projectId, onClose, resolutionPresets }: {
             {/* 清空所有 BGM（#91）：二次确认后逐条 remove */}
             {bgms.length > 0 && (
               <Button variant="ghost" size="sm" className="!text-danger"
-                onClick={() => {
-                  if (!window.confirm(`确定清空全部 ${bgms.length} 个背景音乐？`)) return
-                  Promise.all(bgms.map((b) => creationApi.removeBgm(projectId, b.material_id)))
-                    .then(() => { toast('背景音乐已清空', 'success'); load() })
-                    .catch((e) => toast((e as Error).message, 'error'))
-                }}>清空</Button>
+                onClick={() => { setBgmsSnapshot(bgms); setConfirmClearBgms(true) }}>清空</Button>
             )}
             <select className="ml-auto h-7 rounded-md border border-border bg-white px-1 text-xs" value={bgmStrategy}
               onChange={(e) => creationApi.updateProject(projectId, { bgm_strategy: e.target.value }).then(load)}>
