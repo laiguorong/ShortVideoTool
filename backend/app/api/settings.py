@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """系统设置路由（F-08）：配置、健康检查、清理、备份恢复、风险告知、通知中心。"""
 
+import os
+import sys as _sys
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 
 from app.core import notifier
@@ -9,6 +13,38 @@ from app.models.setting import (BackupRequest, DataDirMigrateRequest, RestoreReq
 from app.services import setting_service
 
 router = APIRouter(prefix="/settings", tags=["系统设置"])
+
+
+# #598 整套删 userData 持久化后，settings:chooseDataDir 走 POST /data-dir-prepare：
+# - 只写 settings.json 的 data_dir 字段，不调 init_data_dir（避免运行时改 DATA_DIR 全局
+#   导致业务引用旧路径派生 key，造成数据漂移）
+# - 重启后整个后端从头 init 走新 settings.json 才真正生效
+# 校验规则：拒绝非绝对路径 + Windows 系统目录（与 startup.py _validate_data_dir_path 对齐）
+_WINDOWS_PROTECTED = (
+    os.path.normcase("C:/Windows"),
+    os.path.normcase("C:/Windows/System32"),
+    os.path.normcase("C:/Program Files"),
+    os.path.normcase("C:/Program Files (x86)"),
+    os.path.normcase("C:/ProgramData"),
+    os.path.normcase("C:/$Recycle.Bin"),
+    os.path.normcase("C:/Recovery"),
+)
+
+
+def _validate_prepare_path(p: Path) -> str | None:
+    """轻量路径校验（prepare 端点用，不做存在/可写检查——由 init_data_dir 阶段触发）。
+    返回 None = 通过；返 str = 错误描述。"""
+    try:
+        if not p.is_absolute():
+            return "路径必须是绝对路径"
+        if _sys.platform == "win32":
+            resolved = os.path.normpath(os.path.normcase(os.path.normpath(str(p))).rstrip(" ."))
+            for protected in _WINDOWS_PROTECTED:
+                if resolved == protected or resolved.startswith(protected + "\\"):
+                    return f"禁止使用系统目录: {protected}"
+        return None
+    except OSError as exc:
+        return f"路径无效: {exc}"
 
 
 @router.get("", summary="读取全局配置")
@@ -65,6 +101,26 @@ def get_data_dir():
     """当前 data 目录与子目录清单。"""
     from app.services.setting_service import DATA_SUB_DIRS, get_data_dir as _dir
     return {"data_dir": str(_dir()), "sub_dirs": DATA_SUB_DIRS}
+
+
+@router.post("/data-dir-prepare", summary="设置数据目录（仅写配置，不 init；用于设置页改目录需重启）")
+def prepare_data_dir(body: DataDirMigrateRequest):
+    """#598 整套删 userData 持久化后用此端点。
+
+    行为：
+    - 校验路径（绝对路径 + Windows 系统目录拒绝）
+    - 写 settings.json::data_dir 字段
+    - **不**调 init_data_dir（避免运行时改 DATA_DIR 全局）
+
+    与 startup.py POST /api/startup/data-dir 的区别：后者会同步调 init_data_dir 改 DATA_DIR
+    立即生效（用于启动页首次配置），本端点仅写配置 + 等待重启（用于设置页运行中改）。
+    """
+    p = Path(body.new_dir)
+    err = _validate_prepare_path(p)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    setting_service.save_settings({"data_dir": str(p)})
+    return {"ok": True, "data_dir": str(p)}
 
 
 @router.get("/face-evidence-dir", summary="人脸证据目录路径")

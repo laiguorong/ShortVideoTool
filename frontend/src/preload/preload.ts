@@ -26,10 +26,10 @@ export interface ElectronAPI {
   openExternal: (url: string) => Promise<void>
   /** 后端端口（渲染层拼 API 基址） */
   getBackendPort: () => Promise<number>
-  /** #data-dir-choice：设置页"更改数据目录"用，弹框选目录并持久化 */
+  /** #data-dir-choice：设置页"更改数据目录"用，弹框选目录并写后端 settings.json */
   chooseDataDir: () => Promise<{ abs_path: string } | null>
-  /** 获取当前首选目录（UI 展示用） */
-  getPreferredDataDir: () => Promise<{ abs_path: string } | null>
+  /** #597：启动页触发的主进程数据目录选择完整流程（默认盘 + 立即选择 + 5 次重试 + retry-or-quit） */
+  chooseDataDirFlow: () => Promise<{ abs_path: string } | null>
   /** 默认盘探测结果（"恢复默认"按钮展示） */
   defaultDataDirHint: () => Promise<{ disk: string; abs_path: string } | null>
   /** 重启 Electron（写入数据目录后立即生效） */
@@ -47,7 +47,7 @@ const api: ElectronAPI = {
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   getBackendPort: () => ipcRenderer.invoke('app:getBackendPort'),
   chooseDataDir: () => ipcRenderer.invoke('settings:chooseDataDir'),
-  getPreferredDataDir: () => ipcRenderer.invoke('settings:getPreferredDataDir'),
+  chooseDataDirFlow: () => ipcRenderer.invoke('dataDir:choose'),
   defaultDataDirHint: () => ipcRenderer.invoke('settings:defaultDataDirHint'),
   relaunch: () => ipcRenderer.invoke('app:relaunch'),
 }

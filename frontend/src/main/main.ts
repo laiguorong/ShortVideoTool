@@ -1,7 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, net, session } from 'electron'
 import {
-  loadPreferredDataDir,
-  writePreferredDataDir,
   validateDataDir,
   pickDefaultDataDirHint,
 } from './preferredDataDir'
@@ -387,16 +385,11 @@ async function forceKillBackend(): Promise<void> {
 }
 
 async function ensureDataDirChoice(): Promise<string | null> {
-  // 0. 持久化路径校验通过 → 静默
-  const persisted = loadPreferredDataDir()
-  if (persisted) {
-    const v = validateDataDir(persisted)
-    if (v.ok) {
-      logDev(`[Main] 沿用首选数据目录: ${persisted}`)
-      return persisted
-    }
-    logWarn(`[Main] 首选数据目录失效（${v.reason}），将重新选择: ${persisted}`)
-  }
+  // #597 重构 + #598 整套删 userData 持久化：
+  // - 启动时由后端 check_data_dir 走 env / settings.json 配置检测（都没配置时
+  //   返 need_choose=true 触发启动页调本函数），启动流程不读 userData
+  // - 本弹窗函数也**不读** userData"静默沿用持久化"（preferredDataDir 已整套删），
+  //   弹窗每次都从默认盘开始让用户重新选
 
   // 默认盘探测 → 极端：没找到任何可用盘直接弹错误退出
   const hint = pickDefaultDataDirHint()
@@ -458,12 +451,10 @@ async function ensureDataDirChoice(): Promise<string | null> {
     })
 
     if (next.action === 'use-default') {
-      writePreferredDataDir(hint.abs_path)
       logDev(`[Main] 使用默认数据目录: ${hint.abs_path}`)
       return hint.abs_path
     }
     if (next.action === 'confirm') {
-      writePreferredDataDir(next.chosen)
       logDev(`[Main] 用户选择数据目录: ${next.chosen}`)
       return next.chosen
     }
@@ -637,7 +628,12 @@ function createWindow() {
     }
   })
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  // 启动即最大化窗口（每次启动固定最大化，不记忆上次状态）
+  // maximize() 必须在 show() 前调用以避免从 1280×860 闪一下再放大的视觉跳变
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.maximize()
+    mainWindow?.show()
+  })
 
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
@@ -804,14 +800,21 @@ ipcMain.handle('fs:walkDir', async (_, dirPath: string) => {
   return out
 })
 
-// ===== #data-dir-choice：数据目录选择与持久化 =====
-/** SettingsPage「更改数据目录」用：选目录 → 写 userData → 返回新路径（不重启） */
+// ===== #data-dir-choice：数据目录选择（#598 整套删 userData 持久化） =====
+/** SettingsPage「更改数据目录」用：
+ *  - 弹 dialog 选目录
+ *  - 校验存在 + 是目录 + 可写
+ *  - 主进程直接 fetch 后端 POST /api/startup/data-dir 写 settings.json + init_data_dir
+ *  - 返回新路径
+ *  历史 bug 修复：原本实现"写 userData + 弹重启"——但**根本不写 settings.json**，
+ *  重启后 check_data_dir 读 settings.json 拿旧 data_dir → 沿用旧目录 → 改目录实际不生效。
+ *  现在写后端 settings.json 才是真正生效。重启后整个后端从头 init 走新路径。 */
 ipcMain.handle('settings:chooseDataDir', async () => {
   if (!mainWindow) return null
-  const cur = loadPreferredDataDir()
+  const hint = pickDefaultDataDirHint()
   const result = await dialog.showOpenDialog(mainWindow, {
     title: '选择数据目录',
-    defaultPath: cur && validateDataDir(cur).ok ? cur : undefined,
+    defaultPath: hint?.abs_path,
     properties: ['openDirectory', 'createDirectory'],
     message: '将用于存储数据库、素材、成品视频等全部本地数据。\n可随时在「设置 → 数据目录」中更改（更改后需重启生效）。',
   })
@@ -822,17 +825,36 @@ ipcMain.handle('settings:chooseDataDir', async () => {
     logWarn(`[Main] 用户选择的目录不可用: ${chosen} (${v.reason})`)
     throw new Error(`所选目录不可用：${v.reason}`)
   }
-  writePreferredDataDir(chosen)
-  logDev(`[Main] 已保存首选数据目录: ${chosen}`)
+  // #598：走 /api/settings/data-dir-prepare 端点（只写 settings.json，不调 init_data_dir）。
+  // 避免运行时改 DATA_DIR 全局导致业务引用旧路径派生 key（数据漂移）。
+  // 重启后整个后端从头 init 走新 settings.json 才真正生效。
+  try {
+    const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/settings/data-dir-prepare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ new_dir: chosen }),
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      errorDev(`[Main] 写后端 settings.json 失败: ${res.status} ${text.slice(0, 200)}`)
+      throw new Error(`保存数据目录失败（HTTP ${res.status}）`)
+    }
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith('保存数据目录失败')) throw e
+    errorDev(`[Main] 写后端 settings.json 异常`, e)
+    throw new Error(`保存数据目录失败：${(e as Error).message}`)
+  }
+  logDev(`[Main] 已保存数据目录到 settings.json: ${chosen}`)
   return { abs_path: chosen }
 })
 
-/** 获取当前首选目录（只读） */
-ipcMain.handle('settings:getPreferredDataDir', () => {
-  const p = loadPreferredDataDir()
-  // #data-dir-choice：审计日志（IPC 频次低：mount + focus/visibility 触发；落盘便于排查）
-  logDev(`[Main] getPreferredDataDir → ${p ? 'set' : 'null'}`)
-  return p ? { abs_path: p } : null
+/** #597：启动页触发的主进程数据目录选择完整流程（默认盘探测 + 5 次重试 + retry-or-quit）。
+ *  返回用户最终选择的路径（默认盘 / 立即选择 / 取消返回 null）。 */
+ipcMain.handle('dataDir:choose', async (): Promise<{ abs_path: string } | null> => {
+  logDev('[Main] IPC dataDir:choose 触发 ensureDataDirChoice 弹窗')
+  const chosen = await ensureDataDirChoice()
+  if (!chosen) return null
+  return { abs_path: chosen }
 })
 
 /** 获取默认盘探测结果（首次启动弹窗 / 设置页"恢复默认"用） */
@@ -884,24 +906,18 @@ if (!hasSingleInstanceLock) {
   })
 
   app.whenReady().then(async () => {
-    // #data-dir-choice：首次启动前确认数据目录；返回路径或 null（用户取消）
-    const dataDir = await ensureDataDirChoice()
-    if (dataDir === null) {
-      // 取消场景：已弹过错误框，直接退出
-      logWarn('[Main] 用户取消数据目录选择，退出启动')
-      app.exit(1)
-      return
-    }
-
-    // 先创建主窗口 — 启动页立即显示（"正在启动后端..."），不等后端
-    // Renderer 加载后 App.tsx health 探活每秒 1 次，后端起来后自动接续 6 步 check
-    // 后端启动失败时 Renderer 显示启动页 + 真实失败原因，比弹错误框友好
+    // #597 重构：删除主进程 ensureDataDirChoice 自动弹窗
+    // - 启动页先渲染（phase=waiting-backend），等 health 通后跑 6 步 check
+    // - data_dir 步骤如未配置会返 failed + need_choose=true，启动页自动调 IPC 触发主进程 ensureDataDirChoice 弹窗
+    // - 不再静默沿用 preferred_data_dir.json（明确每次启动都让用户感知数据目录）
     logDev('[Main] 创建主窗口（启动页先显示，后端后台启动）')
     createWindow()
 
-    // 后台 spawn 后端 + 等 health 就绪（并行窗口显示，不阻塞 UI）
+    // 后台 spawn 后端（不传 dataDir = 不透传 SHORTVIDEO_DATA_DIR env / --data-dir 参数，
+    // 让后端 check_data_dir 走 env + settings.json 配置检测；
+    // 都没配置时返 failed + need_choose=true，由启动页 IPC 触发 ensureDataDirChoice 弹窗）
     try {
-      await startBackend(dataDir)
+      await startBackend(null)
     } catch (e) {
       errorDev('[Main] startBackend 抛错:', e)
       // 与 waitForBackendReady 失败路径对称：走错误弹窗让用户选择

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""7 步启动 check 函数（每步独立、内部 try/except 返 CheckResult、绝不抛）。
+"""6 步启动 check 函数（每步独立、内部 try/except 返 CheckResult、绝不抛）。
 
 启动依赖链（与原 on_startup 一致，顺序仅挪位置）：
   data_dir → database + settings → scheduler（cleanup 都放 scheduler 末尾）
@@ -18,6 +18,7 @@ from pathlib import Path
 from loguru import logger
 
 from app.core import startup_state
+from app.core.logger import init_logger_file  # 模块顶部 import，避免散在 try 内
 from app.core.startup_state import CheckResult
 
 
@@ -26,25 +27,52 @@ from app.core.startup_state import CheckResult
 def check_data_dir() -> CheckResult:
     """应用目录 + 数据目录初始化，data_dir 就绪后挂 loguru 文件 sink。
 
+    检测顺序（#597 重构：默认盘探测改在主进程 ensureDataDirChoice 弹窗内）：
+    1. ① env 透传：SHORTVIDEO_DATA_DIR（仅 RUNTIME=1 时信任，避免测试/CI 污染）
+    2. ② settings.json 持久化：用户此前选过的 data_dir 字段
+    3. 都没配置 / 路径失效 → failed + data.need_choose=true，触发启动页自动调主进程弹窗
+       （主进程 ensureDataDirChoice 跑默认盘探测 + 让用户选）
+
     依赖：无
-    失败：路径不可写 / mkdir 失败 / 应用目录不可写
+    失败：路径不可写 / mkdir 失败 / 应用目录不可写 / 都没配置（need_choose）
+          / 路径失效（盘符卸载 / 权限被改）—— 也返 need_choose 让用户重选
     """
     try:
         from app.services.setting_service import (
             init_app_dirs,
             init_data_dir,
             get_data_dir,
+            load_settings,
         )
         init_app_dirs()
-        # 复用 main.py 模块顶部 _args 解析策略（env 透传 + RUNTIME 守卫）
-        arg = (
-            os.environ.get("SHORTVIDEO_DATA_DIR")
-            if os.environ.get("SHORTVIDEO_TOOL_RUNTIME")
-            else None
-        )
-        init_data_dir(Path(arg) if arg else None)
+        # ① env 透传（仅 RUNTIME=1 时信任；统一 strip 防御 env 含不可见字符）
+        env_arg: str | None = None
+        if os.environ.get("SHORTVIDEO_TOOL_RUNTIME"):
+            raw = os.environ.get("SHORTVIDEO_DATA_DIR", "").strip()
+            if raw:
+                env_arg = raw
+        # ② settings.json 持久化（用户此前选过；init_app_dirs 后 load_settings 可用）
+        settings_arg: str | None = None
+        try:
+            sd = load_settings().get("data_dir")
+            if isinstance(sd, str) and sd.strip():
+                settings_arg = sd.strip()
+        except Exception:  # noqa: BLE001 配置损坏用空（DEFAULT_SETTINGS 兜底）
+            pass
+        # 优先级：env > settings.json
+        chosen = env_arg or settings_arg
+        if not chosen:
+            # ③ 都没配置 → 通知前端触发主进程 ensureDataDirChoice 弹窗
+            return CheckResult(
+                key="data_dir",
+                status="failed",
+                detail="未配置数据目录，请选择数据目录",
+                data={"need_choose": True},
+            )
+        # 路径失效（盘符卸载 / 权限被改）也会抛 RuntimeError/Exception，
+        # 外层 except 捕获后也设 need_choose=true → 启动页给用户重选机会
+        init_data_dir(Path(chosen))
         # 数据目录就绪 → 挂文件 sink（init_logger_file 内部调 get_data_dir()）
-        from app.core.logger import init_logger_file
         init_logger_file()
         data_dir = get_data_dir()
         return CheckResult(
@@ -58,6 +86,8 @@ def check_data_dir() -> CheckResult:
             key="data_dir",
             status="failed",
             detail=f"{type(exc).__name__}: {exc}",
+            # #597：路径失效也允许用户重选（不仅是"没配置"）
+            data={"need_choose": True},
         )
 
 
@@ -404,7 +434,7 @@ def check_scheduler() -> CheckResult:
         )
 
 
-# 步骤注册表（按用户给定顺序 1→7；步骤 1 后端存活由前端直接判定）
+# 步骤注册表（6 步；后端存活由前端 Electron 主进程 waitForBackendReady 判定，不在此表）
 STEPS = [
     ("data_dir",   check_data_dir),
     ("database",   check_database),
@@ -413,3 +443,12 @@ STEPS = [
     ("playwright", check_playwright),
     ("scheduler",  check_scheduler),
 ]
+
+
+# 模块加载时立即注册到 startup_state（不在 on_startup 阶段）。
+# 目的：保证后端 Python 进程 import 完 → STEPS 已注册 → uvicorn listen 后
+# /api/startup/check/{key} 立即可用，根除 on_startup 异步触发期间
+# 前端 health 已通 + check 接口返回 404 的 race condition。
+# register 幂等（重复注册覆盖 runner，不重置 state），与 on_startup 调效果一致。
+for _key, _fn in STEPS:
+    startup_state.register(_key, _fn)

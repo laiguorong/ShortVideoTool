@@ -66,7 +66,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import api_router
 from app.core import task_scheduler
-from app.core import startup_state
 from app.core import startup_checks
 from app.core.logger import init_logger_console
 
@@ -113,7 +112,7 @@ def _patch_uvicorn_force_exit() -> None:
 
 _patch_uvicorn_force_exit()
 
-app = FastAPI(title="短视频工具 后端服务", version="1.0.1")
+app = FastAPI(title="短视频工具 后端服务", version="1.0.2")
 
 # CORS 全开（本地 Electron 渲染层跨端口访问）
 app.add_middleware(
@@ -130,16 +129,15 @@ def on_startup() -> None:
 
     仅做：
     - 控制台 logger 初始化（init_logger_console，不依赖 data_dir）
-    - 注册 7 步 check 函数到 startup_state（不执行）
 
-    7 步业务初始化（data_dir → database → settings → ffmpeg → playwright → scheduler）
-    由前端启动页按 1→7 串行触发 POST /api/startup/check/{key}。
+    6 步业务 check 函数注册在 startup_checks 模块 import 时完成（不再在 on_startup 阶段
+    注册，避免 health 已通 + startup router 还没注册导致的 404 race）。
+    6 步业务初始化（data_dir → database → settings → ffmpeg → playwright → scheduler）
+    由前端启动页按顺序串行触发 POST /api/startup/check/{key}。
     """
     from loguru import logger
     init_logger_console()
-    for key, fn in startup_checks.STEPS:
-        startup_state.register(key, fn)
-    logger.info("[启动] on_startup 完成，已注册 {} 步检查，等待前端触发", len(startup_checks.STEPS))
+    logger.info("[启动] on_startup 完成，STEPS 已在模块加载时注册（{} 步），等待前端触发", len(startup_checks.STEPS))
 
 
 @app.on_event("shutdown")

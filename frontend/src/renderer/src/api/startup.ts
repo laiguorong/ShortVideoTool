@@ -7,7 +7,8 @@ export interface CheckResult {
   key: string
   status: 'pending' | 'running' | 'ok' | 'failed'
   detail: string
-  data: Record<string, unknown>
+  /** 步骤相关数据。后端 data_dir 步骤会写 need_choose=true 通知前端弹选择数据目录弹窗 */
+  data: { need_choose?: boolean; [key: string]: unknown }
   ts: string
 }
 

@@ -163,16 +163,14 @@ function DataDirTab() {
   const [dataDir, setDataDir] = useState('')
   const [faceEvidenceDir, setFaceEvidenceDir] = useState('')
   const [cleanupOpen, setCleanupOpen] = useState(false)
-  const [preferredDir, setPreferredDir] = useState<string | null>(null)
   const [defaultHint, setDefaultHint] = useState<DefaultDataDirHint | null>(null)
   const [relaunchOpen, setRelaunchOpen] = useState(false)
 
   // #data-dir-choice：mount + 窗口回到前台时 reload（debounce + visible 守卫）
-const load = useCallback(() => {
+  const load = useCallback(() => {
     settingApi.healthCheck().then(setHealth).catch((e) => console.warn('[Settings] 请求失败:', e))
     settingApi.dataDir().then((r) => setDataDir(r.data_dir)).catch((e) => console.warn('[Settings] 请求失败:', e))
     settingApi.faceEvidenceDir().then((r) => setFaceEvidenceDir(r.face_evidence_dir)).catch((e) => console.warn('[Settings] 请求失败:', e))
-    window.electronAPI?.getPreferredDataDir().then((r) => setPreferredDir(r?.abs_path ?? null)).catch(() => {})
     loadDefaultDataDirHint().then(setDefaultHint)
   }, [])
   useReloadOnVisible(load)
@@ -189,7 +187,8 @@ const load = useCallback(() => {
     }
   }
 
-  // #data-dir-choice：更改数据目录 → 写 userData → 弹重启确认 dialog
+  // #data-dir-choice + #598 整套删 userData 持久化：
+  // 改数据目录 → 弹 dialog 选 → 主进程写后端 settings.json + init_data_dir → 弹重启确认 dialog
   const chooseDataDir = async () => {
     if (!window.electronAPI) {
       toast('当前环境不支持更改数据目录', 'error')
@@ -198,7 +197,6 @@ const load = useCallback(() => {
     try {
       const r = await window.electronAPI.chooseDataDir()
       if (!r) return  // 用户取消选目录框
-      setPreferredDir(r.abs_path)
       setRelaunchOpen(true)  // 弹单一重启确认 dialog（不再额外 toast）
     } catch (e) {
       toast((e as Error).message, 'error')
@@ -227,11 +225,6 @@ const load = useCallback(() => {
             <Button variant="outline" size="sm" onClick={chooseDataDir}>更改目录</Button>
           )}
         </div>
-        {preferredDir && preferredDir !== dataDir && (
-          <div className="mt-1 text-xs text-amber-600">
-            已选择新目录：{preferredDir}（重启后切换）
-          </div>
-        )}
       </div>
 
       <div>
