@@ -49,6 +49,9 @@ def test_video_dir_fixed_no_overlap_two_accounts():
         daily_limit_mode="per_account",
         daily_limit_global=0,
         daily_limit_per_account=(("acc0", 2), ("acc1", 2)),
+        # #596：per_account 下每账号必须配算模式 + 两个独立间隔字段
+        daily_limit_per_account_schedule=(
+            ("acc0", "fixed", 30, 60), ("acc1", "fixed", 30, 60)),
         start_time="2026-09-22 07:00:00",
         end_time="2026-09-22 23:00:00",
         schedule_mode="fixed",
@@ -80,6 +83,9 @@ def test_video_dir_fixed_overflow_raises_with_offset():
         daily_limit_mode="per_account",
         daily_limit_global=0,
         daily_limit_per_account=(("acc0", 3), ("acc1", 3)),
+        # #596：per_account 下每账号必须配算模式 + 两个独立间隔字段
+        daily_limit_per_account_schedule=(
+            ("acc0", "fixed", 30, 60), ("acc1", "fixed", 30, 60)),
         start_time="2026-09-22 07:00:00",
         end_time="2026-09-22 23:00:00",
         schedule_mode="fixed",
@@ -108,6 +114,9 @@ def test_video_dir_fixed_three_accounts_one_dir():
         daily_limit_mode="per_account",
         daily_limit_global=0,
         daily_limit_per_account=(("acc0", 3), ("acc1", 3), ("acc2", 3)),
+        # #596：per_account 下每账号必须配算模式 + 两个独立间隔字段
+        daily_limit_per_account_schedule=(
+            ("acc0", "fixed", 30, 60), ("acc1", "fixed", 30, 60), ("acc2", "fixed", 30, 60)),
         start_time="2026-09-22 07:00:00",
         end_time="2026-09-22 23:00:00",
         schedule_mode="fixed",
@@ -143,6 +152,9 @@ def test_video_dir_balanced_no_overlap_two_accounts():
         daily_limit_mode="per_account",
         daily_limit_global=0,
         daily_limit_per_account=(("acc0", 4), ("acc1", 4)),
+        # #596：per_account 下每账号必须配算模式 + 两个独立间隔字段
+        daily_limit_per_account_schedule=(
+            ("acc0", "balanced", 10, 60), ("acc1", "balanced", 10, 60)),
         start_time="2026-09-22 07:00:00",
         end_time="2026-09-22 23:00:00",
         schedule_mode="balanced",

@@ -177,6 +177,9 @@ def test_per_account_mode() -> None:
         account_ids=("accA", "accB"), projects=_spec_projects(),
         daily_limit_mode="per_account", daily_limit_global=0,
         daily_limit_per_account=(("accA", 8), ("accB", 6)),
+        # #596：per_account 下每账号必须配算模式 + 两个独立间隔字段
+        daily_limit_per_account_schedule=(
+            ("accA", "balanced", 10, 60), ("accB", "balanced", 10, 60)),
         start_time="2023-09-22 07:00:00", end_time="2023-09-22 22:00:00",
         schedule_mode="balanced", balanced_step_min=60, fixed_interval_min=10,
             diff_project_interval_min=10,
@@ -184,6 +187,10 @@ def test_per_account_mode() -> None:
     items, stats = build_schedule(cfg)
     assert stats.by_account == {"accA": 8, "accB": 6}
     assert stats.total == 14
+    # #596：明细行带算模式 + 间隔
+    for it in items:
+        assert it.schedule_mode == "balanced"
+        assert it.interval_min == 60
 
 
 def test_overflow_raises() -> None:
@@ -540,6 +547,9 @@ def test_fixed_mode_per_account_limit_caps() -> None:
         projects=(proj_a,),
         daily_limit_mode="per_account", daily_limit_global=0,
         daily_limit_per_account=(("accA", 2), ("accB", 2)),
+        # #596：per_account 下每账号必须配算模式 + 两个独立间隔字段
+        daily_limit_per_account_schedule=(
+            ("accA", "fixed", 10, 60), ("accB", "fixed", 10, 60)),
         start_time="2023-09-22 07:00:00", end_time="2023-09-22 22:00:00",
         schedule_mode="fixed", fixed_interval_min=10, balanced_step_min=60,
     )

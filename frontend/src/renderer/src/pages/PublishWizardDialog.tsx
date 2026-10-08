@@ -41,6 +41,16 @@ function fmtLocal(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/** #597：当前本地时间（"yyyy-MM-dd HH:mm"）—— canAdvance 校验过去时间用 */
+function localNowStr(): string {
+  return fmtLocal(new Date())
+}
+
+/** #597：当前本地时间（"yyyy-MM-ddTHH:mm"）—— datetime-local input 的 min 属性用 */
+function localNowMin(): string {
+  return fmtLocal(new Date()).replace(' ', 'T')
+}
+
 /** 行内 spinner（视频目录按钮 loading 用） */
 function Spinner() {
   return (
@@ -110,10 +120,18 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   const [dailyLimitMode, setDailyLimitMode] = useState<'global' | 'per_account'>('global')
   // #420：发布上限默认值 10 → 75（与后端模型 + 用户偏好对齐）
   const [dailyLimitGlobal, setDailyLimitGlobal] = useState(75)
-  const [dailyLimitPerAccount, setDailyLimitPerAccount] = useState<Record<string, number>>({})
+  // #596：每账号独立上限 + 算模式 + 两个独立 interval 字段（切 mode 不影响值）
+  const [dailyLimitPerAccount, setDailyLimitPerAccount] = useState<Record<
+    string, {
+      limit: number
+      scheduleMode: 'fixed' | 'balanced'
+      fixedIntervalMin: number
+      balancedStepMin: number
+    }
+  >>({})
   const [startTime, setStartTime] = useState(defaultStart())
   const [endTime, setEndTime] = useState(defaultEnd())
-  // #calc_mode：计算模式（固定间隔 / 均衡间隔）
+  // #calc_mode：计算模式（固定间隔 / 均衡间隔）—— 全局模式专用（per_account 模式按行）
   const [scheduleMode, setScheduleMode] = useState<'fixed' | 'balanced'>('balanced')
   const [fixedIntervalMin, setFixedIntervalMin] = useState(10)
   const [balancedStepMin, setBalancedStepMin] = useState(60)
@@ -208,6 +226,31 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         setAllowDownload(!!detail.allow_download)
         setDailyLimitMode(detail.daily_limit_mode || 'global')
         setDailyLimitGlobal(detail.daily_limit_global || 75)
+        // #596：编辑模式回填分账号上限（每账号从 daily_limit_per_account_json 读完整 record）
+        try {
+          const perAccFromDB = JSON.parse(detail.daily_limit_per_account_json || '[]') as {
+            account_id: string; limit: number
+            schedule_mode?: string
+            fixed_interval_min?: number; balanced_step_min?: number
+            interval_min?: number  // 老字段兼容
+          }[]
+          if (perAccFromDB.length > 0) {
+            const rec: typeof dailyLimitPerAccount = {}
+            for (const r of perAccFromDB) {
+              // 老数据可能只存 interval_min 单字段——按当前 mode 落到对应字段
+              const fallback = r.interval_min || (
+                r.schedule_mode === 'fixed' ? fixedIntervalMin : balancedStepMin
+              )
+              rec[r.account_id] = {
+                limit: r.limit,
+                scheduleMode: (r.schedule_mode === 'fixed' ? 'fixed' : 'balanced'),
+                fixedIntervalMin: r.fixed_interval_min || fallback,
+                balancedStepMin: r.balanced_step_min || fallback,
+              }
+            }
+            setDailyLimitPerAccount(rec)
+          }
+        } catch (e) { console.warn('[Wizard] 编辑模式 per_account 回填失败:', e) }
         // project_source + video_dirs / manual_shops
         const source = detail.project_source || 'project'
         setProjectSource(source)
@@ -292,6 +335,23 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     setAllowDownload(!!p.allow_download)
     setDailyLimitMode(p.daily_limit_mode || 'global')
     setDailyLimitGlobal(p.daily_limit_global ?? 75)
+    // #596：复制模式回填分账号上限（含每账号算模式 + 两个独立间隔字段，老数据 fallback）
+    if (p.daily_limit_per_account && p.daily_limit_per_account.length > 0) {
+      const rec: typeof dailyLimitPerAccount = {}
+      for (const e of p.daily_limit_per_account) {
+        // 老数据可能只存 interval_min 单字段——按当前 mode 落到对应字段
+        const fallback = e.interval_min || (
+          e.schedule_mode === 'fixed' ? fixedIntervalMin : balancedStepMin
+        )
+        rec[e.account_id] = {
+          limit: e.limit,
+          scheduleMode: e.schedule_mode === 'fixed' ? 'fixed' : 'balanced',
+          fixedIntervalMin: e.fixed_interval_min || fallback,
+          balancedStepMin: e.balanced_step_min || fallback,
+        }
+      }
+      setDailyLimitPerAccount(rec)
+    }
 
     const source = p.project_source || 'project'
     setProjectSource(source)
@@ -450,16 +510,25 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   // #451：删除旧 initedShopSelRef / useEffect（无任何代码读它，纯死代码）。
 
   // R31 修：模式切换或 selAccounts 变化都同步 per_account 表
+  // #596：per_account 扩为 { limit, scheduleMode, fixedIntervalMin, balancedStepMin } record；
+  // - 新账号：默认值 limit=dailyLimitGlobal, scheduleMode=balanced, fixed=10, balanced=60
+  // - 已有账号：保留原值（来回切不破坏用户已输入）
+  // - global 模式不写 per_account（UI 不展示；data 残留无副作用）
   useEffect(() => {
+    if (dailyLimitMode !== 'per_account') return
     setDailyLimitPerAccount((prev) => {
       const next = { ...prev }
-      const defaultVal = dailyLimitGlobal >= 1 ? dailyLimitGlobal : 1
+      const defaultLimit = dailyLimitGlobal >= 1 ? dailyLimitGlobal : 75
       for (const a of selAccounts) {
-        if (next[a.id] === undefined) next[a.id] = defaultVal
-      }
-      // global mode 强制覆盖
-      if (dailyLimitMode === 'global') {
-        for (const a of selAccounts) next[a.id] = defaultVal
+        const cur = next[a.id]
+        if (!cur) {
+          next[a.id] = {
+            limit: defaultLimit,
+            scheduleMode: 'balanced',
+            fixedIntervalMin: 10,
+            balancedStepMin: 60,
+          }
+        }
       }
       return next
     })
@@ -574,15 +643,27 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       account_snapshots,
       project_snapshots,
       daily_limit_mode: dailyLimitMode,
-      daily_limit_global: dailyLimitGlobal,
+      // #595 兜底：state 残留 0/NaN 时强制回 75，避免触发后端 Pydantic 422
+      daily_limit_global: dailyLimitMode === 'global' && dailyLimitGlobal >= 1 && dailyLimitGlobal <= 75
+        ? dailyLimitGlobal
+        : (dailyLimitMode === 'global' ? 75 : undefined),
       daily_limit_per_account: dailyLimitMode === 'per_account'
         ? selAccounts.map<DailyLimitEntry>((a) => {
-            const v = dailyLimitPerAccount[a.id]
-            const lim = (typeof v === 'number' && !Number.isNaN(v) && v >= 1) ? v : 1
+            const rec = dailyLimitPerAccount[a.id]
+              ?? { limit: dailyLimitGlobal >= 1 ? dailyLimitGlobal : 75,
+                   scheduleMode: 'balanced' as const,
+                   fixedIntervalMin: 10, balancedStepMin: 60 }
+            const lim = (typeof rec.limit === 'number' && !Number.isNaN(rec.limit) && rec.limit >= 1) ? rec.limit : 1
+            const fixedMin = (typeof rec.fixedIntervalMin === 'number' && !Number.isNaN(rec.fixedIntervalMin) && rec.fixedIntervalMin >= 1) ? rec.fixedIntervalMin : 10
+            const balancedMin = (typeof rec.balancedStepMin === 'number' && !Number.isNaN(rec.balancedStepMin) && rec.balancedStepMin >= 1) ? rec.balancedStepMin : 60
             return {
               account_id: a.id,
               account_label: a.nickname || a.remark || '',
-              limit: lim,
+              limit: Math.min(lim, 75),
+              // #596：分账号下每账号独立算模式 + 两个独立间隔字段（切 mode 不影响值）
+              schedule_mode: rec.scheduleMode || 'balanced',
+              fixed_interval_min: fixedMin,
+              balanced_step_min: balancedMin,
             }
           })
         : [],
@@ -726,10 +807,24 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       }
       return true
     }
-    if (step === 5) return (dailyLimitGlobal >= 1 || dailyLimitMode === 'per_account')
-      && !!startTime && !!endTime && startTime < endTime
-      // #calc_mode：固定模式 ≥ 1，均衡模式 ≥ 1；视频目录模式固定步长
-      && (scheduleMode === 'fixed' ? fixedIntervalMin >= 1 : balancedStepMin >= 1)
+    if (step === 5) {
+      // #596 + #597：发布模式 + 排期时间 + 间隔统一校验
+      if (!startTime || !endTime || startTime >= endTime) return false
+      // #597：起始时间必须晚于当前（兜底硬拦截，避免手填过去时间）
+      if (startTime <= localNowStr()) return false
+      if (dailyLimitMode === 'global') {
+        if (!(dailyLimitGlobal >= 1)) return false
+        // #calc_mode：固定模式 ≥ 1，均衡模式 ≥ 1
+        if (scheduleMode === 'fixed') return fixedIntervalMin >= 1
+        return balancedStepMin >= 1
+      }
+      // 分账号：每账号 limit ≥ 1 + 两个 interval 字段都 ≥ 1
+      return selAccounts.every((a) => {
+        const rec = dailyLimitPerAccount[a.id]
+        if (!rec || rec.limit < 1) return false
+        return rec.fixedIntervalMin >= 1 && rec.balancedStepMin >= 1
+      })
+    }
     return true
   })()
 
@@ -1255,127 +1350,185 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
 
       {step === 5 && (
         <div className="space-y-4">
-          {/* #418：合并上限 + 排期时间 + 间隔为「排期规则」一步；
-              #428：再折叠「自主声明 / 是否允许下载」到本步末尾 */}
+          {/* #596：合并「每天上限 + 计算模式」为「发布模式」一节；
+              - 全局：1 行（每天上限 + 计算模式 select + 间隔 input）
+              - 分账号：每账号独立行（账号 \| 每天上限 \| 计算模式 select \| 间隔 input） */}
           <div>
-            <label className="mb-1 block text-sm font-medium">每天发布上限</label>
+            <label className="mb-1 block text-sm font-medium">发布模式</label>
             <div className="flex items-center gap-3 text-sm">
               <label className="flex items-center gap-1">
                 <input type="radio" checked={dailyLimitMode === 'global'}
-                  onChange={() => setDailyLimitMode('global')} />全局上限
+                  onChange={() => setDailyLimitMode('global')} />全局
               </label>
               <label className="flex items-center gap-1">
                 <input type="radio" checked={dailyLimitMode === 'per_account'}
-                  onChange={() => setDailyLimitMode('per_account')} />分账号上限
+                  onChange={() => setDailyLimitMode('per_account')} />分账号
               </label>
             </div>
             {dailyLimitMode === 'global' ? (
-              <div className="mt-1">
-                <input type="number" min={1} max={75}
-                  className="h-9 w-32 rounded-md border border-border bg-white px-3 text-sm"
-                  value={Number.isNaN(dailyLimitGlobal) ? '' : dailyLimitGlobal}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10)
-                    // #413 真机 bug 修复 U6：清空时保留 0 让用户看到必填，不静默变 NaN
-                    // 后端 daily_limit_global 校验 ≤ 75（参考 publish 模型）：超过自动钳到 75 并提示
-                    if (!Number.isNaN(v) && v > 75) {
-                      toast('每天上限不能超过 75', 'info')
-                      setDailyLimitGlobal(75)
-                    } else {
-                      setDailyLimitGlobal(Number.isNaN(v) ? 0 : v)
-                    }
-                  }} />
+              /* 全局：每天上限 + 计算模式（select）+ 间隔（input） */
+              <div className="mt-2 space-y-2">
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-2 text-sm">
+                    <span className="shrink-0 text-muted-foreground">每天上限</span>
+                    <input type="number" min={1} max={75}
+                      className="h-9 w-32 rounded-md border border-border bg-white px-3 text-sm"
+                      value={Number.isNaN(dailyLimitGlobal) ? '' : dailyLimitGlobal}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10)
+                        // #413 真机 bug 修复 U6：清空/0 自动回 75，避免发出非法值触发后端 400 toast
+                        if (Number.isNaN(v) || v < 1) {
+                          toast('每天上限不能为空，已自动设为 75', 'info')
+                          setDailyLimitGlobal(75)
+                        } else if (v > 75) {
+                          toast('每天上限不能超过 75', 'info')
+                          setDailyLimitGlobal(75)
+                        } else {
+                          setDailyLimitGlobal(v)
+                        }
+                      }} />
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <span className="shrink-0 text-muted-foreground">计算模式</span>
+                    <select
+                      className="h-9 rounded-md border border-border bg-white px-2 text-sm"
+                      value={scheduleMode}
+                      onChange={(e) => setScheduleMode(e.target.value as 'fixed' | 'balanced')}>
+                      <option value="fixed">固定间隔</option>
+                      <option value="balanced">均衡间隔</option>
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <span className="shrink-0 text-muted-foreground">间隔（分钟）</span>
+                    {scheduleMode === 'fixed' ? (
+                      <input type="number" min={1}
+                        className="h-9 w-24 rounded-md border border-border bg-white px-3 text-sm"
+                        value={Number.isNaN(fixedIntervalMin) ? '' : fixedIntervalMin}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10)
+                          setFixedIntervalMin(Number.isNaN(v) ? 0 : v)
+                        }} />
+                    ) : (
+                      <input type="number" min={1}
+                        className="h-9 w-24 rounded-md border border-border bg-white px-3 text-sm"
+                        value={Number.isNaN(balancedStepMin) ? '' : balancedStepMin}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10)
+                          setBalancedStepMin(Number.isNaN(v) ? 0 : v)
+                        }} />
+                    )}
+                  </label>
+                </div>
               </div>
             ) : (
-              <table className="mt-1 w-full text-sm">
-                <thead>
-                  <tr className="border-b text-left text-xs text-muted-foreground">
-                    <th className="py-2">账号</th>
-                    <th>每天上限</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {selAccounts.map((a) => (
-                    <tr key={a.id} className="border-b last:border-0">
-                      <td className="py-2">{a.remark || a.nickname || a.id}</td>
-                      <td>
-                        <input type="number" min={1} max={75}
-                          className="h-8 w-24 rounded-md border border-border bg-white px-2 text-sm"
-                          value={dailyLimitPerAccount[a.id] ?? ''}
-                          onChange={(e) => {
-                            const v = parseInt(e.target.value, 10)
-                            // 同全局上限：每天上限不能超过 75
-                            if (!Number.isNaN(v) && v > 75) {
-                              toast('每天上限不能超过 75', 'info')
-                              setDailyLimitPerAccount((p) => ({ ...p, [a.id]: 75 }))
-                            } else {
-                              setDailyLimitPerAccount((p) =>
-                                ({ ...p, [a.id]: Number.isNaN(v) ? 0 : v }))
-                            }
-                          }} />
-                      </td>
+              /* 分账号：表（账号 \| 每天上限 \| 计算模式 select \| 间隔 input） */
+              <div className="mt-2 overflow-auto rounded-md border border-border">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b text-left text-xs text-muted-foreground">
+                      <th className="px-2 py-2">账号</th>
+                      <th className="px-2 py-2">每天上限</th>
+                      <th className="px-2 py-2">计算模式</th>
+                      <th className="px-2 py-2">间隔（分钟）</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {selAccounts.map((a) => {
+                      const rec = dailyLimitPerAccount[a.id]
+                        ?? { limit: dailyLimitGlobal >= 1 ? dailyLimitGlobal : 75,
+                             scheduleMode: 'balanced' as const,
+                             fixedIntervalMin: 10, balancedStepMin: 60 }
+                      // #596：两个独立 interval 字段，按当前 mode 显对应——切 mode 不丢另一字段值
+                      const currentInterval = rec.scheduleMode === 'fixed'
+                        ? rec.fixedIntervalMin
+                        : rec.balancedStepMin
+                      const updateField = (patch: Partial<typeof rec>) => {
+                        const cur = dailyLimitPerAccount[a.id]
+                          ?? { limit: 0, scheduleMode: 'balanced' as const,
+                               fixedIntervalMin: 10, balancedStepMin: 60 }
+                        setDailyLimitPerAccount((p) => ({
+                          ...p, [a.id]: { ...cur, ...patch },
+                        }))
+                      }
+                      return (
+                        <tr key={a.id} className="border-b last:border-0">
+                          <td className="px-2 py-1.5">{a.remark || a.nickname || a.id}</td>
+                          <td className="px-2 py-1.5">
+                            <input type="number" min={1} max={75}
+                              className="h-8 w-24 rounded-md border border-border bg-white px-2 text-sm"
+                              value={rec.limit === 0 ? '' : rec.limit}
+                              onChange={(e) => {
+                                const v = parseInt(e.target.value, 10)
+                                if (!Number.isNaN(v) && v > 75) {
+                                  toast('每天上限不能超过 75', 'info')
+                                  updateField({ limit: 75 })
+                                } else {
+                                  updateField({ limit: Number.isNaN(v) ? 0 : v })
+                                }
+                              }} />
+                          </td>
+                          <td className="px-2 py-1.5">
+                            <select
+                              className="h-8 rounded-md border border-border bg-white px-2 text-sm"
+                              value={rec.scheduleMode}
+                              onChange={(e) => {
+                                updateField({ scheduleMode: e.target.value as 'fixed' | 'balanced' })
+                              }}>
+                              <option value="fixed">固定间隔</option>
+                              <option value="balanced">均衡间隔</option>
+                            </select>
+                          </td>
+                          <td className="px-2 py-1.5">
+                            <input type="number" min={1}
+                              className="h-8 w-24 rounded-md border border-border bg-white px-2 text-sm"
+                              value={currentInterval === 0 ? '' : currentInterval}
+                              onChange={(e) => {
+                                const v = parseInt(e.target.value, 10)
+                                // 写到当前 mode 对应字段（切 mode 不丢另一字段值）
+                                if (rec.scheduleMode === 'fixed') {
+                                  updateField({ fixedIntervalMin: Number.isNaN(v) ? 0 : v })
+                                } else {
+                                  updateField({ balancedStepMin: Number.isNaN(v) ? 0 : v })
+                                }
+                              }} />
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="mb-1 block text-sm font-medium">起始发布时间</label>
-              <input className="h-9 w-full rounded-md border border-border bg-white px-3 font-mono text-sm"
-                value={startTime} onChange={(e) => setStartTime(e.target.value)} />
+              {/* #597：datetime-local picker — 浏览器原生日期时间选择器，避免手填格式错误；
+                  min=now 本地化字符串（浏览器内置拦截过去时间），value 转换 HH:mm ↔ T HH:mm */}
+              <input type="datetime-local" step={60}
+                className="h-9 w-full rounded-md border border-border bg-white px-3 text-sm"
+                min={localNowMin()}
+                value={startTime.replace(' ', 'T')}
+                onChange={(e) => setStartTime(e.target.value.replace('T', ' '))} />
             </div>
             <div>
               <label className="mb-1 block text-sm font-medium">结束发布时间</label>
-              <input className="h-9 w-full rounded-md border border-border bg-white px-3 font-mono text-sm"
-                value={endTime} onChange={(e) => setEndTime(e.target.value)} />
+              {/* #597：min=startTime 强制 end > start（start 已是合法的未来时间） */}
+              <input type="datetime-local" step={60}
+                className="h-9 w-full rounded-md border border-border bg-white px-3 text-sm"
+                min={startTime.replace(' ', 'T')}
+                value={endTime.replace(' ', 'T')}
+                onChange={(e) => setEndTime(e.target.value.replace('T', ' '))} />
             </div>
-            <div className="col-span-2 space-y-2">
-              <label className="mb-1 block text-sm font-medium">计算模式</label>
-              <div className="flex items-center gap-4 text-sm">
-                <label className="flex items-center gap-1">
-                  <input type="radio" checked={scheduleMode === 'fixed'}
-                    onChange={() => setScheduleMode('fixed')} />
-                  固定间隔
-                </label>
-                <label className="flex items-center gap-1">
-                  <input type="radio" checked={scheduleMode === 'balanced'}
-                    onChange={() => setScheduleMode('balanced')} />
-                  均衡间隔
-                </label>
-              </div>
-            </div>
-            {scheduleMode === 'fixed' ? (
-              <div>
-                <label className="mb-1 block text-sm font-medium">固定间隔（分钟）</label>
-                <input type="number" min={1}
-                  className="h-9 w-full rounded-md border border-border bg-white px-3 text-sm"
-                  value={Number.isNaN(fixedIntervalMin) ? '' : fixedIntervalMin}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10)
-                    setFixedIntervalMin(Number.isNaN(v) ? 0 : v)
-                  }} />
-              </div>
-            ) : (
-              <div>
-                <label className="mb-1 block text-sm font-medium">均衡间隔（分钟，默认 60）</label>
-                <input type="number" min={1}
-                  className="h-9 w-full rounded-md border border-border bg-white px-3 text-sm"
-                  value={Number.isNaN(balancedStepMin) ? '' : balancedStepMin}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10)
-                    setBalancedStepMin(Number.isNaN(v) ? 0 : v)
-                  }} />
-              </div>
-            )}
+            {/* #596：计算模式 + 间隔已收纳进上方「发布模式」段（全局/分账号各自展示），
+                此处不再重复。保留起始/结束时间 + 提示。 */}
             {startTime && endTime && startTime >= endTime && (
               <div className="col-span-2 text-xs text-danger">结束时间必须晚于起始时间</div>
             )}
-            {/* #413 真机 bug 修复 U3：提示用户用 yyyy-MM-dd HH:mm 格式；#420 去掉秒数 */}
-            <div className="col-span-2 text-xs text-muted-foreground">
-              时间格式：yyyy-MM-dd HH:mm（如 2026-09-22 07:00）
-            </div>
+            {/* #597：起始时间不能是过去；与后端 _validate_payload 双重拦截 */}
+            {startTime && startTime <= localNowStr() && (
+              <div className="col-span-2 text-xs text-danger">起始时间必须晚于当前</div>
+            )}
             <div className="col-span-2 text-xs text-muted-foreground">
               默认起始 = 明天 07:00，结束 = 明天 22:00。固定模式：所有账号共用固定间隔顺排；均衡模式：每项目独占时段内等距（步长 = 均衡间隔）
             </div>

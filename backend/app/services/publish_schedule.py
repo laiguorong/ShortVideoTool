@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from app.db import get_db
+
 
 class ScheduleOverflowError(ValueError):
     """排期溢出基类——子类型用 category 区分原因，前端按 category 回退到对应 step。
@@ -41,6 +43,57 @@ class ScheduleVideoShortageError(ScheduleOverflowError):
     """视频目录下合规视频数 < 当前排期所需的第 k 个。"""
 
     category = "video"
+
+
+# #595：明细入库前实时检查——DB 是否有未完成明细占用此 video_path
+# 占用判定：item.status IN ('waiting','publishing','paused')
+# success/failed/cancelled：已释放（成功会归档到 _published/）
+# ⚠️ 新增 item.status 枚举时必须同步此列表，否则漏锁或误锁
+_IN_FLIGHT_ITEM_STATUSES = ("waiting", "publishing", "paused")
+
+
+def _is_video_locked(video_path: str) -> bool:
+    """#595：明细入库前实时查 DB——返回 True 表示该路径正被其它发布任务占用。
+
+    仅 _confirm_video_dir（cfg.skip_locked_videos=True）走此路径；preview 路径不感知锁。
+    单点 SQL（参数化，LIMIT 1）→ 加 idx_item_video_path 索引可毫秒级返回。
+    """
+    d = get_db()
+    row = d.query_one(
+        "SELECT 1 FROM publish_task_item "
+        "WHERE video_path=? AND source='video_dir' "
+        "AND status IN (?, ?, ?) LIMIT 1",
+        (video_path, *_IN_FLIGHT_ITEM_STATUSES),
+    )
+    return row is not None
+
+
+def _count_locked_in_dir(d: VideoDirProjectSpec) -> int:
+    """#595：返回该目录下当前被其它任务占用的 video_paths 数量（用于错误消息拼接）。
+
+    单次 SQL（IN 子句 + COUNT(DISTINCT)）→ 避免在赋值点循环调 _is_video_locked 反复查 DB。
+    """
+    if not d.video_paths:
+        return 0
+    placeholders = ",".join("?" * len(d.video_paths))
+    row = get_db().query_one(
+        f"SELECT COUNT(DISTINCT video_path) AS cnt FROM publish_task_item "
+        f"WHERE source='video_dir' AND status IN ({','.join('?' * len(_IN_FLIGHT_ITEM_STATUSES))}) "
+        f"AND video_path IN ({placeholders})",
+        (*_IN_FLIGHT_ITEM_STATUSES, *d.video_paths),
+    )
+    return int(row["cnt"]) if row else 0
+
+
+def _skip_locked_k(d: VideoDirProjectSpec, k: int) -> int:
+    """#595：实时查 DB，从 k 开始逐个跳过被占视频，返回下一个可用 k（可能 == len 越界）。
+
+    调用方拿到返回值后必须再做 `k >= len(d.video_paths)` 检查以抛 ScheduleVideoShortageError。
+    仅在 cfg.skip_locked_videos=True 时调用。
+    """
+    while k < len(d.video_paths) and _is_video_locked(d.video_paths[k]):
+        k += 1
+    return k
 
 
 # ---------- 数据结构 ----------
@@ -72,6 +125,10 @@ class ScheduleItem:
     intro_content: str
     intro_topics: tuple[str, ...]
     plan_time: str                     # #420 yyyy-MM-dd HH:mm（去掉秒数）
+    # #596：分账号上限下，每个明细带的算模式 + 间隔写回 DB；
+    # global 模式下两字段都从 cfg 顶层继承，调度后回填。
+    schedule_mode: str = "balanced"    # 'fixed' | 'balanced'
+    interval_min: int = 60             # 间隔分钟
 
 
 @dataclass(frozen=True)
@@ -83,28 +140,35 @@ class ScheduleConfig:
     - 'balanced'：原"等距排期"行为，每项目独占时段内等距；balanced_step_min 直接作步长。
 
     旧字段 same_project_interval_min / diff_project_interval_min 保留向后兼容读取。
+
+    #596：daily_limit_per_account_schedule 是 (account_id, mode, interval_min) 三元组。
+    per_account 模式下按账号组合 (mode, interval_min) 调度（每账号独立算模式）；
+    global 模式下不读此字段，用顶层 schedule_mode / *_interval_min。
     """
     account_ids: tuple[str, ...]
     projects: tuple[ProjectSpec, ...]
     daily_limit_mode: str              # global / per_account
     daily_limit_global: int            # mode=global 时使用
     daily_limit_per_account: tuple[tuple[str, int], ...]  # mode=per_account 时使用
-    start_time: str                    # yyyy-MM-dd HH:mm:ss
-    end_time: str                      # yyyy-MM-dd HH:mm:ss（同日）
-    # #calc_mode 新字段
-    schedule_mode: str = "balanced"    # 'fixed' | 'balanced'
-    fixed_interval_min: int = 10       # schedule_mode='fixed' 时使用
-    balanced_step_min: int = 60        # schedule_mode='balanced' 时使用（步长）
+    start_time: str
+    end_time: str
+    # #calc_mode 全局模式下使用的字段
+    schedule_mode: str = "balanced"
+    fixed_interval_min: int = 10
+    balanced_step_min: int = 60
     # 旧字段保留（向后兼容旧 DB draft）
     same_project_interval_min: int | None = None
     diff_project_interval_min: int | None = None
+    # #596：per_account 模式下每账号独立的算模式 + 间隔；放在所有非默认字段后（dataclass 限制）
+    # 4 元组：(account_id, schedule_mode, fixed_interval_min, balanced_step_min)
+    daily_limit_per_account_schedule: tuple[tuple[str, str, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.daily_limit_mode not in ("global", "per_account"):
             raise ValueError("daily_limit_mode 必须为 global 或 per_account")
         if self.daily_limit_mode == "global" and self.daily_limit_global < 1:
             raise ValueError("daily_limit_global 必须 >= 1")
-        # #calc_mode 模式校验
+        # #calc_mode 模式校验（顶层字段——global 模式必填，per_account 模式仅 fallback 用）
         if self.schedule_mode not in ("fixed", "balanced"):
             raise ValueError(f"schedule_mode 必须为 fixed 或 balanced，当前：{self.schedule_mode!r}")
         if self.schedule_mode == "fixed" and self.fixed_interval_min < 1:
@@ -119,7 +183,7 @@ class ScheduleConfig:
         if end <= start:
             raise ValueError("结束时间必须晚于起始时间")
         # #calc_mode 终版：均衡模式要求 window ≥ balanced_step_min（项目内步长）；
-        # 否则连 1 条都排不下
+        # 否则连 1 条都排不下。仅校验顶层 balanced_step_min（global 模式用）。
         window_min = int((end - start).total_seconds() // 60)
         if self.schedule_mode == "balanced" and window_min < self.balanced_step_min:
             raise ValueError(
@@ -134,6 +198,21 @@ class ScheduleConfig:
                 raise ValueError(f"项目 {p.id} 门店列表不能为空")
             # #456：视频简介允许为空（intros=() 表示不添加视频简介；空校验已删除，
             # 下游 _schedule_for_account_balanced / _schedule_fixed 用占位 intro_id='' 兜底）
+        # #596：per_account 模式下 daily_limit_per_account_schedule 必须给每账号一条
+        # 4 元组：(account_id, schedule_mode, fixed_interval_min, balanced_step_min)
+        if self.daily_limit_mode == "per_account":
+            sched_ids = {aid for aid, _, _, _ in self.daily_limit_per_account_schedule}
+            missing = [aid for aid in self.account_ids if aid not in sched_ids]
+            if missing:
+                raise ValueError(f"per_account 模式下账号 {missing} 未指定算模式 + 间隔")
+            for aid, mode, fixed_min, balanced_min in self.daily_limit_per_account_schedule:
+                if mode not in ("fixed", "balanced"):
+                    raise ValueError(f"账号 {aid} schedule_mode 必须为 fixed 或 balanced，当前：{mode!r}")
+                # 两个独立间隔字段都校验——保证 scheduler 按 mode 取对应字段时一定有值
+                if fixed_min < 1:
+                    raise ValueError(f"账号 {aid} 固定间隔必须 >= 1 分钟，当前：{fixed_min}")
+                if balanced_min < 1:
+                    raise ValueError(f"账号 {aid} 均衡间隔必须 >= 1 分钟，当前：{balanced_min}")
 
 
 @dataclass
@@ -320,6 +399,9 @@ def _schedule_for_account_balanced(account_id: str,
             intro_content=intro.content,
             intro_topics=intro.topics,
             plan_time=_format(t_dt),
+            # #596：分账号模式下该账号的算模式 + 间隔写回 item 行
+            schedule_mode="balanced",
+            interval_min=interval_min,
         ))
     return items
 
@@ -327,8 +409,9 @@ def _schedule_for_account_balanced(account_id: str,
 def _schedule_fixed(cfg: ScheduleConfig,
                     start_dt: datetime,
                     end_dt: datetime,
-                    limits: dict[str, int]) -> tuple[list[ScheduleItem], ScheduleStats]:
-    """#calc_mode 固定模式排期：所有账号共用 fixed_interval_min，每账号独立 seq（对齐视频目录 fixed 模式）。
+                    limits: dict[str, int],
+                    acc_schedules: dict[str, tuple[str, int, int]] | None = None) -> tuple[list[ScheduleItem], ScheduleStats]:
+    """#calc_mode 固定模式排期。
 
     算法（用户最终定义）：
     - 步长 = max(fixed_min // n_proj, 10)（项目间交错 + 步长下限 10min）
@@ -339,11 +422,15 @@ def _schedule_fixed(cfg: ScheduleConfig,
     - K_A≠K_B 不对称：seq 推进式 break，末条所在项目可能比前项目少 1 条
       （如 fixed=40, n_proj=2 → projA 12 + projB 11）；需要对称请用 balanced 模式
 
+    #596：acc_schedules 为 None 时所有账号共用 cfg.schedule_mode + cfg.fixed_interval_min；
+    非空时按账号独立（per_account daily 算模式用）：
+    {account_id: (mode, interval_min)} —— mode ∈ {'fixed','balanced'}，interval_min 单位分钟。
+    不在 acc_schedules 的账号按 cfg 顶层 fallback。
+
     例：fixed=10, n_proj=3, acc_limit=4, accounts=2
         账号0 seq=0/1/2/3: 07:00 项目0 / 07:10 项目1 / 07:20 项目2 / 07:30 项目0
         账号1 seq=0/1/2/3: 07:00 项目0 / 07:10 项目1 / 07:20 项目2 / 07:30 项目0
     """
-    fixed_min = cfg.fixed_interval_min
     items: list[ScheduleItem] = []
     stats = ScheduleStats()
 
@@ -354,19 +441,24 @@ def _schedule_fixed(cfg: ScheduleConfig,
         return items, stats
 
     n_proj = len(cfg.projects)
-    # #calc_mode 末条约束：
-    # step = max(fixed_min // n_proj, 10)，last_allowed = end_dt − step。
-    # 例：fixed=40, n_proj=2 → step=20, last_allowed = end_dt − 20min = 21:40。
-    # seq=22 t=21:40 ≤ 21:40 ✓；seq=23 t=22:00 > 21:40 截断 → 末条 = 21:40。
-    step = _compute_step_with_floor(fixed_min, n_proj, "固定")
-    last_allowed_dt = end_dt - timedelta(minutes=step)
 
     for account_id in cfg.account_ids:
+        # #596：per_account 算模式 — 每账号独立 mode + 独立 fixed/balanced 字段
+        if acc_schedules and account_id in acc_schedules:
+            acc_mode, fixed_min, balanced_min = acc_schedules[account_id]
+            # 按当前 mode 取对应字段
+            acc_interval = fixed_min if acc_mode == "fixed" else balanced_min
+        else:
+            acc_mode, acc_interval = cfg.schedule_mode, cfg.fixed_interval_min
+        # fixed 计算后用全局步长下限：
+        # step = max(acc_interval // n_proj, 10)，last_allowed = end_dt − step。
+        step = _compute_step_with_floor(acc_interval, n_proj, "固定")
+        last_allowed_dt = end_dt - timedelta(minutes=step)
         acc_limit = limits[account_id]
         produced_for_acc = 0
         for seq in range(acc_limit):
             project_idx = seq % n_proj
-            t_dt = start_dt + timedelta(minutes=seq * fixed_min)
+            t_dt = start_dt + timedelta(minutes=seq * acc_interval)
             if t_dt > last_allowed_dt:
                 break  # 末条约束；超出直接停
             project = cfg.projects[project_idx]
@@ -381,6 +473,9 @@ def _schedule_fixed(cfg: ScheduleConfig,
                 intro_content=intro.content,
                 intro_topics=intro.topics,
                 plan_time=_format(t_dt),
+                # #596：写回 item 行（global 模式全账号同值，per_account 下每账号独立）
+                schedule_mode=acc_mode,
+                interval_min=acc_interval,
             ))
             produced_for_acc += 1
         stats.by_account[account_id] = produced_for_acc
@@ -396,27 +491,61 @@ def build_schedule(cfg: ScheduleConfig) -> tuple[list[ScheduleItem], ScheduleSta
     #calc_mode：根据 schedule_mode 分发到 fixed 或 balanced 实现。
     - balanced：seq 单账号内全局递增，project_idx = seq % n_proj，步长 = interval // n_proj（≥ 10）
     - fixed：每账号独立 seq（账号0/1 都从 seq=0 开始），project_idx = seq % n_proj，步长 = interval（≥ 10）
+
+    #596：per_account 模式下按账号的 (mode, interval_min) 独立调度；
+    global 模式下全账号共用 cfg.schedule_mode + cfg.{fixed,balanced}_interval_min。
     """
     start_dt = _parse(cfg.start_time)
     end_dt = _parse(cfg.end_time)
     limits = _resolve_limits(cfg)
 
+    if cfg.daily_limit_mode == "per_account":
+        # #596：per_account 算模式配置 → dict（方便子函数按账号 O(1) 取）
+        # 值：(mode, fixed_interval_min, balanced_step_min) — 按 mode 取对应字段
+        acc_schedules: dict[str, tuple[str, int, int]] = {
+            aid: (mode, fixed_min, balanced_min)
+            for aid, mode, fixed_min, balanced_min in cfg.daily_limit_per_account_schedule
+        }
+    else:
+        acc_schedules = None
+
     if cfg.schedule_mode == "fixed":
-        all_items, stats = _schedule_fixed(cfg, start_dt, end_dt, limits)
+        all_items, stats = _schedule_fixed(cfg, start_dt, end_dt, limits, acc_schedules)
     else:
         all_items: list[ScheduleItem] = []
         stats = ScheduleStats()
         for account_id in cfg.account_ids:
-            items = _schedule_for_account_balanced(
-                account_id=account_id,
-                projects=cfg.projects,
-                limit=limits[account_id],
-                start_dt=start_dt,
-                end_dt=end_dt,
-                interval_min=cfg.balanced_step_min,
-            )
-            all_items.extend(items)
-            stats.by_account[account_id] = len(items)
+            # #596：per_account 下按账号取 mode + 独立 interval；global 下共用顶层
+            if acc_schedules and account_id in acc_schedules:
+                acc_mode, fixed_min, balanced_min = acc_schedules[account_id]
+                # 按当前 mode 取对应字段（与全局行为对齐：切 mode 不丢另一字段值）
+                acc_interval = fixed_min if acc_mode == "fixed" else balanced_min
+            else:
+                acc_mode, acc_interval = "balanced", cfg.balanced_step_min
+            if acc_mode == "fixed":
+                # 该账号选 fixed：用 _schedule_fixed 子函数，但只生成单账号版（再聚合）
+                # 简化：内联一段固定模式单账号循环（避免改 _schedule_fixed 拆子函数）
+                single_items = _schedule_single_account_fixed(
+                    account_id=account_id,
+                    projects=cfg.projects,
+                    limit=limits[account_id],
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    fixed_interval_min=acc_interval,
+                )
+                all_items.extend(single_items)
+                stats.by_account[account_id] = len(single_items)
+            else:
+                items = _schedule_for_account_balanced(
+                    account_id=account_id,
+                    projects=cfg.projects,
+                    limit=limits[account_id],
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    interval_min=acc_interval,
+                )
+                all_items.extend(items)
+                stats.by_account[account_id] = len(items)
 
     # 全局按时间升序
     all_items.sort(key=lambda x: (x.plan_time, x.account_id, x.project_id))
@@ -444,6 +573,48 @@ def build_schedule(cfg: ScheduleConfig) -> tuple[list[ScheduleItem], ScheduleSta
             )
     return all_items, stats
 
+
+def _schedule_single_account_fixed(account_id: str,
+                                    projects: tuple[ProjectSpec, ...],
+                                    limit: int,
+                                    start_dt: datetime,
+                                    end_dt: datetime,
+                                    fixed_interval_min: int) -> list[ScheduleItem]:
+    """#596：per_account 模式下某账号选 fixed 的单账号版排期（避免改 _schedule_fixed 拆子函数）。
+
+    算法与 _schedule_fixed 同构，但只生成单个账号（账号→项目按 seq % n_proj 交错，
+    每条 plan_time = start_dt + seq × fixed_interval_min）。
+    """
+    if fixed_interval_min < 1:
+        raise ScheduleTimeShortageError(f"固定间隔必须 ≥ 1min，当前 {fixed_interval_min}")
+    if not projects:
+        return []
+    n_proj = len(projects)
+    step = _compute_step_with_floor(fixed_interval_min, n_proj, "固定")
+    last_allowed_dt = end_dt - timedelta(minutes=step)
+    items: list[ScheduleItem] = []
+    for seq in range(limit):
+        project_idx = seq % n_proj
+        t_dt = start_dt + timedelta(minutes=seq * fixed_interval_min)
+        if t_dt > last_allowed_dt:
+            break
+        project = projects[project_idx]
+        k = seq // n_proj
+        intro = _resolve_intro(project.intros, k)
+        shop_id = _resolve_shop(project.shop_ids, k)
+        items.append(ScheduleItem(
+            account_id=account_id,
+            project_id=project.id,
+            shop_id=shop_id,
+            intro_id=intro.id,
+            intro_content=intro.content,
+            intro_topics=intro.topics,
+            plan_time=_format(t_dt),
+            schedule_mode="fixed",
+            interval_min=fixed_interval_min,
+        ))
+    return items
+
 # ---------- #418 视频目录模式独立排期 ----------
 
 @dataclass(frozen=True)
@@ -465,6 +636,9 @@ class VideoDirScheduleItem:
     shop_name: str                # 手动输入门店名（poi_id 留空，发布时按名称模糊匹配）
     intro_content: str            # #292：手动输入视频简介（按视频顺序轮转）
     plan_time: str
+    # #596：分账号上限下，每个明细带的算模式 + 间隔写回 DB
+    schedule_mode: str = "fixed"  # 视频目录默认 fixed（用户场景）
+    interval_min: int = 10        # 间隔分钟（fixed → fixed_interval_min；balanced → balanced_step_min）
 
 
 @dataclass(frozen=True)
@@ -477,6 +651,8 @@ class VideoDirScheduleConfig:
       目录间交错偏移 = step。两模式同配置生成一致 plan_time 序列。
 
     字段命名与 ScheduleConfig 完全一致，便于上层 service 统一构造/落库。
+
+    #596：per_account 模式下每账号独立算模式 + 间隔（与项目模式对齐）。
     """
     account_ids: tuple[str, ...]
     video_dirs: tuple[VideoDirProjectSpec, ...]
@@ -491,6 +667,12 @@ class VideoDirScheduleConfig:
     balanced_step_min: int = 60
     # 视频简介-按项目一一对应：key=dir.id，value=该目录下的简介元组；按各目录的视频数独立轮转
     manual_intros: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # #595：明细入库前实时跳过——True 时 scheduler 在选 vp 前逐个查 DB 跳过被占路径
+    # （confirm-direct 用），False 时按原有逻辑不感知锁（preview 用）
+    skip_locked_videos: bool = False
+    # #596：per_account 模式下每账号独立的算模式 + 间隔；放在所有非默认字段后（dataclass 限制）
+    # 4 元组：(account_id, schedule_mode, fixed_interval_min, balanced_step_min)
+    daily_limit_per_account_schedule: tuple[tuple[str, str, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.daily_limit_mode not in ("global", "per_account"):
@@ -522,6 +704,21 @@ class VideoDirScheduleConfig:
             intros_for_dir = self.manual_intros.get(d.id) or ()
             if not intros_for_dir:
                 raise ValueError(f"目录 {d.title} 必须至少输入 1 条视频简介")
+        # #596：per_account 模式下 daily_limit_per_account_schedule 必须给每账号一条
+        # 4 元组：(account_id, schedule_mode, fixed_interval_min, balanced_step_min)
+        if self.daily_limit_mode == "per_account":
+            sched_ids = {aid for aid, _, _, _ in self.daily_limit_per_account_schedule}
+            missing = [aid for aid in self.account_ids if aid not in sched_ids]
+            if missing:
+                raise ValueError(f"per_account 模式下账号 {missing} 未指定算模式 + 间隔")
+            for aid, mode, fixed_min, balanced_min in self.daily_limit_per_account_schedule:
+                if mode not in ("fixed", "balanced"):
+                    raise ValueError(f"账号 {aid} schedule_mode 必须为 fixed 或 balanced，当前：{mode!r}")
+                # 两个独立间隔字段都校验——保证 scheduler 按 mode 取对应字段时一定有值
+                if fixed_min < 1:
+                    raise ValueError(f"账号 {aid} 固定间隔必须 >= 1 分钟，当前：{fixed_min}")
+                if balanced_min < 1:
+                    raise ValueError(f"账号 {aid} 均衡间隔必须 >= 1 分钟，当前：{balanced_min}")
 
 
 @dataclass
@@ -538,7 +735,8 @@ def _schedule_video_dir_balanced(account_id: str,
                                  start_dt: datetime,
                                  end_dt: datetime,
                                  interval_min: int,
-                                 acc_offset: int = 0) -> list[VideoDirScheduleItem]:
+                                 acc_offset: int = 0,
+                                 skip_locked_videos: bool = False) -> tuple[list[VideoDirScheduleItem], dict[str, int]]:
     """#418 视频目录模式 - 均衡模式（与 _schedule_for_account_balanced 算法对齐：两模式同配置应生成一致 plan_time）。
 
     算法对齐（#calc_mode 对齐项目模式）：
@@ -563,13 +761,16 @@ def _schedule_video_dir_balanced(account_id: str,
     if interval_min < 1:
         raise ScheduleTimeShortageError(f"均衡间隔必须 ≥ 1min，当前 {interval_min}")
     if not video_dirs:
-        return []
+        return [], {}
     n_dirs = len(video_dirs)
     step = _compute_step_with_floor(interval_min, n_dirs, "视频目录-均衡")
     last_allowed_dt = end_dt - timedelta(minutes=step)
 
     items: list[VideoDirScheduleItem] = []
     used_times: set[datetime] = set()
+    # #595b：每个目录独立维护 k 游标（不重置）——同任务内不重复选同一视频
+    # 起始值 = acc_offset（多账号交错段起点）
+    dir_k: dict[str, int] = {d.id: acc_offset for d in video_dirs}
     for seq in range(limit):
         dir_idx = seq % n_dirs
         t_min = (seq // n_dirs) * interval_min + dir_idx * step
@@ -585,10 +786,20 @@ def _schedule_video_dir_balanced(account_id: str,
             break  # 末条约束；超出直接停
         used_times.add(t_dt)
         d = video_dirs[dir_idx]
-        # #fix-video-dedup：acc_offset 让多账号在同目录占不同 k 段，避免共用视频
-        k = seq // n_dirs + acc_offset
+        # #595b：k 用 dir 独立游标（不重置）——被占跳过/正常选完后都递增
+        k = dir_k[d.id]
+        # #595：True 时实时查 DB 跳过被占视频（confirm-direct 用）
+        if skip_locked_videos:
+            k = _skip_locked_k(d, k)
         # 视频数耗尽：直接抛错，让前端提示用户调整数量/换目录（避免重复排期同文件导致多条明细指向同一视频）
         if k >= len(d.video_paths):
+            locked_cnt = _count_locked_in_dir(d) if skip_locked_videos else 0
+            if locked_cnt > 0:
+                raise ScheduleVideoShortageError(
+                    f"目录「{d.title}」共 {len(d.video_paths)} 个视频，其中 "
+                    f"{locked_cnt} 个正被其它任务占用，已无可用。"
+                    f"请等待其它任务完成或换目录。"
+                )
             raise ScheduleVideoShortageError(
                 f"目录「{d.title}」仅有 {len(d.video_paths)} 个合规视频，"
                 f"当前账号需发布 {limit} 条、按 {n_dirs} 个目录平均分配，"
@@ -607,8 +818,80 @@ def _schedule_video_dir_balanced(account_id: str,
             shop_name=shop_name,
             intro_content=intro_content,
             plan_time=_format(t_dt),
+            # #596：写回 item 行的算模式 + 间隔（视频目录均衡模式 → mode='balanced'）
+            schedule_mode="balanced",
+            interval_min=interval_min,
         ))
-    return items
+        # #595b：递增 dir 游标，下次 seq 接着
+        dir_k[d.id] = k + 1
+    return items, dir_k
+
+
+def _schedule_video_dir_single_account_fixed(account_id: str,
+                                             video_dirs: tuple[VideoDirProjectSpec, ...],
+                                             manual_intros: dict[str, tuple[str, ...]],
+                                             limit: int,
+                                             start_dt: datetime,
+                                             end_dt: datetime,
+                                             fixed_min: int,
+                                             acc_offset: int = 0,
+                                             skip_locked_videos: bool = False) -> tuple[list[VideoDirScheduleItem], dict[str, int]]:
+    """#596：per_account 视频目录 fixed 模式——单账号版（与 _schedule_video_dir_fixed_inner 同构）。
+
+    算法与 fixed_inner 同构，但只生成单账号（避免拆 fixed_inner 改子函数）：
+    - 步长 = max(fixed_min // n_dirs, 10)
+    - 每账号独立 seq=0..limit-1，dir_idx = seq % n_dirs
+    - plan_time = start_dt + seq × fixed_min
+    - 末条约束：seq 对应 t_dt > end_dt − step → break
+    - 视频文件 / 门店 / 简介：按 dir 独立 k 游标 + acc_offset
+    """
+    if fixed_min < 1:
+        raise ScheduleTimeShortageError(f"固定间隔必须 ≥ 1min，当前 {fixed_min}")
+    if not video_dirs:
+        return [], {}
+    n_dirs = len(video_dirs)
+    step = _compute_step_with_floor(fixed_min, n_dirs, "视频目录-固定")
+    last_allowed_dt = end_dt - timedelta(minutes=step)
+    items: list[VideoDirScheduleItem] = []
+    dir_k: dict[str, int] = {d.id: acc_offset for d in video_dirs}
+    for seq in range(limit):
+        dir_idx = seq % n_dirs
+        t_dt = start_dt + timedelta(minutes=seq * fixed_min)
+        if t_dt > last_allowed_dt:
+            break
+        d = video_dirs[dir_idx]
+        k = dir_k[d.id]
+        if skip_locked_videos:
+            k = _skip_locked_k(d, k)
+        if k >= len(d.video_paths):
+            locked_cnt = _count_locked_in_dir(d) if skip_locked_videos else 0
+            if locked_cnt > 0:
+                raise ScheduleVideoShortageError(
+                    f"目录「{d.title}」共 {len(d.video_paths)} 个视频，其中 "
+                    f"{locked_cnt} 个正被其它任务占用，已无可用。"
+                    f"请等待其它任务完成或换目录。"
+                )
+            raise ScheduleVideoShortageError(
+                f"目录「{d.title}」仅有 {len(d.video_paths)} 个合规视频，"
+                f"当前账号起始 k={acc_offset}、本目录需 k={k + 1}。"
+                f"请减少每账号发布数或增加目录内视频。"
+            )
+        vp = d.video_paths[k]
+        shop_name = d.shop_names[k % len(d.shop_names)]
+        intros_for_dir = manual_intros.get(d.id) or ()
+        intro_content = intros_for_dir[k % len(intros_for_dir)]
+        items.append(VideoDirScheduleItem(
+            account_id=account_id,
+            project_id=d.id,
+            video_path=vp,
+            shop_name=shop_name,
+            intro_content=intro_content,
+            plan_time=_format(t_dt),
+            schedule_mode="fixed",
+            interval_min=fixed_min,
+        ))
+        dir_k[d.id] = k + 1
+    return items, dir_k
 
 
 def build_video_dir_schedule(cfg: VideoDirScheduleConfig) -> tuple[list[VideoDirScheduleItem], VideoDirScheduleStats]:
@@ -620,46 +903,74 @@ def build_video_dir_schedule(cfg: VideoDirScheduleConfig) -> tuple[list[VideoDir
 
     视频简介 / 门店：按 k（seq // n_dirs）在该目录专属池内轮转。
     视频文件：按 k 取该目录下第 k 个（k 超长则复用尾条——业务上表示该目录视频用尽但仍继续顺排）。
+
+    #596：per_account 模式下按账号的 (mode, interval_min) 独立调度；
+    global 模式下全账号共用 cfg.schedule_mode + cfg.{fixed,balanced}_interval_min。
     """
     start_dt = _parse(cfg.start_time)
     end_dt = _parse(cfg.end_time)
     limits = _resolve_video_dir_limits(cfg)
 
-    if cfg.schedule_mode == "balanced":
-        items: list[VideoDirScheduleItem] = []
-        stats = VideoDirScheduleStats()
-        # #fix-video-dedup：累加 acc_offset 让每账号在每个目录占独立 k 段
-        n_dirs = len(cfg.video_dirs)
-        acc_offset = 0
-        for account_id in cfg.account_ids:
-            account_items = _schedule_video_dir_balanced(
+    if cfg.daily_limit_mode == "per_account":
+        # #596：per_account 算模式配置（4 元组按 mode 取对应字段）
+        acc_schedules: dict[str, tuple[str, int, int]] = {
+            aid: (mode, fixed_min, balanced_min)
+            for aid, mode, fixed_min, balanced_min in cfg.daily_limit_per_account_schedule
+        }
+    else:
+        acc_schedules = None
+
+    items: list[VideoDirScheduleItem] = []
+    stats = VideoDirScheduleStats()
+    # #fix-video-dedup：累加 acc_offset 让每账号在每个目录占独立 k 段
+    acc_offset = 0
+
+    for account_id in cfg.account_ids:
+        # #596：按账号取 mode + 独立 fixed/balanced 字段
+        if acc_schedules and account_id in acc_schedules:
+            acc_mode, fixed_min, balanced_min = acc_schedules[account_id]
+            acc_interval = fixed_min if acc_mode == "fixed" else balanced_min
+        else:
+            acc_mode, acc_interval = cfg.schedule_mode, (
+                cfg.fixed_interval_min if cfg.schedule_mode == "fixed" else cfg.balanced_step_min
+            )
+        limit = limits[account_id]
+
+        if acc_mode == "fixed":
+            account_items, dir_k_after = _schedule_video_dir_single_account_fixed(
                 account_id=account_id,
                 video_dirs=cfg.video_dirs,
                 manual_intros=cfg.manual_intros,
-                limit=limits[account_id],
+                limit=limit,
                 start_dt=start_dt,
                 end_dt=end_dt,
-                interval_min=cfg.balanced_step_min,
+                fixed_min=acc_interval,
                 acc_offset=acc_offset,
+                skip_locked_videos=cfg.skip_locked_videos,
             )
-            items.extend(account_items)
-            stats.by_account[account_id] = len(account_items)
-            # 下一个账号的 acc_offset：本账号最多占 ceil(limit / n_dirs) 段
-            if limits[account_id] > 0 and n_dirs > 0:
-                acc_offset += (limits[account_id] + n_dirs - 1) // n_dirs
-    else:
-        # fixed：单函数生成（与 _schedule_fixed 同构，seq 跨账号累加）
-        items, stats = _schedule_video_dir_fixed_inner(
-            cfg.account_ids, cfg.video_dirs, limits, start_dt, end_dt, cfg.fixed_interval_min, cfg.manual_intros,
-        )
+        else:
+            account_items, dir_k_after = _schedule_video_dir_balanced(
+                account_id=account_id,
+                video_dirs=cfg.video_dirs,
+                manual_intros=cfg.manual_intros,
+                limit=limit,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                interval_min=acc_interval,
+                acc_offset=acc_offset,
+                skip_locked_videos=cfg.skip_locked_videos,
+            )
+        items.extend(account_items)
+        stats.by_account[account_id] = len(account_items)
+        for it in account_items:
+            stats.by_directory[it.project_id] = stats.by_directory.get(it.project_id, 0) + 1
+        # #595b：下个账号起始 k = 本账号 max dir 游标（反映被占跳过的真实占用）
+        if dir_k_after:
+            acc_offset = max(dir_k_after.values())
 
     # 全局按时间升序（plan_time, account_id, project_id）
     items.sort(key=lambda x: (x.plan_time, x.account_id, x.project_id))
     stats.total = len(items)
-    # 重建 by_directory（_schedule_video_dir_fixed_inner 已填；balanced 走单账号未填，补一遍）
-    if cfg.schedule_mode == "balanced":
-        for it in items:
-            stats.by_directory[it.project_id] = stats.by_directory.get(it.project_id, 0) + 1
     return items, stats
 
 
@@ -670,78 +981,3 @@ def _resolve_video_dir_limits(cfg: VideoDirScheduleConfig) -> dict[str, int]:
     return _resolve_limits_generic(
         cfg.daily_limit_mode, cfg.daily_limit_global, cfg.daily_limit_per_account, cfg.account_ids,
     )
-
-
-def _schedule_video_dir_fixed_inner(account_ids: tuple[str, ...],
-                                    video_dirs: tuple[VideoDirProjectSpec, ...],
-                                    limits: dict[str, int],
-                                    start_dt: datetime,
-                                    end_dt: datetime,
-                                    fixed_min: int,
-                                    manual_intros: dict) -> tuple[list[VideoDirScheduleItem], VideoDirScheduleStats]:
-    """fixed 模式具体实现（#calc_mode：对齐项目 _schedule_fixed —— 每账号独立 seq，账号0/1 都从 seq=0 开始）。
-
-    算法：
-    - 步长 = max(fixed_min // n_dirs, 10)（_compute_step_with_floor）
-    - 每账号独立 seq=0..acc_limit-1，dir_idx = seq % n_dirs
-    - 每条 plan_time = start_dt + seq × fixed_min（严格单调递增，天然无同时间冲突）
-    - 末条约束：每账号最末条 ≤ end_dt − step
-    - 视频文件 / 门店 / 简介：按 k（k = seq // n_dirs + acc_offset）在该目录专属池轮转
-      - #fix-video-dedup：acc_offset 让多账号在同一目录占不同 k 段，避免共用同一视频
-    - k 超长抛 ScheduleOverflowError
-
-    例：fixed_min=10, n_dirs=3, accounts=2, acc_limit=4
-        账号0: 07:00/07:10/07:20/07:30（k=0/0/0/1 → video[0]/[0]/[0]/[1]）
-        账号1: 07:00/07:10/07:20/07:30（k=2/2/2/3 → video[2]/[2]/[2]/[3]，acc_offset=2）
-        每账号同起点 + 不同视频段 → 多账号不共用同一视频
-    """
-    if fixed_min < 1:
-        raise ScheduleTimeShortageError(f"固定间隔必须 ≥ 1min，当前 {fixed_min}")
-    if not video_dirs:
-        return [], VideoDirScheduleStats()
-    n_dirs = len(video_dirs)
-    step = _compute_step_with_floor(fixed_min, n_dirs, "视频目录-固定")
-    last_allowed_dt = end_dt - timedelta(minutes=step)
-
-    items: list[VideoDirScheduleItem] = []
-    stats = VideoDirScheduleStats()
-    # #fix-video-dedup：累加 acc_offset 让每账号在每个目录占独立 k 段，避免多账号共用同一视频
-    acc_offset = 0
-    for account_id in account_ids:
-        limit = limits[account_id]
-        produced_for_acc = 0
-        for seq in range(limit):
-            dir_idx = seq % n_dirs
-            t_dt = start_dt + timedelta(minutes=seq * fixed_min)
-            if t_dt > last_allowed_dt:
-                break
-            d = video_dirs[dir_idx]
-            # acc_offset 让同 dir_idx 的多账号 k 错开（账号0: 0..N，账号1: M..M+N）
-            k = seq // n_dirs + acc_offset
-            # 视频数耗尽：直接抛错，让前端提示用户调整数量/换目录（避免重复排期同文件导致多条明细指向同一视频）
-            if k >= len(d.video_paths):
-                raise ScheduleVideoShortageError(
-                    f"目录「{d.title}」仅有 {len(d.video_paths)} 个合规视频，"
-                    f"当前账号起始 k={acc_offset}、本目录需 k={k + 1}。"
-                    f"请减少每账号发布数或增加目录内视频。"
-                )
-            vp = d.video_paths[k]
-            shop_name = d.shop_names[k % len(d.shop_names)]
-            intros_for_dir = manual_intros.get(d.id) or ()
-            intro_content = intros_for_dir[k % len(intros_for_dir)]
-            items.append(VideoDirScheduleItem(
-                account_id=account_id,
-                project_id=d.id,
-                video_path=vp,
-                shop_name=shop_name,
-                intro_content=intro_content,
-                plan_time=_format(t_dt),
-            ))
-            produced_for_acc += 1
-            stats.total += 1
-            stats.by_account[account_id] = stats.by_account.get(account_id, 0) + 1
-            stats.by_directory[d.id] = stats.by_directory.get(d.id, 0) + 1
-        # 下一个账号的 acc_offset：本账号最多占 ceil(limit / n_dirs) 段
-        if limit > 0:
-            acc_offset += (limit + n_dirs - 1) // n_dirs
-    return items, stats

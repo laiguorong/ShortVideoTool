@@ -931,6 +931,23 @@ MIGRATIONS: list[tuple[int, str]] = [
         DROP TABLE IF EXISTS account_stats_daily;
         """,
     ),
+    (
+        45,
+        """
+        -- ============ v45 #596 发布模式算模式按账号粒度 ============
+        -- 背景：发布计数模式由「全局一份」改为「按账号独立」（分账号上限下，每个账号各自定
+        --   固定/均衡 + 间隔分钟）。publish_task 顶层 schedule_mode / fixed_interval_min /
+        --   balanced_step_min 仍存在（global 模式用），per_account 模式下不读此列。
+        -- publish_task_item 扩列存"该明细归属账号的算模式 + 间隔"，调度按 item 行粒度算时间。
+        --
+        -- 列定义：
+        --   schedule_mode TEXT NOT NULL DEFAULT 'balanced'   -- 'fixed' | 'balanced'
+        --   interval_min INTEGER NOT NULL DEFAULT 60        -- 间隔分钟
+        --
+        -- 老数据兜底 = balanced + 60min（与 v40 全局默认一致，行为零变化）。
+        -- （_apply_v45 函数里幂等补列；这里 DDL block 仅注释。）
+        """,
+    ),
 ]
 
 
@@ -973,6 +990,8 @@ def migrate(database) -> int:
             _apply_v42(database)
         elif version == 43:
             _apply_v43(database)
+        elif version == 45:
+            _apply_v45(database)
         else:
             database.executescript(ddl)
         database.set_user_version(version)
@@ -1462,6 +1481,11 @@ def _apply_v41(database) -> None:
         database.execute("ALTER TABLE publish_task_item ADD COLUMN source TEXT NOT NULL DEFAULT 'project'")
     if _has_table(database, "publish_task_item") and not _has_column(database, "publish_task_item", "video_path"):
         database.execute("ALTER TABLE publish_task_item ADD COLUMN video_path TEXT")
+    # #595：明细入库前实时查占用——给 video_dir 源的视频路径建部分索引（项目模式无 video_path）
+    database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_video_path "
+        "ON publish_task_item(video_path) WHERE source='video_dir'"
+    )
 
 
 def _apply_v40(database) -> None:
@@ -1515,3 +1539,24 @@ def _apply_v43(database) -> None:
     if _has_table(database, "share_import_task") and not _has_column(database, "share_import_task", "type"):
         database.execute(
             "ALTER TABLE share_import_task ADD COLUMN type TEXT NOT NULL DEFAULT 'video'")
+
+
+def _apply_v45(database) -> None:
+    """v45：#596 发布模式算模式按账号粒度——publish_task_item 扩 2 列。
+
+    分账号上限下，每个账号独立选固定/均衡 + 间隔：
+    - schedule_mode TEXT NOT NULL DEFAULT 'balanced'  -- 'fixed' | 'balanced'
+    - interval_min INTEGER NOT NULL DEFAULT 60       -- 间隔分钟
+
+    老行自动按 balanced + 60min 兜底（与 v40 全局默认一致），无需代码迁移。
+    全局上限下仍读 publish_task 顶层 schedule_mode 等字段（不变）。
+    """
+    if not _has_table(database, "publish_task_item"):
+        return
+    cols = [
+        ("schedule_mode", "TEXT NOT NULL DEFAULT 'balanced'"),
+        ("interval_min", "INTEGER NOT NULL DEFAULT 60"),
+    ]
+    for col, decl in cols:
+        if not _has_column(database, "publish_task_item", col):
+            database.execute(f"ALTER TABLE publish_task_item ADD COLUMN {col} {decl}")

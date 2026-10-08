@@ -81,11 +81,16 @@ class ProjectDraftEntry(BaseModel):
 
 
 class DailyLimitEntry(BaseModel):
-    """分账号每天上限。"""
+    """分账号每天上限 + 该账号算模式（#596）。"""
     account_id: str
     # #449：账号昵称/备注快照（与 account_id 同序）
     account_label: str = Field(default="", description="账号显示名快照（nickname/remark），仅日志用")
     limit: int = Field(ge=1, le=75)
+    # #596：分账号下，每个账号可独立选固定/均衡 + 两个独立间隔字段（切 mode 不影响值）
+    schedule_mode: str = Field(default="balanced", description="'fixed' | 'balanced'，仅 daily_limit_mode='per_account' 时生效")
+    # #596：两个独立字段——切 mode 时另一字段保留旧值（与全局行为对齐）
+    fixed_interval_min: int = Field(default=10, ge=1, description="固定间隔（分钟），仅 daily_limit_mode='per_account' + mode='fixed' 时使用")
+    balanced_step_min: int = Field(default=60, ge=1, description="均衡间隔（步长，分钟），仅 daily_limit_mode='per_account' + mode='balanced' 时使用")
 
 
 # #418：成品视频目录项（一个目录 = 一个项目）

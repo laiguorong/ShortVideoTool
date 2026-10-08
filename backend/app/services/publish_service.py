@@ -367,11 +367,20 @@ def preview_task(task_id: str) -> dict:
     # 每天上限解析（#413 审查 #9：避免 None/0 误判——显式 None 检查）
     if task["daily_limit_mode"] == "global":
         per_acc = ()
+        per_acc_sched = ()
         gl = task["daily_limit_global"]
         global_lim = 0 if gl is None else int(gl)
     else:
         raw = json.loads(task.get("daily_limit_per_account_json") or "[]")
         per_acc = tuple((r["account_id"], int(r["limit"])) for r in raw)
+        # #596：从 DB JSON 读 per_account 算模式 + 4 元组 (老记录无这俩字段 → fallback balanced 60/10)
+        per_acc_sched = tuple(
+            (r["account_id"],
+             r.get("schedule_mode") or _DEFAULT_SCHEDULE_MODE,
+             int(r.get("fixed_interval_min") or _DEFAULT_FIXED_INTERVAL),
+             int(r.get("balanced_step_min") or _DEFAULT_BALANCED_STEP))
+            for r in raw
+        )
         global_lim = 0
 
     # C6 修：dirty 写回改事务内，原子保证
@@ -387,6 +396,8 @@ def preview_task(task_id: str) -> dict:
         daily_limit_mode=task["daily_limit_mode"],
         daily_limit_global=global_lim,
         daily_limit_per_account=per_acc,
+        # #596：per_account 下从 DB JSON 读回每账号算模式 + 间隔
+        daily_limit_per_account_schedule=per_acc_sched,
         start_time=task["start_time"],
         end_time=task["end_time"],
         # #calc_mode：优先新字段，旧字段 fallback（用 is None 避免 0 陷阱）
@@ -417,6 +428,9 @@ def preview_task(task_id: str) -> dict:
                 "intro_content": it.intro_content,
                 "intro_topics": list(it.intro_topics),
                 "plan_time": it.plan_time,
+                # #596：preview 阶段把每条的算模式 + 间隔带上（confirm 路径 INSERT 时直接取用）
+                "schedule_mode": it.schedule_mode,
+                "interval_min": it.interval_min,
             }
             for it in items
         ],
@@ -547,6 +561,9 @@ def confirm_task(task_id: str) -> dict:
                 "declaration": task["declaration"],
                 "allow_download": task["allow_download"],
                 "status": "waiting",
+                # #596：preview 阶段已带算模式 + 间隔（按账号从 cfg 写出）；老 preview 数据可能缺这俩字段 → fallback balanced 60
+                "schedule_mode": it.get("schedule_mode") or _DEFAULT_SCHEDULE_MODE,
+                "interval_min": int(it.get("interval_min") or _DEFAULT_BALANCED_STEP),
             })
             d.execute("UPDATE generated_video SET status='occupied' WHERE id=?", (video["id"],))
             inserted += 1
@@ -761,6 +778,17 @@ def _validate_payload_video_dir(payload: dict) -> None:
     end_time = payload.get("end_time") or default_end
     if start_time >= end_time:
         raise ValueError("[时间] 结束时间必须晚于起始时间")
+    # #597：video_dir 模式同样校验起始时间不能是过去（confirm 路径已走 _validate_payload 兜底；
+    # 这里再加硬校验以保护直接 confirm-direct video_dir 的路径）
+    try:
+        start_dt = _parse_flexible(start_time)
+    except ValueError as e:
+        raise ValueError(f"[时间] {e}") from None
+    if start_dt <= datetime.now():
+        raise ValueError(
+            f"[时间] 起始时间必须晚于当前（起始 {start_dt.strftime('%Y-%m-%d %H:%M')}，"
+            f"当前 {datetime.now().strftime('%Y-%m-%d %H:%M')}），请重新选择"
+        )
 
 
 def _preview_video_dir(payload: dict) -> dict:
@@ -775,9 +803,18 @@ def _preview_video_dir(payload: dict) -> dict:
     if payload["daily_limit_mode"] == "global":
         per_acc = ()
         global_lim = int(payload.get("daily_limit_global") or 0)
+        per_acc_sched = ()
     else:
         per_acc_raw = payload.get("daily_limit_per_account") or []
         per_acc = tuple((r["account_id"], int(r["limit"])) for r in per_acc_raw)
+        # #596：per_account 下每账号独立算模式 + 4 元组 (老记录无这俩字段 → fallback fixed 10/balanced 60)
+        per_acc_sched = tuple(
+            (r["account_id"],
+             r.get("schedule_mode") or _DEFAULT_VIDEO_DIR_SCHEDULE_MODE,
+             int(r.get("fixed_interval_min") or _DEFAULT_FIXED_INTERVAL),
+             int(r.get("balanced_step_min") or _DEFAULT_BALANCED_STEP))
+            for r in per_acc_raw
+        )
         global_lim = 0
     # #calc_mode：统一解析三字段（与 _confirm_video_dir / _confirm_task_from_video_dir 共用）
     schedule_mode, fixed_interval_min, balanced_step_min, _ = _resolve_schedule_fields(payload)
@@ -788,6 +825,8 @@ def _preview_video_dir(payload: dict) -> dict:
         daily_limit_mode=payload["daily_limit_mode"],
         daily_limit_global=global_lim,
         daily_limit_per_account=per_acc,
+        # #596：per_account 下每账号独立算模式 + 间隔
+        daily_limit_per_account_schedule=per_acc_sched,
         start_time=start_time,
         end_time=end_time,
         # #calc_mode：三字段透传，与 ScheduleConfig 一致
@@ -815,6 +854,9 @@ def _preview_video_dir(payload: dict) -> dict:
                 "validation": {"warnings": [], "has_warnings": False}}
     # 视频目录 id → 目录名 映射（#418：预览项目列显示 dir_name 与 wizard step2 一致）
     dir_name_map = {d.id: d.title for d in cfg.video_dirs}
+    # #596：账号→(mode, fixed_min, balanced_min) 映射（4 元组按 mode 取对应字段）
+    sched_by_acc = {aid: (mode, fixed_min, balanced_min)
+                    for aid, mode, fixed_min, balanced_min in per_acc_sched}
     return {
         "overflow": False,
         "items": [
@@ -829,6 +871,18 @@ def _preview_video_dir(payload: dict) -> dict:
                 "intro_topics": [],
                 "plan_time": it.plan_time,
                 "video_path": it.video_path,
+                # #596：per_account 模式带该账号的 mode + 按 mode 取对应 interval；global 模式带顶层
+                "schedule_mode": (
+                    sched_by_acc[it.account_id][0]
+                    if payload["daily_limit_mode"] == "per_account" and it.account_id in sched_by_acc
+                    else schedule_mode
+                ),
+                "interval_min": (
+                    (sched_by_acc[it.account_id][1] if sched_by_acc[it.account_id][0] == "fixed"
+                     else sched_by_acc[it.account_id][2])
+                    if payload["daily_limit_mode"] == "per_account" and it.account_id in sched_by_acc
+                    else (fixed_interval_min if schedule_mode == "fixed" else balanced_step_min)
+                ),
             }
             for it in items
         ],
@@ -842,41 +896,117 @@ def _preview_video_dir(payload: dict) -> dict:
 
 
 def _confirm_video_dir(payload: dict) -> dict:
-    """#418 视频目录模式 confirm。"""
+    """#418 视频目录模式 confirm（#595：明细入库前实时跳过被占视频）。
+
+    - 自构 cfg 设 skip_locked_videos=True；scheduler 选 vp 前现查 DB 跳过被占
+    - 全占 → 抛 ScheduleVideoShortageError → 400 给前端
+    - 时间窗 / 排期字段统一算一次（之前重复两遍，bug 风险）
+    """
     _normalize_payload(payload)
     _log_payload_snapshot("confirm-direct-video-dir", payload)
     _validate_payload_video_dir(payload)
-    preview = _preview_video_dir(payload)
-    if preview.get("overflow"):
-        # 错误前缀（[视频]/[时间]）已由 _preview_video_dir 写入 message，直接抛
-        raise ValueError(preview["message"])
-    items_raw = preview["items"]
-    if not items_raw:
-        raise ValueError("[项目] 视频目录模式下无可发布明细")
-    # 保存 manual_intros 到 JSON（编辑回显 + 历史快照）——按项目一一对应的 dict
-    manual_intros_json = json.dumps(payload.get("manual_intros") or {}, ensure_ascii=False)
-    d = get_db()
+    # ===== 公共字段：scheduler cfg 构造 + INSERT 落库共用（统一计算） =====
+    specs = _build_video_dir_specs(payload)
     default_start, default_end = _default_start_end()
     start_time = payload.get("start_time") or default_start
     end_time = payload.get("end_time") or default_end
     daily_limit_mode = payload["daily_limit_mode"]
     if daily_limit_mode == "global":
+        per_acc: list = []
+        per_acc_sched: tuple = ()
         global_lim = int(payload.get("daily_limit_global") or 0)
-        per_acc = []
     else:
-        per_acc = payload.get("daily_limit_per_account") or []
+        per_acc_raw = payload.get("daily_limit_per_account") or []
+        per_acc = [
+            {"account_id": r["account_id"], "limit": int(r["limit"])}
+            for r in per_acc_raw
+        ]
+        # #596：per_account 下每账号独立算模式 + 4 元组 (老字段 interval_min 兼容 → 转固定 4 元组)
+        per_acc_sched = tuple(
+            (r["account_id"],
+             r.get("schedule_mode") or _DEFAULT_VIDEO_DIR_SCHEDULE_MODE,
+             int(r.get("fixed_interval_min") or r.get("interval_min") or _DEFAULT_FIXED_INTERVAL),
+             int(r.get("balanced_step_min") or _DEFAULT_BALANCED_STEP))
+            for r in per_acc_raw
+        )
         global_lim = 0
-    # #calc_mode：统一解析三字段 + 旧字段 fallback（与 _preview_video_dir / _confirm_task_from_video_dir 共用）
+    # #calc_mode：四字段（scheduler 用前三，DB 落库用 same_project_interval_min）
     schedule_mode, fixed_interval_min, balanced_step_min, same_project_interval_min = _resolve_schedule_fields(payload)
+    # ===== scheduler cfg =====
+    cfg = VideoDirScheduleConfig(
+        account_ids=tuple(payload["account_ids"]),
+        video_dirs=tuple(specs),
+        daily_limit_mode=daily_limit_mode,
+        daily_limit_global=global_lim,
+        daily_limit_per_account=tuple((r["account_id"], int(r["limit"])) for r in per_acc),
+        # #596：per_account 下每账号独立算模式 + 间隔
+        daily_limit_per_account_schedule=per_acc_sched,
+        start_time=start_time,
+        end_time=end_time,
+        schedule_mode=schedule_mode,
+        fixed_interval_min=fixed_interval_min,
+        balanced_step_min=balanced_step_min,
+        manual_intros={
+            d.id: tuple(payload.get("manual_intros", {}).get(d.id) or ())
+            for d in specs
+        },
+        # #595：开启实时跳过被占视频——scheduler 在选 vp 前现查 DB
+        skip_locked_videos=True,
+    )
+    # ===== 事务（默认 deferred）：scheduler + INSERT 在内 =====
+    # 桌面端 UI 无并发 confirm，无需 IMMEDIATE 抢写锁；
+    # 保留 scheduler 在事务内是为了事务原子性（scheduler 抛错则全部回滚）。
+    # 保存 manual_intros 到 JSON（编辑回显 + 历史快照）——按项目一一对应的 dict
+    manual_intros_json = json.dumps(payload.get("manual_intros") or {}, ensure_ascii=False)
+    d = get_db()
     declaration = payload.get("declaration") or _DEFAULT_DECLARATION
     allow_download = bool(payload.get("allow_download"))
     video_dirs_json = json.dumps(payload.get("video_dirs") or [], ensure_ascii=False)
     manual_shops_json = json.dumps(payload.get("manual_shops") or {}, ensure_ascii=False)
-    account_ids = payload["account_ids"]
+    # #596：账号→(mode, fixed, balanced) 映射（4 元组按 mode 取对应字段），INSERT item 时直接取
+    sched_by_acc = {aid: (mode, fixed_min, balanced_min)
+                    for aid, mode, fixed_min, balanced_min in per_acc_sched}
     with d.transaction():
+        try:
+            items, _ = build_video_dir_schedule(cfg)
+        except ScheduleOverflowError as e:
+            # category: 'video' → [视频] 前缀；'time' → [时间] 前缀
+            prefix = "[视频]" if e.category == "video" else "[时间]"
+            raise ValueError(f"{prefix} {e}") from e
+        # 转 dict（与原 preview['items'] shape 对齐，下游 INSERT 不感知）
+        dir_name_map = {d.id: d.title for d in specs}
+        items_raw = [
+            {
+                "account_id": it.account_id,
+                "project_id": it.project_id,
+                "project_title": dir_name_map.get(it.project_id, it.project_id),
+                "shop_id": it.shop_name,
+                "shop_name": it.shop_name,
+                "intro_id": "",
+                "intro_content": it.intro_content,
+                "intro_topics": [],
+                "plan_time": it.plan_time,
+                "video_path": it.video_path,
+                # #596：per_account 模式带 mode + 按 mode 取对应 interval；global 模式带顶层
+                "_schedule_mode": (
+                    sched_by_acc[it.account_id][0]
+                    if daily_limit_mode == "per_account" and it.account_id in sched_by_acc
+                    else schedule_mode
+                ),
+                "_interval_min": (
+                    (sched_by_acc[it.account_id][1] if sched_by_acc[it.account_id][0] == "fixed"
+                     else sched_by_acc[it.account_id][2])
+                    if daily_limit_mode == "per_account" and it.account_id in sched_by_acc
+                    else (fixed_interval_min if schedule_mode == "fixed" else balanced_step_min)
+                ),
+            }
+            for it in items
+        ]
+        if not items_raw:
+            raise ValueError("[项目] 视频目录模式下无可发布明细")
         task_id = d.insert("publish_task", {
             "task_name": payload["task_name"],
-            "account_ids_json": json.dumps(account_ids, ensure_ascii=False),
+            "account_ids_json": json.dumps(payload["account_ids"], ensure_ascii=False),
             "project_ids_json": json.dumps([it["project_id"] for it in items_raw], ensure_ascii=False),
             "shop_ids_json": json.dumps([]),
             "per_account_count": 0,
@@ -917,13 +1047,16 @@ def _confirm_video_dir(payload: dict) -> dict:
                 "allow_download": 1 if allow_download else 0,
                 "source": "video_dir",
                 "status": "waiting",
+                # #596：明细行存算模式 + 间隔（per_account 模式取该账号的；global 模式取顶层）
+                "schedule_mode": it["_schedule_mode"],
+                "interval_min": it["_interval_min"],
             })
         # #v42：首次进入 running 时写 started_at；用 execute + COALESCE（update_by_id 仅支持 ? 占位符）
         d.execute(
             "UPDATE publish_task SET status='running', "
             "started_at=COALESCE(started_at, ?), "
             "per_account_count=?, update_time=? WHERE id=?",
-            (now_str(), len(items_raw) // max(len(account_ids), 1), now_str(), task_id))
+            (now_str(), len(items_raw) // max(len(payload["account_ids"]), 1), now_str(), task_id))
     # #confirm-kickoff：事务外立即派发任务下全部 waiting 明细（绕开 plan_time<=now gate）
     # 失败仅日志，不回滚 confirm 的成功包
     try:
@@ -1024,6 +1157,12 @@ def _soft_validate_payload(payload: dict) -> None:
         end_dt = _parse_flexible(end_time)
     except ValueError as e:
         raise ValueError(f"[时间] {e}") from None
+    # #597：起始时间不能是过去——先校验（避免 start 在过去日时，[时间] 同一天先抛掩盖主错误）
+    if start_dt <= datetime.now():
+        raise ValueError(
+            f"[时间] 起始时间必须晚于当前（起始 {start_dt.strftime('%Y-%m-%d %H:%M')}，"
+            f"当前 {datetime.now().strftime('%Y-%m-%d %H:%M')}），请重新选择"
+        )
     if start_dt.date() != end_dt.date():
         raise ValueError("[时间] 起始/结束时间必须同一天")
     if end_dt <= start_dt:
@@ -1159,6 +1298,23 @@ def _validate_payload(payload: dict) -> None:
                 raise ValueError(
                     f"[排期] 账号 {r.get('account_id')} 每天上限必须 ≥ 1"
                 )
+            # #596：per_account 下每账号独立算模式 + 间隔必须给且合法
+            mode = r.get("schedule_mode")
+            if mode not in ("fixed", "balanced"):
+                raise ValueError(
+                    f"[排期] 账号 {r.get('account_id')} 计算模式必须为 fixed 或 balanced，当前：{mode!r}"
+                )
+            # 两个独立间隔字段都校验（4 元组语义——切 mode 也不丢另一字段值）
+            fixed_min = r.get("fixed_interval_min")
+            if not isinstance(fixed_min, int) or fixed_min < 1:
+                raise ValueError(
+                    f"[排期] 账号 {r.get('account_id')} 固定间隔必须 ≥ 1 分钟，当前：{fixed_min!r}"
+                )
+            balanced_min = r.get("balanced_step_min")
+            if not isinstance(balanced_min, int) or balanced_min < 1:
+                raise ValueError(
+                    f"[排期] 账号 {r.get('account_id')} 均衡间隔必须 ≥ 1 分钟，当前：{balanced_min!r}"
+                )
     elif payload.get("daily_limit_mode") == "global":
         gl = int(payload.get("daily_limit_global") or 0)
         if gl < 1:
@@ -1174,6 +1330,12 @@ def _validate_payload(payload: dict) -> None:
         end_dt = _parse_flexible(end_time)
     except ValueError as e:
         raise ValueError(f"[时间] {e}") from None
+    # #597：起始时间不能是过去——先校验（避免 start 在过去日时，[时间] 同一天先抛掩盖主错误）
+    if start_dt <= datetime.now():
+        raise ValueError(
+            f"[时间] 起始时间必须晚于当前（起始 {start_dt.strftime('%Y-%m-%d %H:%M')}，"
+            f"当前 {datetime.now().strftime('%Y-%m-%d %H:%M')}），请重新选择"
+        )
     if start_dt.date() != end_dt.date():
         raise ValueError("[时间] 起始/结束时间必须同一天")
     if end_dt <= start_dt:
@@ -1207,9 +1369,18 @@ def preview_task_direct(payload: dict) -> dict:
     if payload["daily_limit_mode"] == "global":
         per_acc = ()
         global_lim = int(payload.get("daily_limit_global") or 0)
+        per_acc_sched = ()
     else:
         per_acc_raw = payload.get("daily_limit_per_account") or []
         per_acc = tuple((r["account_id"], int(r["limit"])) for r in per_acc_raw)
+        # #596：per_account 下每账号独立算模式 + 4 元组
+        per_acc_sched = tuple(
+            (r["account_id"],
+             r.get("schedule_mode") or _DEFAULT_SCHEDULE_MODE,
+             int(r.get("fixed_interval_min") or _DEFAULT_FIXED_INTERVAL),
+             int(r.get("balanced_step_min") or _DEFAULT_BALANCED_STEP))
+            for r in per_acc_raw
+        )
         global_lim = 0
     cfg = ScheduleConfig(
         account_ids=tuple(payload["account_ids"]),
@@ -1217,6 +1388,8 @@ def preview_task_direct(payload: dict) -> dict:
         daily_limit_mode=payload["daily_limit_mode"],
         daily_limit_global=global_lim,
         daily_limit_per_account=per_acc,
+        # #596：per_account 下每账号独立算模式 + 间隔
+        daily_limit_per_account_schedule=per_acc_sched,
         start_time=start_time,
         end_time=end_time,
         # #calc_mode：优先新字段，旧字段 fallback（is None 避免 0 陷阱）
@@ -1247,6 +1420,9 @@ def preview_task_direct(payload: dict) -> dict:
                 "intro_content": it.intro_content,
                 "intro_topics": list(it.intro_topics),
                 "plan_time": it.plan_time,
+                # #596：preview 阶段带上算模式 + 间隔（confirm 路径 INSERT 时取用）
+                "schedule_mode": it.schedule_mode,
+                "interval_min": it.interval_min,
             }
             for it in items
         ],
@@ -1286,9 +1462,18 @@ def confirm_task_direct(payload: dict) -> dict:
     if payload["daily_limit_mode"] == "global":
         per_acc = ()
         global_lim = int(payload.get("daily_limit_global") or 0)
+        per_acc_sched = ()
     else:
         per_acc_raw = payload.get("daily_limit_per_account") or []
         per_acc = tuple((r["account_id"], int(r["limit"])) for r in per_acc_raw)
+        # #596：per_account 下每账号独立算模式 + 4 元组
+        per_acc_sched = tuple(
+            (r["account_id"],
+             r.get("schedule_mode") or _DEFAULT_SCHEDULE_MODE,
+             int(r.get("fixed_interval_min") or _DEFAULT_FIXED_INTERVAL),
+             int(r.get("balanced_step_min") or _DEFAULT_BALANCED_STEP))
+            for r in per_acc_raw
+        )
         global_lim = 0
     # 4. 时间窗
     default_start, default_end = _default_start_end()
@@ -1309,6 +1494,8 @@ def confirm_task_direct(payload: dict) -> dict:
         daily_limit_mode=payload["daily_limit_mode"],
         daily_limit_global=global_lim,
         daily_limit_per_account=per_acc,
+        # #596：per_account 下每账号独立算模式 + 间隔
+        daily_limit_per_account_schedule=per_acc_sched,
         start_time=start_time,
         end_time=end_time,
         # #calc_mode：优先新字段，旧字段 fallback（is None 避免 0 陷阱）
@@ -1329,8 +1516,20 @@ def confirm_task_direct(payload: dict) -> dict:
     needed = len(items)
     project_ids_set = {it.project_id for it in items}
     account_ids_json = json.dumps(payload["account_ids"], ensure_ascii=False)
+    # #596：per_account 下写入 JSON 时带 schedule_mode / fixed_interval_min / balanced_step_min（编辑回显 + 历史留痕）
     daily_limit_per_account_json = json.dumps(
-        [{"account_id": aid, "limit": lim} for aid, lim in per_acc],
+        [
+            {
+                "account_id": aid,
+                "limit": lim,
+                **({"schedule_mode": mode,
+                    "fixed_interval_min": fixed_min,
+                    "balanced_step_min": balanced_min}
+                   if daily_limit_mode == "per_account" else {}),
+            }
+            for (aid, lim), (mode, fixed_min, balanced_min) in zip(per_acc, per_acc_sched)
+        ] if daily_limit_mode == "per_account"
+        else [{"account_id": aid, "limit": lim} for aid, lim in per_acc],
         ensure_ascii=False)
     projects_payload_json = json.dumps(
         [{"project_id": p.id, "shop_ids": list(p.shop_ids), "intro_ids": [it.id for it in p.intros]}
@@ -1394,6 +1593,9 @@ def confirm_task_direct(payload: dict) -> dict:
             cursor[pid] = d.query_all(
                 "SELECT * FROM generated_video WHERE project_id=? AND status='idle' ORDER BY create_time",
                 (pid,))
+        # #596：账号→(mode, fixed, balanced) 映射（4 元组按 mode 取对应字段），INSERT item 时直接取
+        sched_by_acc = {aid: (mode, fixed_min, balanced_min)
+                        for aid, mode, fixed_min, balanced_min in per_acc_sched}
         # 6.4 落明细 + 占成品
         inserted = 0
         for it in items:
@@ -1416,6 +1618,15 @@ def confirm_task_direct(payload: dict) -> dict:
             intro_content_snapshot = (
                 intro_row["content"] if intro_row else it.intro_content
             )
+            # #596：per_account 模式按该账号 mode 取对应 fixed/balanced 字段；global 取顶层
+            if payload["daily_limit_mode"] == "per_account" and it.account_id in sched_by_acc:
+                item_mode, item_fixed, item_balanced = sched_by_acc[it.account_id]
+                item_interval = item_fixed if item_mode == "fixed" else item_balanced
+            else:
+                item_mode = schedule_mode
+                item_interval = (
+                    fixed_interval_min if schedule_mode == "fixed" else balanced_step_min
+                )
             d.insert("publish_task_item", {
                 "task_id": task_id,
                 "plan_time": it.plan_time,
@@ -1429,6 +1640,9 @@ def confirm_task_direct(payload: dict) -> dict:
                 "declaration": declaration,
                 "allow_download": 1 if allow_download else 0,
                 "status": "waiting",
+                # #596：明细行存算模式 + 间隔（per_account 模式取该账号的；global 模式取顶层）
+                "schedule_mode": item_mode,
+                "interval_min": item_interval,
             })
             d.execute("UPDATE generated_video SET status='occupied' WHERE id=?", (video["id"],))
             inserted += 1
@@ -1507,7 +1721,18 @@ def duplicate_task(task_id: str) -> dict:
         # publish_task 表不存 snapshots（运行时数据），必须主动拼才能让预览日志有可读名字
         "account_labels": _build_account_labels(json.loads(src["account_ids_json"] or "[]")),
         "daily_limit_global": src["daily_limit_global"] or 0,
-        "daily_limit_per_account": [{"account_id": r["account_id"], "limit": int(r["limit"])} for r in per_acc],
+        # #596：复制时把每账号的算模式 + 两个独立间隔字段都带上（老数据无 → fallback 顶层）
+        "daily_limit_per_account": [
+            {
+                "account_id": r["account_id"],
+                "limit": int(r["limit"]),
+                "schedule_mode": r.get("schedule_mode") or schedule_mode,
+                # 老数据可能只存 interval_min 单字段——按当前 mode 落到对应字段
+                "fixed_interval_min": int(r.get("fixed_interval_min") or r.get("interval_min") or fixed_interval_min),
+                "balanced_step_min": int(r.get("balanced_step_min") or r.get("interval_min") or balanced_step_min),
+            }
+            for r in per_acc
+        ],
         "start_time": src["start_time"],
         "end_time": src["end_time"],
         "schedule_mode": schedule_mode,

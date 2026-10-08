@@ -152,6 +152,12 @@ export interface DailyLimitEntry {
   // #449：账号显示名快照（日志用）
   account_label?: string
   limit: number
+  // #596：分账号下每账号独立算模式 + 两个独立 interval 字段（切 mode 不影响值）
+  schedule_mode?: 'fixed' | 'balanced'
+  fixed_interval_min?: number
+  balanced_step_min?: number
+  // 老字段兼容（被 fixed_interval_min/balanced_step_min 取代；老 payload 透传时按 mode 落到对应字段）
+  interval_min?: number
 }
 
 // #418：成品视频目录项（一个目录 = 一个项目）
@@ -181,7 +187,7 @@ export interface DraftRequest {
   // #449：与 account_ids 等长，按序；供后端日志 / 排查
   account_labels?: string[]
   daily_limit_mode: 'global' | 'per_account'
-  daily_limit_global: number
+  daily_limit_global?: number
   daily_limit_per_account: DailyLimitEntry[]
   start_time?: string | null
   end_time?: string | null
@@ -220,6 +226,9 @@ export interface PreviewItem {
   intro_topics: string[]
   plan_time: string
   video_path?: string
+  // #596：preview 行带算模式 + 当前 mode 对应间隔（per_account 模式按账号不同；global 与顶层一致）
+  schedule_mode?: 'fixed' | 'balanced'
+  interval_min?: number
 }
 
 export interface PreviewStats {

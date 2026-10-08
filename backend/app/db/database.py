@@ -42,11 +42,16 @@ class Database:
     # ---------- 事务 ----------
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, isolation: str = "deferred"):
         """事务上下文：BEGIN → yield → COMMIT/ROLLBACK。
 
-        异常时整体回滚（含 INSERT 已自增的 id 不会被外部读到）；
-        正常结束统一 commit。事务内调用的 execute()/insert()/update_by_id()
+        isolation:
+        - 'deferred'（默认）：延迟获取写锁，并发 SELECT 看到一致快照
+        - 'immediate'：BEGIN 时立即抢写锁；并发场景第二个 BEGIN 阻塞等第一个 COMMIT，
+          解决「两事务都查到相同 in-flight → 重复选择同一资源」问题
+          （典型场景：_confirm_video_dir scheduler 选 vp 前查锁）
+
+        异常时整体回滚；正常结束统一 commit。事务内调用的 execute()/insert()/update_by_id()
         不会触发自动 commit（由本方法末尾统一提交）。
         """
         with self._lock:
@@ -55,7 +60,8 @@ class Database:
                 yield
                 return
             self._in_transaction = True
-            self._conn.execute("BEGIN")
+            begin_sql = "BEGIN" if isolation == "deferred" else f"BEGIN {isolation.upper()}"
+            self._conn.execute(begin_sql)
             try:
                 yield
             except Exception:
