@@ -45,6 +45,8 @@ sh.exe.stackdump
 # 临时目录
 .tmp/
 .playwright-mcp/
+# WorkBuddy 本地缓存 + memory（assistant 个人/项目 memory，不入库）
+.workbuddy/
 
 # pytest 缓存
 backend/.pytest_cache/
