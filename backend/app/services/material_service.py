@@ -1859,6 +1859,15 @@ def _process_single_video(
                 "title": video.get("title", ""),
                 "reason": f"详情抓取失败：{e}",
             }
+        # #fix-browser-closed：拦截浏览器主动关闭的降级返回 dict（client 不再抛异常），
+        # 转为业务侧 "failed" 响应，避免继续走 _download_and_ingest 触发 KeyError。
+        if isinstance(video, dict) and video.get("status") == "browser_closed":
+            return {
+                "action": "failed",
+                "material_id": None,
+                "title": video.get("title", "") or "",
+                "reason": "详情抓取失败：浏览器已关闭（用户主动关闭浏览器窗口）",
+            }
     # 4) 下载 + 内容过滤 + 入库
     try:
         material_id = _download_and_ingest(
@@ -2020,6 +2029,25 @@ def _run_detail_phase(
             info.progress = _fmt_progress("详情抓取中")
             video = client._fetch_aweme_detail(
                 aweme_id, cookie, account_id=account_id, page=page)
+            # #fix-browser-closed：浏览器被用户手动关闭时 client 返回 status="browser_closed"
+            # 降级 dict；此处不抛异常，转为跳过该条并继续后续视频，
+            # 避免后续访问 video.get("video_id") 等字段时 KeyError。
+            if isinstance(video, dict) and video.get("status") == "browser_closed":
+                logger.warning(
+                    "[拉取阶段B] 浏览器已关闭，跳过当前视频 aweme_id={}", aweme_id)
+                skip_count += 1
+                processed_count += 1
+                # 浏览器已关 = 整个会话失效，连续失败计数 +1 后由上层 break 决定。
+                consecutive_fails += 1
+                if consecutive_fails >= CONSECUTIVE_FAIL_THRESHOLD:
+                    fail_reason = (
+                        f"连续 {consecutive_fails} 个视频处理失败，已停止任务（疑似浏览器已关闭）"
+                    )
+                    logger.warning(
+                        "[拉取] 连续失败 {} 个（浏览器关闭），停止处理后续视频",
+                        consecutive_fails)
+                    break
+                continue
             # 2. 单视频统一处理：客户端兜底 → 去重 → 下载 → 内容检测 → 入库
             info.progress = _fmt_progress("下载入库中")
             single = _process_single_video(

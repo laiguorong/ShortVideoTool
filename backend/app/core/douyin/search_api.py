@@ -465,33 +465,97 @@ class BrowserSearchSession:
         f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("最新发布")',
     ]
     # 排序方式字面量映射（与 selection.VideoPullConditions.sort_type 对齐）
-    # 0=综合 / 1=最多点赞 / 2=最新发布（默认）。未识别值按"最新发布"兜底。
+    # 0=综合 / 1=最多点赞 / 2=最新发布。
+    # 默认值 = 0（综合排序）：与抖音搜索结果页 UI 默认排序一致；
+    # 拉取场景默认值走抖音 UI 默认，避免点选无意义的"最新发布"。
     _SORT_TEXT = {
         0: "综合排序",
         1: "最多点赞",
         2: "最新发布",
     }
-    _SORT_DEFAULT_TEXT = "最新发布"
+    _SORT_DEFAULT_TEXT = "综合排序"
+    _SORT_DEFAULT_TYPE = 0     # 默认值（与抖音 UI 默认排序对齐）
     _PUBLISH_RANGE_TEXT = {
         "any": "不限",
         "1d": "一天内",
         "7d": "一周内",
         "180d": "半年内",
     }
+    _PUBLISH_RANGE_DEFAULT = "any"
     _DURATION_TEXT = {
         "any": "不限",
         "lt1m": "1分钟以下",
         "1to5m": "1-5分钟",
         "gt5m": "5分钟以上",
     }
-    # 内容形式=视频：精确匹配「视频」字面量，避免误命中「图文」/「直播」等含「视」字项
-    _CONTENT_VIDEO_SELECTORS = [
-        f'{_FILTER_PANEL_SELECTOR} span.KlEyP1lp:text-is("视频")',
+    _DURATION_DEFAULT = "any"
+    # 搜索结果页 tab 选择器：默认抖音落在「综合」tab（含图文/直播混排），
+    # 切到「视频」tab 后搜索结果只含视频，筛选面板的排序/时间/时长才有效。
+    # 主：限定在 toolbar container 内（防页面其它 [data-key] 误命中）；
+    # 兜底：data-key 直接匹配，覆盖 toolbar class 改版的退化场景。
+    _TAB_VIDEO_SELECTORS = [
+        '#search-toolbar-container [data-key="video"]',
+        '[data-key="video"]',
     ]
     # 无确认按钮：旧版 confirm selectors 全部删除（点选项即时生效）。
 
+    def _switch_to_video_tab(self, page) -> bool:
+        """切换搜索结果页到「视频」tab（必须在 _apply_filters 之前执行）。
+
+        背景：抖音搜索默认落在「综合」tab，结果含图文/直播/视频混排。
+        若不切到「视频」tab，wheel 翻页捕获的 aweme_id 会混入图文/直播，
+        后续时长/封面检测/标题正则等过滤规则全部失效。
+
+        实现：
+        1. 探针当前 tab 激活态（class 含 cur/active）→ 已在视频 tab 直接返回 True
+        2. 未激活 → click 切换（用 _click_first_visible 遍历 selector 链）
+        3. 切换后等 React 重渲染（800ms），给 XHR 落库留时间
+
+        返回：
+            True  = 已在或已切到视频 tab
+            False = 找不到 tab（UI 改版，按当前 tab 拉取，不抛错）
+
+        异常：
+            浏览器关闭 → 透传 SearchBlockedError 中断（与 _apply_filters 一致）
+        """
+        primary_sel = self._TAB_VIDEO_SELECTORS[0]
+        # 1. 探针：是否已在视频 tab
+        try:
+            loc = page.locator(primary_sel).first
+            if loc.count() > 0:
+                already = loc.evaluate(
+                    "(el) => el && ("
+                    "(el.className || '').split(/\\s+/).some("
+                    "c => c === 'cur' || c === 'active'"
+                    ")"
+                    "|| el.getAttribute('aria-selected') === 'true'"
+                    ")"
+                )
+                if already:
+                    logger.debug("[Tab] 已在视频tab，跳过切换")
+                    return True
+        except Exception as e:
+            # 探针阶段浏览器断开 → 中断（不再 swallow 让后续 _apply_filters 噪音）
+            _raise_if_browser_closed(e, "探测视频tab状态")
+            # 非 closed 异常 swallow：按"未激活需 click"路径继续
+            logger.debug("[Tab] 探针异常 {}（按未激活处理）", e)
+        # 2. 未激活 → click 切换
+        hit = self._click_first_visible(
+            page, self._TAB_VIDEO_SELECTORS, "切换视频tab",
+        )
+        if not hit:
+            logger.info("[Tab] 视频tab 找不到（按当前tab拉取）")
+            return False
+        # 3. 切完等 React 重渲染（800ms）+ 抖音切 tab 会重发搜索 XHR
+        try:
+            page.wait_for_timeout(800)
+        except Exception as e:
+            _raise_if_browser_closed(e, "切tab稳定等待")
+        logger.info("[Tab] 已切换到视频tab")
+        return True
+
     def _apply_filters(self, page, conditions: dict, *, debug: bool = False) -> bool:
-        """507 改造：搜索结果页点 [筛选] 按钮 + 设置排序/发布时间/视频时长/内容形式。
+        """507 改造：搜索结果页点 [筛选] 按钮 + 设置排序/发布时间/视频时长（v3：默认值跳过）。
 
         返回 True 表示筛选面板成功设置至少一项；False 表示找不到面板（UI 改版或非结果页）。
         UI 改版 → 静默降级，不抛错（用户决策：筛选失效 = 不需要过滤）。
@@ -524,10 +588,52 @@ class BrowserSearchSession:
 
 
     def _apply_filters_inner(self, page, conditions: dict, *, debug: bool = False) -> bool:
-        """_apply_filters 实际逻辑：与外层 try/except 分离便于调试栈清晰。"""
-        # 筛选面板失败不再每条 warning 刷屏：收集结果到尾部一次性 INFO。
-        # 用户决策：筛选失效 = 不需要过滤，按无筛选拉取。
-        # 1. hover 触发筛选按钮（hover 才能显示下拉面板，click 反而可能关闭）
+        """_apply_filters 实际逻辑：与外层 try/except 分离便于调试栈清晰。
+
+        v3 改造（用户反馈）：
+        - 默认值跳过：所有筛选项都等于默认值 → 不开面板，按抖音默认排序拉取
+        - 单项默认值跳过：只对非默认项操作
+        - 面板稳定等待 500ms → 2000ms（用户反馈：抖音面板 React 渲染慢）
+        - 去掉「内容形式=视频」固定项（与切视频 tab 重复，且默认就是视频）
+        """
+        # 1. 解析 conditions + 识别默认值
+        raw_sort = conditions.get("sort_type")
+        try:
+            sort_type = int(raw_sort) if raw_sort is not None else self._SORT_DEFAULT_TYPE
+        except (TypeError, ValueError):
+            sort_type = self._SORT_DEFAULT_TYPE
+        sort_text = self._SORT_TEXT.get(sort_type, self._SORT_DEFAULT_TEXT)
+        pr = conditions.get("publish_range") or self._PUBLISH_RANGE_DEFAULT
+        pr_text = self._PUBLISH_RANGE_TEXT.get(pr, "不限")
+        dr = conditions.get("duration_range") or self._DURATION_DEFAULT
+        dr_text = self._DURATION_TEXT.get(dr, "不限")
+        # 2. 构造非默认项的 (描述, selectors) 列表
+        effective: list[tuple[str, list[str]]] = []
+        if sort_type != self._SORT_DEFAULT_TYPE:
+            effective.append((
+                f"排序={sort_text}",
+                [
+                    # 主：精确字面量匹配
+                    f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:text-is("{sort_text}")',
+                    # 兜底：同 class 内 :has-text
+                    f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{sort_text}")',
+                ],
+            ))
+        if pr != self._PUBLISH_RANGE_DEFAULT:
+            effective.append((
+                f"发布时间={pr_text}",
+                [f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{pr_text}")'],
+            ))
+        if dr != self._DURATION_DEFAULT:
+            effective.append((
+                f"视频时长={dr_text}",
+                [f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{dr_text}")'],
+            ))
+        # 3. ★ 全部默认 → 不开面板，按抖音默认排序拉取
+        if not effective:
+            logger.info("[筛选] 全部筛选项为默认值，跳过筛选面板（按默认排序拉取）")
+            return False
+        # 4. hover 触发筛选按钮（hover 才能显示下拉面板，click 反而可能关闭）
         btn = None
         for sel in self._FILTER_BTN_SELECTORS:
             try:
@@ -547,7 +653,7 @@ class BrowserSearchSession:
             _raise_if_browser_closed(e, "筛选按钮 hover")
             logger.info("[筛选] 筛选按钮 hover 失败 {}（按无筛选拉取）", e)
             return False
-        # 2. 等面板容器出现
+        # 5. 等面板容器出现
         try:
             page.wait_for_selector(self._FILTER_PANEL_SELECTOR, timeout=3_000)
         except Exception as e:
@@ -555,58 +661,19 @@ class BrowserSearchSession:
             _raise_if_browser_closed(e, "等筛选面板")
             logger.info("[筛选] hover 后筛选面板未弹出（按无筛选拉取）")
             return False
-        # 防御：wait_for_timeout 在 page 异常断开时会抛 Error: Page closed，
-        # 包 try/except 后继续后续步骤（按部分生效拉取），不让单点故障阻断整个筛选。
-        _safe_wait_or_raise(page, 500, "面板稳定等待")
-        # 收集每步结果
-        steps: list[tuple[str, bool]] = []
-        # 3. 排序依据（0=综合 / 1=最多点赞 / 2=最新发布，默认 2）
-        # 用户反馈：抖音 UI 切换有延迟，点完立即下一步会丢点击。点完等
-        # 选中态 .HjptjtzN class 出现作为生效信号（最多 1s）。
-        raw_sort = conditions.get("sort_type")
-        try:
-            sort_type = int(raw_sort) if raw_sort is not None else 2
-        except (TypeError, ValueError):
-            sort_type = 2
-        # 0/1/2 越界或未知值按"最新发布"兜底（与 Pydantic 默认对齐）
-        sort_text = self._SORT_TEXT.get(sort_type, self._SORT_DEFAULT_TEXT)
-        sort_sels = [
-            # 主：精确字面量匹配（避免误命中含该字样的其他文案）
-            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:text-is("{sort_text}")',
-            # 兜底：同 class 内的 :has-text 匹配，class 限定防止误命中面板外文本
-            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{sort_text}")',
-        ]
-        hit = self._click_filter_option(page, sort_sels, f"排序={sort_text}", debug=debug)
-        steps.append((f"排序={sort_text}", hit))
-        # #fix-filter-interval：每对相邻筛选间固定停顿 2s。
-        # 用户反馈：抖音 UI 切换有延迟，相邻两项间隔过短会丢点击；
-        # 固定 2s 间隔让 React 状态稳定 / DOM 选中态 class 完全渲染。
+        # 6. ★ 面板稳定等待：500ms → 2000ms（用户反馈：React 渲染慢，500ms 漏点击）
+        _safe_wait_or_raise(page, 2000, "面板稳定等待")
+        # 7. 顺序点各项，相邻项之间固定 2s 间隔
+        # 用户反馈：抖音 UI 切换有延迟，相邻两项间隔过短会丢点击。
         # 注意：v5 wheel 路径下筛选切换不重发 XHR（XHR 只在首次 search + wheel 触发），
         # 此处 2s 不是等 XHR，是给 React 状态稳定的固定节奏。
-        # 4 项 3 个间隔，共约 6s 等待（点击 + 2s × 3）。
-        _safe_wait_or_raise(page, 2000, "筛选间隔1")
-        # 4. 发布时间
-        pr = conditions.get("publish_range") or "any"
-        text = self._PUBLISH_RANGE_TEXT.get(pr, "不限")
-        range_sels = [
-            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{text}")',
-        ]
-        hit = self._click_filter_option(page, range_sels, f"发布时间={text}", debug=debug)
-        steps.append((f"发布时间={text}", hit))
-        _safe_wait_or_raise(page, 2000, "筛选间隔2")
-        # 5. 视频时长
-        dr = conditions.get("duration_range") or "any"
-        dur_text = self._DURATION_TEXT.get(dr, "不限")
-        dur_sels = [
-            f'{self._FILTER_PANEL_SELECTOR} span.KlEyP1lp:has-text("{dur_text}")',
-        ]
-        hit = self._click_filter_option(page, dur_sels, f"视频时长={dur_text}", debug=debug)
-        steps.append((f"视频时长={dur_text}", hit))
-        _safe_wait_or_raise(page, 2000, "筛选间隔3")
-        # 6. 内容形式 = 视频（精确匹配字面量，避免命中含「视」字选项如「图文/视频」）
-        hit = self._click_filter_option(page, self._CONTENT_VIDEO_SELECTORS, "内容形式=视频", debug=debug)
-        steps.append(("内容形式=视频", hit))
-        # 7. 把鼠标移开收起面板（不影响后续搜索结果滚动）
+        steps: list[tuple[str, bool]] = []
+        for i, (name, sels) in enumerate(effective):
+            hit = self._click_filter_option(page, sels, name, debug=debug)
+            steps.append((name, hit))
+            if i < len(effective) - 1:
+                _safe_wait_or_raise(page, 2000, f"筛选间隔{i+1}")
+        # 8. 把鼠标移开收起面板（不影响后续搜索结果滚动）
         try:
             page.mouse.move(700, 500)
         except Exception as e:
@@ -721,15 +788,35 @@ class BrowserSearchSession:
             except Exception as e:
                 raise SearchBlockedError(f"搜索框操作失败：{e}") from e
             self._searched_keyword = keyword
-            # 等搜索结果页 DOM 渲染（feed 流容器 + 筛选按钮）
             page = self._page
-            try:
-                page.wait_for_selector(
-                    '[data-e2e="search-card"]', timeout=10_000,
+            # XHR 驱动时序（v2）：不等结果页 DOM 渲染，直接监听 XHR。
+            # 之前 wait_for_selector('[data-e2e="search-card"]') 等 DOM 渲染，
+            # 用户实际看到搜索结果页出来好几秒才开始切 tab，体验卡顿。
+            # 改用 XHR 落库作为「响应开始」信号——比 DOM 早 1-3s。
+            # 1) 等综合 tab 首个搜索 XHR 落库
+            self._poll_captured_until(lambda: bool(self._captured), timeout=15_000)
+            # 2) XHR 一回立即切到「视频」tab（默认抖音落在「综合」tab，
+            #    含图文/直播混排；不切则结果混入图文直播，后续过滤规则全部失效）。
+            self._switch_to_video_tab(page)
+            # 3) 切 tab 触发视频 tab 的搜索 XHR，_captured 追加。
+            #    分场景处理：
+            #    - baseline > 0（综合 tab 已有数据）：不强等新 XHR——
+            #      抖音偶发切 tab 不重发 XHR，不该让任务进 75s 重试循环。
+            #      视频 tab 与综合 tab 共用同一批数据，足够用。
+            #    - baseline == 0（综合 tab 0 数据）：必须等新 XHR，
+            #      否则外层 aweme_ids 为空 → 重试逻辑触发。
+            baseline = len(self._captured)
+            if baseline == 0:
+                self._poll_captured_until(
+                    lambda: len(self._captured) > baseline,
+                    timeout=15_000,
                 )
-            except Exception:
-                pass  # 找不到也不阻塞，走 _apply_filters 自身的可见性判断
-            # 507 改造：应用筛选面板（排序/发布时间/视频时长/内容形式）
+            else:
+                logger.debug(
+                    "[搜索] 切 tab 前已有 {} 条数据，跳过强等新 XHR（防 75s 重试）",
+                    baseline,
+                )
+            # 507 改造：应用筛选面板（排序/发布时间/视频时长）
             self._apply_filters(page, conditions, debug=debug)
         # 等首屏 XHR 落库
         self._poll_captured_until(lambda: bool(self._captured), timeout=60)

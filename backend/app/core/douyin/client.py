@@ -432,15 +432,22 @@ class RealDouyinClient(DouyinClient):
             reason = f"详情页加载失败：{msg}" if msg else (
                 f"详情页加载失败（{type(e).__name__}，无消息，建议稍后重试）")
             # #fix-browser-closed：浏览器被用户手动关闭（TargetClosedError）属于用户主动操作，
-            # 静默 WARNING 不刷 traceback；其他异常仍走 logger.exception 全栈打印。
+            # 静默 WARNING 不刷 traceback；采用**降级返回**模式：
+            # 不抛异常（避免被全局处理器打成 ERROR traceback），
+            # 而是返回带 status="browser_closed" 的标记 dict，由上层 material_service
+            # 统一拦截并转为业务侧 "failed" 响应。
+            # 其他异常仍走 logger.exception 全栈打印 + raise，保留 ERROR traceback 排障。
             if "closed" in msg.lower() or "TargetClosedError" in type(e).__name__:
                 logger.warning(
                     "[详情获取] 浏览器已关闭 video_id={} type={}",
                     video_id, type(e).__name__)
-            else:
-                logger.exception(
-                    "[详情获取] 浏览器层异常 video_id={} reason={} type={} args={}",
-                    video_id, reason, type(e).__name__, e.args)
+                # #fix-browser-closed：降级返回只保留 status 字段。
+                # 下游 material_service 只判断 status == "browser_closed"，
+                # 冗余字段（_source/video_id）已删除，避免维护时误解有下游消费。
+                return {"status": "browser_closed"}
+            logger.exception(
+                "[详情获取] 浏览器层异常 video_id={} reason={} type={} args={}",
+                video_id, reason, type(e).__name__, e.args)
             raise DouyinClientError(reason) from e
         for body in bodies:
             aw = body.get("aweme_detail") or {}
