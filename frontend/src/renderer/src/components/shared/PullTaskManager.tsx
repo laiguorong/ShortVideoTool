@@ -389,7 +389,15 @@ export function PullTaskPanel({ onEdit, onCreated, onShowLogs, refreshTrigger, o
       .finally(() => onLoadingChange?.(false))
   }, [page, pageSize, onLoadingChange])
   useEffect(() => { load() }, [load])
+  // #fix-pull-task-double-load：effect [refreshTrigger] 用 ref 守卫避免 mount 时重复 load。
+  // 父组件 doRefresh 在 task tab 路径调 setRefreshTrigger(+1) 切 tab 时，
+  // PullTaskPanel 挂载会触发"effect [load] 一次 + effect [refreshTrigger] 一次"造成双请求；
+  // 再次切到 task 时 refreshTrigger state 保留非 0，effect [refreshTrigger] mount 也会触发，
+  // 三次请求都由此出来——下面 ref 守卫让 effect [refreshTrigger] 只在 refreshTrigger 真正变化时才 load。
+  const lastTriggerRef = useRef<number | undefined>(refreshTrigger)
   useEffect(() => {
+    if (lastTriggerRef.current === refreshTrigger) return
+    lastTriggerRef.current = refreshTrigger
     if (refreshTrigger) load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshTrigger])

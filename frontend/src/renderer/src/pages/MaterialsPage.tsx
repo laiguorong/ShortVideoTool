@@ -1285,12 +1285,16 @@ export function MaterialsPage() {
       })
   }, [tab, selectedCat, debouncedKeyword, page, pageSize])
 
-  /** 一键刷新：同步 setRefreshing(true)，完成后统一关 loading（任务 tab 由 PullTaskPanel onLoadingChange 关闭） */
-  const doRefresh = useCallback(() => {
+  /** 一键刷新：同步 setRefreshing(true)，完成后统一关 loading（任务 tab 由 PullTaskPanel onLoadingChange 关闭）
+ *  opts.skipPanelReload=true：跳过 PullTaskPanel 重载——仅用于"切 tab 时"，此时 PullTaskPanel mount 会自动 load，
+ *                              再 setRefreshTrigger(+1) 会重复请求。
+ *                              手动刷新 / 编辑保存后必须传 false（默认），否则按钮卡在"刷新中…"。
+ */
+  const doRefresh = useCallback((opts?: { skipPanelReload?: boolean }) => {
     setRefreshing(true)
     if (tab === 'task') {
       // 任务 tab：setRefreshing 由 PullTaskPanel onLoadingChange(false) 关
-      setRefreshTrigger((t) => t + 1)
+      if (!opts?.skipPanelReload) setRefreshTrigger((t) => t + 1)
       Promise.all([
         loadCategories(),  // 复用 video 分类
         loadAccounts(),    // 父组件统一加载账号（#fix-edit-cat-echo）
@@ -1307,7 +1311,9 @@ export function MaterialsPage() {
 
   // 初次 mount / 切 tab / 改筛选都走 doRefresh：统一一处管 loading
   useEffect(() => {
-    doRefresh()
+    // #fix-pull-task-double-load：切 tab 时 PullTaskPanel mount 会自动 load，
+    // 跳过 panel reload 避免与 mount 时 effect [load] 重复请求。
+    doRefresh({ skipPanelReload: tab === 'task' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, selectedCat, debouncedKeyword, page, pageSize])
 
@@ -1445,7 +1451,7 @@ export function MaterialsPage() {
             onCompositionEnd={() => {/* compositionEnd 后 debouncedKeyword 300ms 内生效 */}} />
         )}
         {/* 三个 tab 都显示刷新按钮；任务 tab 由 PullTaskPanel onLoadingChange 通知 loading 状态 */}
-        <Button size="sm" variant="outline" onClick={doRefresh} disabled={refreshing || loading}>
+        <Button size="sm" variant="outline" onClick={() => doRefresh()} disabled={refreshing || loading}>
           {refreshing || loading ? '刷新中…' : '刷新'}
         </Button>
         <div className="ml-auto flex items-center gap-2">
@@ -1796,7 +1802,14 @@ export function MaterialsPage() {
       <PullTaskDialog open={pullEditOpen}
         onOpenChange={(v) => { if (!v) { setPullEditOpen(false); setEditPullTask(null) } }}
         categories={categories} accounts={accounts} editTarget={editPullTask}
-        onDone={() => { setPullEditOpen(false); setEditPullTask(null); doRefresh() }} />
+        onDone={() => {
+          // #fix-pull-task-double-load：编辑保存后单独 setRefreshTrigger(+1) 让 PullTaskPanel 重载
+          // （doRefresh 不再统一 setRefreshTrigger，避免切 tab 时多次请求）
+          setPullEditOpen(false)
+          setEditPullTask(null)
+          doRefresh()
+          setRefreshTrigger((t) => t + 1)
+        }} />
       <ConfirmDialog open={!!deleteTarget} onOpenChange={(v) => !v && setDeleteTarget(null)} title="删除素材" danger
         content={`确定删除素材「${deleteTarget?.title}」？被项目引用处将显示素材缺失。`}
         onConfirm={async () => {
