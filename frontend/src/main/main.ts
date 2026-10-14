@@ -114,9 +114,9 @@ function _ensureLogFile(): string | null {
   }
 }
 
+/** 写文件日志：strip ANSI + 折叠内部换行保持每条单行，便于 grep/解析。
+ * console 走原始 message（含 ANSI 与换行，dev 终端展示更直观）。 */
 function _writeLog(level: 'INFO' | 'WARN' | 'ERROR', message: string): void {
-  // 文件日志 strip ANSI + 折叠内部换行：保持每条日志一行，便于 grep/解析
-  // console 走 errorDev 原始 message（含 ANSI 与换行，dev 终端展示更直观）
   const singleLine = _stripAnsi(message).replace(/[\r\n]+/g, ' ')
   const line = `[${_localIsoStamp(new Date())}] [${level}] ${singleLine}\n`
   const file = _ensureLogFile()
@@ -157,20 +157,49 @@ function getBundledBackendBinary(): string | null {
   return fs.existsSync(candidate) ? candidate : null
 }
 
-/** 探活：端口上是否已有本工具后端在跑（health 接口可达即复用） */
+/** 端口占用查询（#port-probe 2026-10-14）：返回端口上是否有 LISTENING 进程。
+ * 用 netstat LISTENING 行判定，比 HTTP 探活更早命中——uvicorn bind 端口的瞬间就 true，
+ * 不需要等到 FastAPI 路由 ready。
+ * 仅用于启动期"端口是否被占用"的快速判断，不替代 /api/health heartbeat 校验
+ * （heartbeat 判断"后端服务是否正常工作"必须看 HTTP 返 200）。
+ * Windows-only：项目打包目标平台仅为 Windows；非 Windows 留 false（与 killPortOccupants 守门一致）。 */
+function isPortOccupied(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') {
+      resolve(false)
+      return
+    }
+    const { exec } = require('child_process') as typeof import('child_process')
+    exec(
+      `netstat -ano | findstr :${port} | findstr LISTENING`,
+      (_e, stdout) => {
+        resolve(typeof stdout === 'string' && stdout.trim().length > 0)
+      },
+    )
+  })
+}
+
+/** 单次心跳探活：HTTP /api/health，200ms 超时（#heartbeat-poll-200 2026-10-14）。
+ * 用途：
+ *   - 步骤 1.5 二次验证（最多循环 3 次，确认是自家 FastAPI 不是别的占端口服务）
+ *   - 步骤 3 / 步骤 6 总 5s 期间的循环探活
+ * 单次 200ms 超时远比 1s 激进——通的路径（HTTP 头到达）几 ms 内 resolve true，
+ * 不通的路径（连接被拒 / 端口 LISTENING 但路由没起）200ms 内 false。
+ * 循环节奏靠外层 waitForBackendReady / 步骤 1.5 控；本函数本身不在内循环。 */
 async function isBackendAlive(): Promise<boolean> {
   return new Promise((resolve) => {
     const req = net.request(`http://127.0.0.1:${BACKEND_PORT}/api/health`)
-    // 2 秒内收到响应即认为存活（连不上/超时都视为未启动）
+    const HEARTBEAT_SINGLE_TIMEOUT_MS = 200
     const timer = setTimeout(() => {
       req.destroy()
       // 超时不记 ERROR（启动期间属正常等待），仅 debug 留痕
-      logDev(`[Main] health 探活超时（端口 ${BACKEND_PORT}）`)
+      logDev(`[Main] health 探活超时（端口 ${BACKEND_PORT}, ${HEARTBEAT_SINGLE_TIMEOUT_MS}ms 单次）`)
       resolve(false)
-    }, 2000)
+    }, HEARTBEAT_SINGLE_TIMEOUT_MS)
     req.on('response', (res) => {
       clearTimeout(timer)
       res.resume()
+      // HTTP 头一到达就触发 response 事件，resolve 同步执行——通的路径不等 200ms 超时
       resolve(res.statusCode === 200)
     })
     req.on('error', (e) => {
@@ -178,22 +207,27 @@ async function isBackendAlive(): Promise<boolean> {
       // #113：e 是 Error，无 code；NodeJS.ErrnoException 才有 code
       const code = (e as NodeJS.ErrnoException).code
       logDev(`[Main] health 探活失败: ${code ?? e.message}`)
+      // 连接被拒等错误也是瞬时的，立即 resolve(false) 不等 200ms 超时
       resolve(false)
     })
     req.end()
   })
 }
 
-/** 拉起后端：生产用内置 exe，开发用系统 Python + uvicorn */
-async function startBackend(dataDir: string | null = null) {
-  // #data-dir-relaunch：主动清理端口任意占用进程（dev 手动启 / NSIS 覆盖安装残留 / 旧 Electron 孤儿）
-  // 旧版"复用现有实例"的设计在 NSIS 覆盖安装场景下有 bug——旧后端 DATA_DIR/版本可能已过时，
-  // 复用会导致"改了数据目录但 SettingsPage 显示旧值"或"两个进程并存"。统一为 spawn 新实例。
-  await killPortOccupants(BACKEND_PORT)
-  const portFree = await waitForPortFree(BACKEND_PORT, 3000)
-  if (!portFree) {
-    errorDev(`[Main] 端口 ${BACKEND_PORT} 3s 未释放，startBackend 放弃`)
-    throw new Error(`端口 ${BACKEND_PORT} 被占用且无法释放`)
+/** 拉起后端：生产用内置 exe，开发用系统 Python + uvicorn。
+ * opts.skipPortCleanup = true：跳过前置 kill+wait+throw（用于"已知端口空闲"的二级重启调用）。
+ * 默认 = 完整清理逻辑（兜底杀端口任意占用 → 3s 内未释放就抛错）。 */
+async function startBackend(dataDir: string | null = null, opts: { skipPortCleanup?: boolean } = {}) {
+  if (!opts.skipPortCleanup) {
+    // #data-dir-relaunch：主动清理端口任意占用进程（dev 手动启 / NSIS 覆盖安装残留 / 旧 Electron 孤儿）
+    // 旧版"复用现有实例"的设计在 NSIS 覆盖安装场景下有 bug——旧后端 DATA_DIR/版本可能已过时，
+    // 复用会导致"改了数据目录但 SettingsPage 显示旧值"或"两个进程并存"。统一为 spawn 新实例。
+    await killPortOccupants(BACKEND_PORT)
+    const portFree = await waitForPortFree(BACKEND_PORT, 3000)
+    if (!portFree) {
+      errorDev(`[Main] 端口 ${BACKEND_PORT} 3s 未释放，startBackend 放弃`)
+      throw new Error(`端口 ${BACKEND_PORT} 被占用且无法释放`)
+    }
   }
 
   const bundled = getBundledBackendBinary()
@@ -277,8 +311,14 @@ async function startBackend(dataDir: string | null = null) {
       const dropped = backendStderrBuffer.shift()!
       backendStderrBytes -= dropped.length
     }
+    // #backend-log-level（2026-10-14）：之前所有 stderr 都走 errorDev，但 Python uvicorn 默认 INFO 日志
+    // 也输出到 stderr（uvicorn 不像多数 CLI 那样把 INFO 分流到 stdout），导致 `[ERROR] [Backend] INFO: ...`
+    // 这种矛盾日志。改成所有 [Backend] 走 logDev（INFO 级别），让原文本里的 `ERROR:` / `ERROR |`
+    // 字符自己传达严重性 —— grep 或颜色仍可定位。
+    // 未来如果需要保留分级（stdout/WARN/ERROR 分流）：解析行首的 `LEVEL:` (uvicorn 格式) 或
+    // loguru 的 `| LEVEL |` 模式，按级别分派到 logDev/logWarn/errorDev。
     for (const line of sanitized.split('\n')) {
-      if (line) errorDev(`[Backend] ${line}`)
+      if (line) logDev(`[Backend] ${line}`)
     }
   })
   backendProcess.on('error', (error) => errorDev(`[Backend] 启动失败: ${error.message}`))
@@ -290,13 +330,19 @@ async function startBackend(dataDir: string | null = null) {
   })
 }
 
-/** 检测后端在 N 秒内是否能响应 health 接口；不可达返 Promise<false>。
- * 用于 #382：环境检查失败导致后端快速退出时，触发用户提示。 */
+/** 检测后端在 N 毫秒内是否能响应 health 接口；不可达返 Promise<false>。
+ * 用于 #382：环境检查失败导致后端快速退出时，触发用户提示。
+ *
+ * #heartbeat-poll-200（2026-10-14 用户拍板）：
+ *   - 单次 isBackendAlive 探活上限 200ms（通的路径几 ms resolve true；不通 200ms 内 resolve false）
+ *   - 总超时 timeoutMs 期间**循环请求**心跳接口——不通立即 retry，不额外 sleep
+ *   - 不通路径：每轮回 ≈ 200ms（单次卡满），5s 总预算约 25 次机会
+ *   - 通路径：首次 resolve true 就 return（不消耗更多时间） */
 async function waitForBackendReady(timeoutMs: number): Promise<boolean> {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
     if (await isBackendAlive()) return true
-    await new Promise((r) => setTimeout(r, 500))
+    // 不通了立即 retry（单次 200ms 卡住本身已经是节奏控制，不需要额外 sleep）
   }
   return false
 }
@@ -913,24 +959,138 @@ if (!hasSingleInstanceLock) {
     logDev('[Main] 创建主窗口（启动页先显示，后端后台启动）')
     createWindow()
 
-    // 后台 spawn 后端（不传 dataDir = 不透传 SHORTVIDEO_DATA_DIR env / --data-dir 参数，
-    // 让后端 check_data_dir 走 env + settings.json 配置检测；
-    // 都没配置时返 failed + need_choose=true，由启动页 IPC 触发 ensureDataDirChoice 弹窗）
+    // 后端启动编排（2026-10-14 #user-flow-rewrite + #port-probe + 步骤日志）：
+    //   步骤 1）端口占用探活（netstat LISTENING）
+    //   步骤 1.5）HTTP 二次验证（确认是 FastAPI，不是别的服务占着同端口）
+    //   步骤 2）端口空闲 → 异步启后端（不等 ready）
+    //   步骤 3）等待 heartbeat ready（HTTP /api/health 200），5s 内不通视为启动失败
+    //   步骤 4）杀自己 spawn 的后端 + 清端口任意占用
+    //   步骤 5）重启后端
+    //   步骤 6）再 5s heartbeat，仍不通就弹错误对话框
+    //
+    // #port-probe-verify（2026-10-14）：netstat LISTENING 只是必要条件，不是充分条件
+    //   （实测 EIS.Toolbox 等外部服务占着 8765 不响应 HTTP）。所以步骤 1 命中后必须做 HTTP 二次验证：
+    //     - 通：确认为自家后端 → 复用
+    //     - 不通：占着的是别的服务 → 杀端口 + 走步骤 2 spawn
+    //
+    // 日志约定：每步起一条 logDev（`步骤 N: ...`），结束一条 ✓/✗ 总结，方便排错时 grep。
+    //
+    // 设计取舍：
+    //   - 步骤 1 用 netstat 而非 HTTP 探活：netstat LISTENING 在 uvicorn bind 端口瞬间就成立，
+    //     HTTP 探活则要等 FastAPI 路由 ready（毫秒到秒级窗口）——这段时间误判会让前端以为没人占着
+    //     进而 spawn 自己杀同端口进程。netstat 完美契合"端口被占用"的字面语义。
+    //   - heartbeat 仍走 HTTP（看 /api/health 返 200）：这是判断"后端服务是否正常工作"的真探针，
+    //     netstat LISTENING 只能反映"进程在 listen"，不能反映"应用层能否响应"
+    //   - 复用命中时 backendProcess = null → forceKillBackend / shutdownApp 关闭不杀这个进程
+    //   - 杀+重启分支只在 spawn 后 timeout 才走，不在 spawn 前主动 kill（不与 NSIS 残留冲突）
+
+    // 步骤 1：端口占用探活（netstat LISTENING）
+    // #port-probe-verify（2026-10-14）：netstat 命中只是必要条件，不充分——
+    // 别的服务也可能 LISTENING 在同一端口（实测：C:\EIS\4.9.33.0\EIS.Toolbox.exe 占着 8765，
+    // 全程不响应 HTTP → 前端 fetch 5s 超时 → 失败 10 次 toast "后端响应异常"）。
+    // 所以步骤 1.5 必须用 isBackendAlive() 做 HTTP 二次验证：
+    //   - 通：确认为自家 FastAPI → 复用
+    //   - 不通：占着的是别的服务 → 杀端口 + 走步骤 2 spawn
+    logDev(`[Main] 步骤 1: 端口占用探活 (port=${BACKEND_PORT}, 检测方式=netstat LISTENING)`)
+    if (await isPortOccupied(BACKEND_PORT)) {
+      logDev(`[Main] 步骤 1 ✓ 端口 ${BACKEND_PORT} 已被占用，做 HTTP 二次验证（确认是 FastAPI 而不是别的服务）`)
+      // 步骤 1.5：HTTP 探活循环（#port-probe-verify 2026-10-14）
+      // 总超时 HEALTH_VERIFY_TIMEOUT_MS 期间循环请求心跳接口，单次 200ms 不通立即 retry。
+      // 复用 waitForBackendReady 函数——与步骤 3 / 步骤 6 行为统一（"总超时内循环"）。
+      // 数字 2000ms 选定理由：自家 FastAPI 路由 ready 通常 200-500ms；外部死服务（占端口不响应 HTTP）
+      // 200ms × 10 次卡满即 false，2s 总超时足够区分，又不会让用户等太久。
+      const HEALTH_VERIFY_TIMEOUT_MS = 2000
+      logDev(`[Main] 步骤 1.5: HTTP 二次验证循环 (timeout=${HEALTH_VERIFY_TIMEOUT_MS}ms, 单次探活 200ms, 不通立即 retry)`)
+      const healthy = await waitForBackendReady(HEALTH_VERIFY_TIMEOUT_MS)
+      if (healthy) {
+        logDev(`[Main] 步骤 1.5 ✓ HTTP 探活通过，确认是自家后端，复用`)
+        backendProcess = null
+        logDev('[Main] 后端就绪（复用），启动页将自动接续 6 步检查')
+        return
+      }
+      logDev(`[Main] 步骤 1.5 ✗ ${HEALTH_VERIFY_TIMEOUT_MS}ms 内 HTTP 始终未通，确认不是 FastAPI，杀端口 + 走步骤 2 spawn`)
+      await killPortOccupants(BACKEND_PORT)
+      const freedAfterKill = await waitForPortFree(BACKEND_PORT, 5000)
+      if (!freedAfterKill) {
+        // #review-2（2026-10-14）：杀不掉（系统服务/PID 4 等 taskkill 杀不动）时直接退出。
+        // 不要弹窗让用户选 [继续] —— 用户选 [继续] 后会走步骤 2 spawn，但端口还占着，spawn 必失败
+        // → 步骤 2 catch 再弹一次 [继续]/[退出] → 用户得连点两次 [退出] 才真退。直接 app.quit 干净。
+        errorDev(`[Main] 端口 ${BACKEND_PORT} 被外部服务占用且杀不掉，强制退出`)
+        isQuitting = true
+        app.quit()
+        return
+      }
+    } else {
+      logDev(`[Main] 步骤 1 ✓ 端口 ${BACKEND_PORT} 空闲，需要启动后端`)
+    }
+
+    // 步骤 2：端口空闲 → 异步启后端
+    logDev('[Main] 步骤 2: 开始异步启动后端进程（不含前置 cleanup）')
     try {
       await startBackend(null)
+      logDev('[Main] 步骤 2 ✓ 后端进程已 spawn，进入 heartbeat 等待')
     } catch (e) {
-      errorDev('[Main] startBackend 抛错:', e)
-      // 与 waitForBackendReady 失败路径对称：走错误弹窗让用户选择
+      // startBackend 内部 kill+wait 抛错（端口被外部服务占着且 3s 内未释放）的兜底弹窗
+      errorDev('[Main] 步骤 2 ✗ startBackend 抛错:', e)
       const recovered = await handleBackendStartupFailure()
       if (!recovered) return
     }
-    const ready = await waitForBackendReady(30000)
-    if (!ready) {
-      errorDev('[Main] 后端启动超时，30s 内 health 未通，触发错误弹窗')
-      // 用户选"继续启动"会保留后端，让启动页展示真实失败原因
-      const recovered = await handleBackendStartupFailure()
-      if (!recovered) return
+
+    // 步骤 3：5s heartbeat 超时 → 杀进程 + 重启
+    const HEARTBEAT_TIMEOUT_MS = 5000
+    logDev(`[Main] 步骤 3: 等待 heartbeat ready (timeout=${HEARTBEAT_TIMEOUT_MS}ms, 单次探活 200ms, 不通立即 retry)`)
+    let ready = await waitForBackendReady(HEARTBEAT_TIMEOUT_MS)
+    if (ready) {
+      logDev('[Main] 步骤 3 ✓ heartbeat ready，后端服务正常')
+    } else {
+      logDev(`[Main] 步骤 3 ✗ ${HEARTBEAT_TIMEOUT_MS}ms heartbeat 未通，杀进程重启`)
+      // 杀自己 spawn 的（如果还活着）
+      if (backendProcess) {
+        try {
+          backendProcess.kill()
+          logDev(`[Main] 步骤 4: 已 kill 后端子进程 (pid=${backendProcess.pid})`)
+        } catch (e) {
+          errorDev('[Main] 步骤 4 ✗ kill 失败', e)
+        }
+        backendProcess = null
+      }
+      // 兜底清端口任意占用（防 dev uvicorn 等外部孤儿干扰）
+      await killPortOccupants(BACKEND_PORT)
+      // #review-1（2026-10-14）：kill 完不能立即 spawn——Windows 端口释放有延迟（TCP 关闭流程几 ms 到几秒），
+      // 直接 spawn uvicorn 会撞 `[Errno 10048] Only one usage of each socket address`。
+      // 等端口空闲 5s，不通就报错不进步骤 5（避免"spawn 失败 → catch 弹窗 → 再循环"）。
+      // 这与步骤 1.5 杀端口后 waitForPortFree(5000) 行为对齐。
+      const freedAfterRestart = await waitForPortFree(BACKEND_PORT, 5000)
+      if (!freedAfterRestart) {
+        errorDev(`[Main] 步骤 4 ✗ 端口 ${BACKEND_PORT} 杀完仍占，无法重启`)
+        const recovered = await handleBackendStartupFailure()
+        if (!recovered) return
+      }
+      logDev('[Main] 步骤 4: 端口清理完毕，准备重启后端')
+
+      // 步骤 5：重新启后端（已知端口已清，跳过 startBackend 的前置 cleanup）
+      logDev('[Main] 步骤 5: 重新启动后端进程')
+      try {
+        await startBackend(null, { skipPortCleanup: true })
+        logDev('[Main] 步骤 5 ✓ 后端进程已重新 spawn，进入 heartbeat 再次等待')
+      } catch (e) {
+        errorDev('[Main] 步骤 5 ✗ startBackend 重试抛错:', e)
+        const recovered = await handleBackendStartupFailure()
+        if (!recovered) return
+      }
+
+      // 步骤 6：再 5s heartbeat，仍不通就报错
+      logDev(`[Main] 步骤 6: 再次等待 heartbeat ready (timeout=${HEARTBEAT_TIMEOUT_MS}ms, 单次 200ms)`)
+      ready = await waitForBackendReady(HEARTBEAT_TIMEOUT_MS)
+      if (ready) {
+        logDev('[Main] 步骤 6 ✓ 重启后 heartbeat ready')
+      } else {
+        logDev('[Main] 步骤 6 ✗ 重启后 heartbeat 仍不通，启动失败')
+        const recovered = await handleBackendStartupFailure()
+        if (!recovered) return
+      }
     }
+
     logDev('[Main] 后端就绪，启动页将自动接续 6 步检查')
   })
 
