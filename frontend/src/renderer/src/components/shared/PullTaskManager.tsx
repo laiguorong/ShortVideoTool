@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { materialApi, type Category, type VideoPullTask } from '@/api/material'
-import { accountApi, type AvailableAccount } from '@/api/account'
+import type { AvailableAccount } from '@/api/account'
 import type { IntervalConfig } from '@/api/selection'
 import { Button } from '@/components/ui/button'
 import { Dialog, ConfirmDialog } from '@/components/ui/dialog'
@@ -59,15 +59,20 @@ function flattenTree(nodes: TreeNode[], depth = 0): { node: TreeNode; depth: num
   return out
 }
 
-/** 创建/编辑视频拉取任务弹窗 */
-export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onDone }: {
+/** 创建/编辑视频拉取任务弹窗
+ *  #fix-edit-cat-echo：accounts 与 categories 都由父组件传入复用，弹窗打开时不再异步 fetch——
+ *  父组件 MaterialsPage 已经在 doRefresh 里统一加载并通过 props 传过来，
+ *  弹窗内 effect 1 完全同步回填所有字段，避免异步副作用（race / 闭包过期 / select options 空白）。
+ */
+export function PullTaskDialog({ open, onOpenChange, categories, accounts, editTarget, onDone }: {
   open: boolean
   onOpenChange: (v: boolean) => void
   categories: Category[]
+  /** 父组件统一传入的有 profile 账号列表（必传；新建/编辑都要） */
+  accounts: AvailableAccount[]
   editTarget: VideoPullTask | null
   onDone: () => void
 }) {
-  const [accounts, setAccounts] = useState<AvailableAccount[]>([])
   const [name, setName] = useState('')
   const [accountId, setAccountId] = useState('')
   const [categoryId, setCategoryId] = useState('')
@@ -110,10 +115,6 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
       return
     }
     lastInitRef.current = { open: true, targetId, ref: editTarget }
-    accountApi.available().then((r) => {
-      setAccounts(r.list)
-      setAccountId((prev) => prev || r.list[0]?.id || '')
-    }).catch((e) => console.warn('[PullTask] 请求失败:', e))
     if (editTarget) {
       setName(editTarget.task_name)
       setAccountId(editTarget.account_id)
@@ -157,9 +158,15 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
 
   useEffect(() => {
     // 默认选第一个分类（含"未分类"虚拟分类作为合法入库目标）
-    const selectable = categories
-    if (open && !categoryId && selectable[0]) setCategoryId(selectable[0].id)
-  }, [open, categories, categoryId])
+    // #fix-edit-cat-echo：仅新建任务下生效——编辑模式由 effect 1 同步回填 categoryId，
+    // effect 2 用闭包 categoryId='' 误判 + 无 editTarget 守卫，会覆盖回填，导致首次打开显示第一个分类。
+    if (open && !editTarget && !categoryId && categories[0]) setCategoryId(categories[0].id)
+  }, [open, editTarget, categories, categoryId])
+
+  useEffect(() => {
+    // 默认选第一个账号（仅新建任务下生效；编辑模式由 effect 1 同步回填 accountId）——同 #fix-edit-cat-echo 的闭包过期防御
+    if (open && !editTarget && !accountId && accounts[0]) setAccountId(accounts[0].id)
+  }, [open, editTarget, accountId, accounts])
 
   const submit = async () => {
     if (!name.trim() || !accountId || !categoryId) {
@@ -248,6 +255,11 @@ export function PullTaskDialog({ open, onOpenChange, categories, editTarget, onD
           </Field>
           <Field label="入库分类">
             <select className={inputCls} value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
+              {/* #fix-edit-cat-blank 兜底：categories 还在异步加载时显示提示，避免空白下拉框误导用户。
+                  父组件 onEdit 已先 await loadCategories，正常路径不会进，纯粹防御性。 */}
+              {categories.filter((c) => c.type === 'video').length === 0 && (
+                <option value="" disabled>分类加载中…</option>
+              )}
               {flattenTree(buildTree(categories.filter((c) => c.type === 'video'))).map(({ node, depth }) => (
                 <option key={node.id} value={node.id}>{'　'.repeat(depth)}{node.name}</option>
               ))}

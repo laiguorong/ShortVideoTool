@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { materialApi, type Category, type Material, type VideoPullTask } from '@/api/material'
+import { accountApi, type AvailableAccount } from '@/api/account'
 import { fileUrl, request } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { PullTaskDialog, PullTaskPanel } from '@/components/shared/PullTaskManager'
@@ -1156,6 +1157,9 @@ function MoveCategoryDialog({ open, onOpenChange, categories, type, title, defau
 export function MaterialsPage() {
   const [tab, setTab] = useState<'video' | 'music' | 'task'>('video')
   const [categories, setCategories] = useState<Category[]>([])
+  // #fix-edit-cat-echo：账号列表也提到父组件统一管理，传给 PullTaskDialog；
+  // 避免弹窗打开时内部 fetch 导致 race condition（accounts 异步未到位 select 显示空白/回显错位）。
+  const [accounts, setAccounts] = useState<AvailableAccount[]>([])
   const [selectedCat, setSelectedCat] = useState('')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [data, setData] = useState<{ list: Material[]; total: number }>({ list: [], total: 0 })
@@ -1219,13 +1223,29 @@ export function MaterialsPage() {
   const [refreshTrigger, setRefreshTrigger] = useState(0)
 
   const loadCategories = useCallback(() => {
-    // 任务 tab：拉取任务入库分类是视频分类（#352：拉取任务编辑/创建对话框的入库分类下拉需要数据）
+    // 任务 tab：拉取任务入库分类是视频分类（#352：拉取任务编辑/创建对话框的入库分类下拉需要数据，
+    // 复用 video tab 的同一个 video 分类——task tab 实际无独立分类）
     const loadType: 'video' | 'music' = tab === 'task' ? 'video' : tab
-    materialApi.categories(loadType).then((rows) => {
+    // #fix-edit-cat-blank：return Promise，让 onEdit/编辑器能 await 到 setCategories 真正应用，
+    // 否则 useCallback 没 return 时 await 立即 resolve，编辑弹窗 select options 仍为空
+    return materialApi.categories(loadType).then((rows) => {
       setCategories(rows)
       if (rows[0] && !rows.some((r) => r.id === selectedCat)) setSelectedCat('')
-    }).catch((e) => console.warn('[Materials] 请求失败:', e))
+    }).catch((e) => {
+      console.warn('[Materials] 请求失败:', e)
+      throw e
+    })
   }, [tab, selectedCat])
+
+  /** 账号列表（统一管理，传给 PullTaskDialog；不再在弹窗内部 fetch） */
+  const loadAccounts = useCallback(() => {
+    return accountApi.available().then((r) => {
+      setAccounts(r.list)
+    }).catch((e) => {
+      console.warn('[Materials] 账号加载失败:', e)
+      throw e
+    })
+  }, [])
 
   /** 自增请求序号：旧请求晚返回时丢弃，避免覆盖新结果（解决快速切换条件 race）。
    * 与 ProjectShopsDrawer.searchReqId 同样思路（#fix-search-race）。 */
@@ -1271,7 +1291,10 @@ export function MaterialsPage() {
     if (tab === 'task') {
       // 任务 tab：setRefreshing 由 PullTaskPanel onLoadingChange(false) 关
       setRefreshTrigger((t) => t + 1)
-      loadCategories()
+      Promise.all([
+        loadCategories(),  // 复用 video 分类
+        loadAccounts(),    // 父组件统一加载账号（#fix-edit-cat-echo）
+      ]).catch((e) => console.warn('[Materials] 加载失败:', e))
       return
     }
     setLoading(true)
@@ -1280,7 +1303,7 @@ export function MaterialsPage() {
         setLoading(false)
         setRefreshing(false)
       })
-  }, [tab, loadCategories, loadMaterials])
+  }, [tab, loadCategories, loadMaterials, loadAccounts])
 
   // 初次 mount / 切 tab / 改筛选都走 doRefresh：统一一处管 loading
   useEffect(() => {
@@ -1455,7 +1478,15 @@ export function MaterialsPage() {
       {/* 下：tab === 'task' 时显示拉取任务面板；其他 tab 显示左分类 + 右素材列表 */}
       {tab === 'task' ? (
         <PullTaskPanel
-          onEdit={(t) => { setEditPullTask(t); setPullEditOpen(true) }}
+          onEdit={async (t) => {
+            // #fix-edit-cat-echo：先 await 父组件的 categories/accounts，确保弹窗打开时两者都已就位，
+            // 弹窗 effect 1 同步回填时 select options 立即有数据（不依赖弹窗内异步 fetch）。
+            try {
+              await Promise.all([loadCategories(), loadAccounts()])
+            } catch { /* 让弹窗照常开+select 显示加载提示 */ }
+            setEditPullTask(t)
+            setPullEditOpen(true)
+          }}
           onCreated={doRefresh}
           refreshTrigger={refreshTrigger}
           onLoadingChange={onPullLoadingChange}
@@ -1764,7 +1795,7 @@ export function MaterialsPage() {
       {/* 拉取任务创建/编辑弹窗（#349：编辑保存后必须刷列表，loadMaterials 在任务 tab 直接 return，故走 doRefresh 触发 refreshTrigger 让 PullTaskPanel 重载） */}
       <PullTaskDialog open={pullEditOpen}
         onOpenChange={(v) => { if (!v) { setPullEditOpen(false); setEditPullTask(null) } }}
-        categories={categories} editTarget={editPullTask}
+        categories={categories} accounts={accounts} editTarget={editPullTask}
         onDone={() => { setPullEditOpen(false); setEditPullTask(null); doRefresh() }} />
       <ConfirmDialog open={!!deleteTarget} onOpenChange={(v) => !v && setDeleteTarget(null)} title="删除素材" danger
         content={`确定删除素材「${deleteTarget?.title}」？被项目引用处将显示素材缺失。`}
