@@ -4,10 +4,15 @@ backend/data/
 node_modules/
 backend/build/
 backend/dist/
+backend/.venv/
 frontend/dist/
 frontend/release/
+frontend/release-*/  # 兼容时间戳隔离的 build 目录
 __pycache__/
 *.py[cod]
+# 临时 pip freeze 备份（不应该入库，用 pip freeze 时会重生成）
+backend/requirements-*.txt
+!backend/requirements.txt
 # FFmpeg 二进制（Git LFS 跟踪，详见 .gitattributes）
 backend/assets/ffmpeg/
 

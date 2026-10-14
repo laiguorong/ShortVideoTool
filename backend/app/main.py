@@ -112,7 +112,7 @@ def _patch_uvicorn_force_exit() -> None:
 
 _patch_uvicorn_force_exit()
 
-app = FastAPI(title="短视频工具 后端服务", version="1.0.2")
+app = FastAPI(title="短视频工具 后端服务", version="1.0.3")
 
 # CORS 全开（本地 Electron 渲染层跨端口访问）
 app.add_middleware(

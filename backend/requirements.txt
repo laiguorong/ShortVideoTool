@@ -16,7 +16,20 @@ APScheduler>=3.11.0
 httpx>=0.28.0
 curl_cffi>=0.5.0
 # 浏览器模拟（B 方案：绕过 JS 签名墙，选品/搜索走真实 Chromium 拦截）
-playwright>=1.50.0
+# 精确锁 playwright==1.62.0: 跟 backend/assets/ms-playwright/ 配套
+# 实测 (v19:18): 荣少报 1248 找不到 → venv 1.62+ bundled chromium-1248
+# 实测对应 (v20:00, **不要信旧 memory**):
+#   - 1.49.1   → chromium-1148
+#   - 1.50.0   → chromium-1155
+#   - 1.55-1.61 → 没实测 (沙箱 timeout)
+#   - 1.62.0+  → chromium-1248 (实测, venv 1.62+ 找 1248)
+# **不维护对应表** — 升级 playwright 必须跑 `playwright install` 让 bundled browser 跟上:
+#   $env:PLAYWRIGHT_BROWSERS_PATH = "<backend/assets/ms-playwright>"
+#   python -m playwright install chromium chromium_headless_shell
+# 这样 venv 装什么, backend/assets 装什么, 永远同步.
+# 想知道当前 SDK bundled 哪个 chromium rev:
+#   python -c "import json, playwright; from pathlib import Path; d=json.loads((Path(playwright.__file__).parent / 'driver' / 'package' / 'browsers.json').read_text()); print([(b['name'], b['revision']) for b in d['browsers'] if 'chromium' in b['name']])"
+playwright==1.62.0
 # Cookie 加密存储
 cryptography>=50.0.0
 # Excel 导出

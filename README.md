@@ -47,14 +47,85 @@
 
 ## 本地开发
 
+### 开发环境准备（**新机器必跑**）
+
+**项目要求 Python 3.12.10**（与 `backend/requirements.txt` 注释锁定的运行时一致）。venv 是项目隔离的 site-packages，**不要装到 system Python**（会污染依赖图）。
+
+**1. 装 Python 3.12.10 + 加 PATH**
+- 下载：https://www.python.org/downloads/release/python-31210/
+- 装时勾选 **"Add Python 3.12 to PATH"**（Windows）
+- 验证：`python --version` 应输出 `Python 3.12.10`
+
+**2. 一键建 venv + 装依赖**（从项目根）
+```powershell
+cd frontend
+npm run setup
+```
+或**直接调跨平台 Python 脚本**（不依赖 npm）：
+```powershell
+python frontend/scripts/setup_venv.py
+# 加 -E 屏蔽 shim (WorkBuddy / 360 杀软环境):
+python -E frontend/scripts/setup_venv.py
+```
+脚本做的事（详见 `frontend/scripts/setup_venv.py`，跨平台，stdlib only）：
+- 检查 Python 版本（**必须 3.12.10**，否则报错退出）
+- 创建 `backend/.venv`（**不入库**，已加 `.gitignore`）
+- 装 `backend/requirements.txt` 列的 16 个项目直接依赖
+- 装 `pyinstaller==6.22.3` + `pyinstaller-hooks-contrib`（**不在** `requirements.txt`，build 时需要）
+- 跨平台：Windows 用 `.venv/Scripts/python.exe`，macOS/Linux 用 `.venv/bin/python`
+- **绝对不要**直接 `cd backend && python -m pip install -r requirements.txt`（会装到 system Python，污染依赖图，PyInstaller 静态分析会误拉 jaxlib/torch/polars 400+MB 进 `_internal/`）
+
+**3. 验证 venv**（可选）
+```powershell
+backend\.venv\Scripts\python.exe -m pip list
+# 应该只显示 80 个包, 没有 jaxlib/torch/transformers/polars/ultralytics
+```
+
+**macOS / Linux 等价**：
+```bash
+cd frontend
+python3.12 -m venv ../backend/.venv
+../backend/.venv/bin/pip install -r ../backend/requirements.txt
+../backend/.venv/bin/pip install pyinstaller==6.22.3 pyinstaller-hooks-contrib
+```
+
+**4. WorkBuddy / IDE 注意**
+- 装过 360 杀软的环境, `pip install` 会被 safe-delete shim 拦 (`os.unlink` 累计 > 50 触发 fail-closed)
+- 解决: 用 `python -E -m pip install` (屏蔽 PYTHONPATH 避开 shim 注入)
+- 或在 `python -m venv` 前先关 360 实时扫描
+
 ### 后端
 
+**核心原则**：**所有** Python 命令必须用 venv 内的 python（`backend\.venv\Scripts\python.exe`），**不要**用 system python。
+
+**1. 跑 dev server**（uvicorn 自动 reload）
 ```powershell
 cd backend
-python -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8765 --reload
 # FFmpeg：放置 ffmpeg.exe / ffprobe.exe 到 backend/assets/ffmpeg/
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 ```
+
+**2. 激活 venv (可选, 让 `python` 命令直接指向 venv)**
+
+PowerShell (Windows):
+```powershell
+# 临时激活 (当前 shell session)
+backend\.venv\Scripts\Activate.ps1
+
+# 验证: python --version 应输出 Python 3.12.10 + (backend) 前缀
+python -c "import sys; print(sys.executable)"  # 期望 backend\.venv\Scripts\python.exe
+
+# 退出: deactivate
+```
+
+bash (macOS / Linux / WSL):
+```bash
+source backend/.venv/bin/activate
+which python  # 期望 backend/.venv/bin/python
+deactivate
+```
+
+激活后 `python` / `pip` 自动指向 venv，**不**用每次敲 `.venv\Scripts\python.exe`。但**风险**：IDE 终端有时**不会**激活 venv，跑命令会落到 system python。**最稳**：不激活，**直接**用 `.venv\Scripts\python.exe` 绝对路径。
 
 ### 前端
 
@@ -64,21 +135,78 @@ npm install
 npm run dev      # 构建 + 启动 Electron（自动拉起后端）
 ```
 
-### 全量回归
+**前端 dev 不依赖 venv**（Node.js 自己的运行时）。但 `npm run build:backend` 会调 venv python（已在 build script 里写死），见 `frontend/package.json` 的 `build:backend` script。
 
+### 测试
+
+**单条**（venv 内的 pytest）：
+```powershell
+cd backend
+.venv\Scripts\python.exe -m pytest tests/ -v
+# 单个文件: .venv\Scripts\python.exe -m pytest tests/test_xxx.py -v
+```
+
+**全量回归**（脚本 5 节：后端语法 + 后端单测 + 前端 typecheck + 前端单测 + GBK stdout）：
 ```bash
 bash run_all_tests.sh
 ```
 
-5 节：后端语法检查 + 后端单测（14 套件）+ 前端 typecheck + 前端单测 + GBK stdout。
-
-### 算法验证脚本（独立运行）
-
+**算法验证脚本**（独立运行）：
 ```powershell
-python scripts/algo_full_test.py   # 输出 /tmp/algo_full_test.md
+backend\.venv\Scripts\python.exe scripts/algo_full_test.py
+# 输出 /tmp/algo_full_test.md
 ```
 
 视频组合算法 4 项核心约束自检：同源率 / 位置重叠 / 权重采样 / 随机均匀，详见 `backend/tests/test_v25_pick_combinations.py`。
+
+### IDE 配置（推荐）
+
+**VSCode**（`.vscode/settings.json`）:
+```json
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
+  "python.analysis.extraPaths": ["${workspaceFolder}/backend"],
+  "python.testing.pytestPath": "${workspaceFolder}/backend/.venv/Scripts/pytest.exe"
+}
+```
+
+**PyCharm**:
+- Settings → Project Interpreter → Add → Virtualenv Environment → Existing
+- 选 `backend/.venv/Scripts/python.exe`
+
+**关键**: IDE 配 venv interpreter 后, IntelliSense / 类型检查 / debug 都走 venv, **不**会**误**导入 system site-packages 的包 (避开了 "venv 装 80 个包, system 装 177 个" 的污染问题).
+
+### 验证 venv 是"干净" (避 system 污染)
+
+```powershell
+# 1. 列出 venv 装的包 (期望 ~80 个, 无 jaxlib/torch/transformers/polars/ultralytics)
+backend\.venv\Scripts\python.exe -m pip list
+
+# 2. 列出 system site-packages (期望 0 个项目依赖, 避免污染)
+"C:\Users\laiguorong\AppData\Local\Programs\Python\Python312\python.exe" -m pip list
+# (上面这个路径是荣少机器实际 system python 路径, 不同机器不同)
+
+# 3. 关键: dev 跑后端时 sys.path 应该只有 venv, **不**含 system site-packages
+backend\.venv\Scripts\python.exe -c "import sys; [print(p) for p in sys.path]"
+# 期望看到: backend\.venv\Lib\site-packages (有)
+# 期望**不**看到: C:\Users\laiguorong\AppData\Local\Programs\Python\Python312\Lib\site-packages (system)
+```
+
+### 写进 SOP 的常见陷阱
+
+- **不要**用 system python 跑 backend 命令 (`python -m uvicorn ...` 落到 system site-packages → 装到 system → 污染依赖图)
+- **不要**在 backend/ 跑 `python -m pip install` (装到 system, 同样污染)
+- **不要**用 IDE 默认 interpreter (VSCode 默认用 PATH 第一个 python, 可能是 system) — **必须**显式配 venv interpreter
+- **不要**激活 venv 后**不**用 `python` 命令直接跑 — 有时 IDE / 终端**不**继承 venv env, 跑出去仍用 system
+
+### 写进 .gitignore (已加)
+
+```
+backend/.venv/                # venv 不入库
+backend/requirements-*.txt    # 临时 pip freeze 备份
+```
+
+`backend/requirements.txt` 16 个项目直接依赖手写, **不要**用 `pip freeze` 覆盖 (会污染).
 
 ## 发布向导
 
@@ -142,10 +270,17 @@ pyinstaller build.spec
 cd ../frontend
 npm install
 npm run build                    # 三段 vite 编译：main + preload + renderer
-npm run dist                     # electron-builder → release/ShortVideoTool Setup 1.0.0.exe
-# 产物：frontend/release/ShortVideoTool Setup 1.0.0.exe
+npm run dist                     # electron-builder → release/ShortVideoTool Setup <version>.exe
+# 产物：frontend/release/ShortVideoTool Setup <version>.exe
 # 副产物：frontend/release/win-unpacked/（解压版，可直接跑）
+
+# 版本号在两处定义：
+#   frontend/package.json: "version"  (NSIS 安装包名 + electron-builder 读取)
+#   backend/app/main.py:   FastAPI(version="...")  (API 标识,与安装包无关但建议同步)
 ```
+
+> **跨平台说明**：`build:backend` 用 `node scripts/rmrf.cjs` 删旧 dist（Node 内置 fs.rmSync 跨平台），
+> 之前用 `rm -rf` 在 Windows cmd 报错 `'rm' 不是内部或外部命令`。
 
 **ffmpeg 必须含 libx264**——否则后端启动时 `check_ffmpeg_env` 抛 RuntimeError，主进程会弹错误框提示。
 
