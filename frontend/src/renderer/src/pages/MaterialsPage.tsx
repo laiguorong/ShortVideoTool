@@ -1245,9 +1245,19 @@ export function MaterialsPage() {
         // 旧请求晚返回时丢弃，避免覆盖新筛选条件的结果
         if (reqId !== listReqId.current) return
         setData({ list: r.list, total: r.total })
-        // 兜底关闭孤儿预览弹窗：当前 playTarget 不在新列表里（被其他 tab/筛选/分页剔除）
-        if (playTarget && !r.list.some((m) => m.id === playTarget.id)) setPlayTarget(null)
-        if (playMusicTarget && !r.list.some((m) => m.id === playMusicTarget.id)) setPlayMusicTarget(null)
+        // 兜底：playTarget 不在新 list 中（如切 tab/筛选/分页剔除）→ 自动切到新 list 的第一个，
+        // 保持预览弹窗打开、可继续翻页。用 functional setState 拿最新值，避免 loadMaterials
+        // useCallback 依赖里没 playTarget 导致闭包过期。
+        setPlayTarget((cur) => {
+          if (!cur) return cur
+          if (r.list.some((m) => m.id === cur.id)) return cur
+          return r.list[0] ?? null
+        })
+        setPlayMusicTarget((cur) => {
+          if (!cur) return cur
+          if (r.list.some((m) => m.id === cur.id)) return cur
+          return r.list[0] ?? null
+        })
       })
       .catch((e) => {
         if (reqId !== listReqId.current) return
@@ -1369,11 +1379,22 @@ export function MaterialsPage() {
   /** 批量删除 */
   const doBatchDelete = async () => {
     const ids = [...checkedIds]
+    // 如果包含 playTarget，预先算 fallback（基于当前 list 快照）
+    const playTargetId = playTarget?.id
+    const playMusicTargetId = playMusicTarget?.id
+    const snapshot = data.list
+    const pickFallback = (id: string): Material | null => {
+      const i = snapshot.findIndex((m) => m.id === id)
+      return i >= 0 ? (snapshot[i + 1] ?? snapshot[i - 1] ?? null) : null
+    }
     try {
       await Promise.all(ids.map((id) => materialApi.remove(id)))
       toast(`已删除 ${ids.length} 个素材`, 'success')
       setCheckedIds(new Set())
       setManageMode(false)
+      // 不关弹窗：playTarget 被批量删了 → 自动切下一个；不在批量里则不动
+      if (playTargetId && ids.includes(playTargetId)) setPlayTarget(pickFallback(playTargetId))
+      if (playMusicTargetId && ids.includes(playMusicTargetId)) setPlayMusicTarget(pickFallback(playMusicTargetId))
       loadMaterials()
       loadCategories()
     } catch (e) {
@@ -1708,19 +1729,20 @@ export function MaterialsPage() {
         defaultCategoryId={moveCatTarget?.category_id}
         onConfirm={async (cid) => {
           if (!moveCatTarget) return
+          // 操作前 list 快照：基于此算"下一个/上一个"
+          const snapshot = data.list
+          const i = snapshot.findIndex((m) => m.id === moveCatTarget.id)
+          const fallback = i >= 0 ? (snapshot[i + 1] ?? snapshot[i - 1] ?? null) : null
           await materialApi.update(moveCatTarget.id, { category_id: cid })
           toast('已移动', 'success')
           const catName = flattenTree(buildTree(categories)).find((f) => f.node.id === cid)?.node.name || ''
-          // 同步：详情弹窗 + 视频/音乐预览弹窗若指向同一素材，更新 category_id
+          // 详情弹窗：保持打开，仅刷新 category_id（详情不需要切走）
           if (detailTarget?.id === moveCatTarget.id) {
             setDetailTarget((cur) => cur ? { ...cur, category_id: cid, category_name: catName } : null)
           }
-          if (playTarget?.id === moveCatTarget.id) {
-            setPlayTarget((cur) => cur ? { ...cur, category_id: cid, category_name: catName } : null)
-          }
-          if (playMusicTarget?.id === moveCatTarget.id) {
-            setPlayMusicTarget((cur) => cur ? { ...cur, category_id: cid, category_name: catName } : null)
-          }
+          // 预览弹窗：自动切下一个（保持连续浏览体验）；非当前预览则不动
+          if (playTarget?.id === moveCatTarget.id) setPlayTarget(fallback)
+          if (playMusicTarget?.id === moveCatTarget.id) setPlayMusicTarget(fallback)
           loadMaterials()
           loadCategories()
         }} />
@@ -1749,12 +1771,16 @@ export function MaterialsPage() {
         onConfirm={async () => {
           if (!deleteTarget) return
           const deletedId = deleteTarget.id
+          // 操作前 list 快照：基于此算"下一个/上一个"，避免引用改删后 list 跳号导致定位错乱
+          const snapshot = data.list
+          const i = snapshot.findIndex((m) => m.id === deletedId)
+          const fallback = i >= 0 ? (snapshot[i + 1] ?? snapshot[i - 1] ?? null) : null
           try {
             await materialApi.remove(deletedId)
             toast('已删除', 'success')
-            // 同步关闭对应的预览弹窗，避免 src 指向已删文件 404
-            if (playTarget?.id === deletedId) setPlayTarget(null)
-            if (playMusicTarget?.id === deletedId) setPlayMusicTarget(null)
+            // 不关弹窗：删的是当前预览 → 自动切下一个（保持连续浏览体验）
+            if (playTarget?.id === deletedId) setPlayTarget(fallback)
+            if (playMusicTarget?.id === deletedId) setPlayMusicTarget(fallback)
             loadMaterials()
             loadCategories()
           } catch (e) { toast((e as Error).message, 'error') }
