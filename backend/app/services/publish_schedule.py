@@ -793,15 +793,14 @@ def _schedule_video_dir_balanced(account_id: str,
             locked_cnt = _count_locked_in_dir(d) if skip_locked_videos else 0
             if locked_cnt > 0:
                 raise ScheduleVideoShortageError(
-                    f"目录「{d.title}」共 {len(d.video_paths)} 个视频，其中 "
-                    f"{locked_cnt} 个正被其它任务占用，已无可用。"
-                    f"请等待其它任务完成或换目录。"
+                    f"目录「{d.title}」里共 {len(d.video_paths)} 个视频，"
+                    f"其中 {locked_cnt} 个正在被其它任务用着，已经没空闲的了。"
+                    f"请等其它任务跑完，或者换个目录。"
                 )
             raise ScheduleVideoShortageError(
-                f"目录「{d.title}」仅有 {len(d.video_paths)} 个合规视频，"
-                f"当前账号需发布 {limit} 条、按 {n_dirs} 个目录平均分配，"
-                f"本账号起始 k={acc_offset}、本目录需 k={k + 1}。"
-                f"请减少每账号发布数或增加目录内视频。"
+                f"目录「{d.title}」里只有 {len(d.video_paths)} 个视频，"
+                f"但本账号需要拍 {limit} 个。"
+                f"建议：减少每个账号的发布数量，或者往目录里多放一些视频。"
             )
         vp = d.video_paths[k]
         # 门店 / 简介轮转（#456 允许 intros 为空——空时 intro_content='' 表示不添加视频简介）
