@@ -641,6 +641,39 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   // 强制用户主动勾选（或点"全选"按钮）才能进入下一步。
   // #451：删除旧 initedShopSelRef / useEffect（无任何代码读它，纯死代码）。
 
+  // #fix-shop-stale-on-reopen：projShops 加载完后，静默过滤掉 selectedShops 中已失效的店。
+  // 场景：复制 / 编辑任务时回填的店集合（draft.selectedShops）包含原任务里已取消加库 / 无佣金的店；
+  // 后端 _resolve_projects_payload 会触发 stale_in_draft 校验 + 阻断 preview（toast「门店配置已变更」）。
+  // 修法：以显示列表（projShops = list_project_shops 已过滤 is_added=1 ∩ is_cps=1）为权威，
+  // projShops 加载完后把 selectedShops 中不在 projShops 里的店剔除——避免回填店集与 DB 不一致。
+  // 静默处理：不弹 toast、不打日志——UI 反映在 step 3 "共 X 家 / 已选 Y 家" 上自然告知。
+  // 新建任务 selectedShops 默认空，过滤空→空→不动，行为不变。
+  // dedupe 用 projShops 加载指纹：StrictMode 下 effect 二次执行早返回，不重 setState。
+  const projectDraftRef = useRef(projectDraft)
+  useEffect(() => { projectDraftRef.current = projectDraft }, [projectDraft])
+  const shopFilterFingerprintRef = useRef<string>('')
+  useEffect(() => {
+    const loadedPids = Object.keys(projShops).sort().join(',')
+    if (loadedPids === shopFilterFingerprintRef.current) return  // StrictMode 二次 / 重复触发早返回
+    shopFilterFingerprintRef.current = loadedPids
+
+    const cur = projectDraftRef.current
+    const next: Record<string, ProjectDraftState> = { ...cur }
+    let changed = false
+    for (const pid of Object.keys(cur)) {
+      const avail = projShops[pid]
+      if (!avail) continue  // 还没加载完，跳过
+      const availIds = new Set(avail.map((s) => s.shop_id))
+      const sel = cur[pid].selectedShops
+      const filtered = sel.filter((s) => availIds.has(s.id))
+      if (filtered.length !== sel.length) {
+        next[pid] = { ...cur[pid], selectedShops: filtered }
+        changed = true
+      }
+    }
+    if (changed) setProjectDraft(next)
+  }, [projShops])
+
   // R31 修：模式切换或 selAccounts 变化都同步 per_account 表
   // #596：per_account 扩为 { limit, scheduleMode, fixedIntervalMin, balancedStepMin } record；
   // - 新账号：默认值 limit=dailyLimitGlobal, scheduleMode=balanced, fixed=10, balanced=60
