@@ -1349,6 +1349,16 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                                 return { ...prev, [p.id]: { ...cur, selectedShops: next } }
                               })} />
                             <span className="flex-1">{s.shop_name ?? s.shop_id}</span>
+                            {/* #publish-count：发布次数角标。后端已按 publish_count ASC 排序，
+                                角标只是把同一信息显式化，不影响勾选顺序。 */}
+                            {s.publish_count > 0 && (
+                              <span
+                                className="inline-block rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground whitespace-nowrap"
+                                title={`该门店累计发布成功 ${s.publish_count} 次`}
+                              >
+                                已发 {s.publish_count} 次
+                              </span>
+                            )}
                           </label>
                         )
                       })}

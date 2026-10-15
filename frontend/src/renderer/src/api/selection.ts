@@ -93,6 +93,9 @@ export interface Shop {
   is_added_to_library: number
   added_time: string | null
 
+  // #publish-count：累计发布成功次数（视频发布成功后 +1）
+  publish_count: number
+
   // 通用
   create_time: string
   update_time: string

@@ -131,6 +131,9 @@ class ShopRead(BaseModel):
     detail_fetched: int = 0
     detail_updated_time: str | None = None
 
+    # #publish-count：累计发布成功次数（视频发布成功后 +1；前端按升序排）
+    publish_count: int = 0
+
     # 通用
     create_time: str
     update_time: str

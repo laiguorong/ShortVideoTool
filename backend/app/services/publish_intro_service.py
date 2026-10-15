@@ -149,22 +149,26 @@ def set_project_intros(project_id: str, items: list[str]) -> int:
 # ---------- 项目-门店 绑定 ----------
 
 def list_project_shops(project_id: str) -> list[dict]:
-    """项目绑定的门店列表（按 sort_order 升序），含门店基础信息。
+    """项目绑定的门店列表（含门店基础信息 + publish_count）。
 
     #444：业务硬约束——只返回「未删 + 已加库 + 有佣金」的店；
     未加库 / 无佣金的店不能进入发布流程（与 #414 ProjectShopsDrawer UI 过滤对齐）。
+
+    #publish-count：排序完全按 publish_count ASC（覆盖原 sort_order）；
+    s.id ASC 作为稳定排序兜底，避免 publish_count 相同时顺序漂移。
     """
     d = get_db()
     return d.query_all(
         """SELECT ps.project_id, ps.shop_id, ps.sort_order,
-                  s.name AS shop_name, s.city, s.category, s.poi_id
+                  s.name AS shop_name, s.city, s.category, s.poi_id,
+                  s.publish_count
            FROM project_shop ps
            LEFT JOIN shop s ON s.id=ps.shop_id AND s.deleted=0
            WHERE ps.project_id=?
              AND s.id IS NOT NULL
              AND s.is_added_to_library=1
              AND s.is_cps=1
-           ORDER BY ps.sort_order""",
+           ORDER BY s.publish_count ASC, s.id ASC""",
         (project_id,))
 
 

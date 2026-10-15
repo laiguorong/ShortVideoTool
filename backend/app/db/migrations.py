@@ -958,6 +958,18 @@ MIGRATIONS: list[tuple[int, str]] = [
         -- shop_name，shop_id 留空字符串。DDL block 仅注释（_apply_v46 函数里幂等补列）。
         """,
     ),
+    (
+        47,
+        """
+        -- ============ v47 #publish-count 门店累计发布次数 ============
+        -- 新增 shop.publish_count INTEGER NOT NULL DEFAULT 0 —— 记录该门店累计发布成功的视频数。
+        -- 用途：
+        --   • 选品中心「门店」Tab 表格新增「发布次数」列
+        --   • 发布中心新建任务选门店时按 publish_count ASC 升序排序
+        --   • 触发点：_publish_one_item_inner 发布成功分支 +1（publish_service.py）
+        -- DDL block 仅注释，幂等补列在 _apply_v47。
+        """,
+    ),
 ]
 
 
@@ -1004,6 +1016,8 @@ def migrate(database) -> int:
             _apply_v45(database)
         elif version == 46:
             _apply_v46(database)
+        elif version == 47:
+            _apply_v47(database)
         else:
             database.executescript(ddl)
         database.set_user_version(version)
@@ -1252,6 +1266,10 @@ def _apply_v33(database) -> None:
             detail_fetched INTEGER NOT NULL DEFAULT 0,
             detail_updated_time TEXT,
 
+            -- #publish-count：累计发布次数（发布视频成功后 +1；前端选品中心门店 Tab 展示、
+            -- 发布中心新建任务时按此升序排）
+            publish_count INTEGER NOT NULL DEFAULT 0,
+
             create_time TEXT NOT NULL,
             update_time TEXT NOT NULL,
             deleted INTEGER NOT NULL DEFAULT 0
@@ -1262,6 +1280,7 @@ def _apply_v33(database) -> None:
         CREATE INDEX idx_shop_commission ON shop(commission_rate);
         CREATE INDEX idx_shop_total_gmv ON shop(total_gmv);
         CREATE INDEX idx_shop_detail_fetched ON shop(detail_fetched);
+        CREATE INDEX idx_shop_publish_count ON shop(publish_count);
     """
     database.executescript(new_ddl)
 
@@ -1606,4 +1625,68 @@ def _apply_v46(database) -> None:
             "WHERE source = 'video_dir' "
             "  AND (shop_name IS NULL OR shop_name = '') "
             "  AND shop_id != ''"
+        )
+
+
+def _apply_v47(database) -> None:
+    """v47：#publish-count 门店累计发布次数。
+
+    新增 shop.publish_count INTEGER NOT NULL DEFAULT 0 —— 记录该门店累计发布成功的视频数。
+
+    用途：
+      • 选品中心「门店」Tab 表格新增「发布次数」列
+      • 发布中心新建任务时，list_project_shops 按 publish_count ASC 排
+      • 触发点：_publish_one_item_inner 发布成功分支 +1（publish_service.py:
+        if result.get("success"):），项目模式用 shop.id、video_dir 模式按
+        shop.name 反查真 shop.id 后 +1
+
+    实施（幂等 + 保护增量）：
+    1. 给 shop 表 ADD COLUMN publish_count INTEGER NOT NULL DEFAULT 0
+    2. 加 idx_shop_publish_count 索引（升序排序用）
+    3. **回填历史**：从 publish_record.status='success' 按 r.shop_id=shop.id
+       聚合计数写入。回填范围 = 项目模式历史 + v46 之后的 video_dir 模式历史
+       （两者 publish_record.shop_id 都是真 shop.id）。
+       **v46 之前 video_dir 老历史不会被这次回填覆盖**——当时 publish_record.shop_id
+       存的是店名占位符，JOIN 不上；这部分历史实际统计意义不大，
+       因为后续 video_dir 模式 +1 钩子（按 name 反查）会接管增量。
+    4. **守卫已 +1 增量**：回填 SQL 加 `AND publish_count = 0` 守卫——只对迁移时
+       还没 +1 过的店回填历史。**避免 v47 重跑 / user_version 被重置后回填
+       SQL 把已 +1 的数冲回 COUNT(*)**。保护用户真实增量（#publish-count-review 用户拍板）。
+
+    兼容性陷阱（修这个 SQL 时**不要换回 EXISTS 形式**——见下方注释）：
+      SQLite 对 `UPDATE SET=(SELECT...) WHERE EXISTS (SELECT... correlating)`
+      偶发 "near WHERE: syntax error"；IN 版本更稳，行为等价。详见工作记忆
+      E:/sourcecode/RongInfo/ShortVideoTool/.workbuddy/memory/MEMORY.md「
+      shop.publish_count 字段」一节。
+    """
+    if not _has_table(database, "shop"):
+        return
+    if not _has_column(database, "shop", "publish_count"):
+        database.execute(
+            "ALTER TABLE shop ADD COLUMN publish_count INTEGER NOT NULL DEFAULT 0"
+        )
+    database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shop_publish_count ON shop(publish_count)"
+    )
+    # 回填：项目模式历史 + v46 之后 video_dir 模式历史。publish_record.shop_id=''
+    # 的行（v46 之后 video_dir 模式标准写入）会被 r.shop_id != '' 守卫过滤掉——
+    # 这部分增量由新加的 _inc_shop_publish_count 钩子按 name 反查负责，不归回填管。
+    # 守卫 publish_count = 0：保护已 +1 增量（详见函数 docstring 第 4 项）。
+    # status='success' 排除 'removed' record（手动下架后 status 改 removed，不计入）。
+    if _has_table(database, "publish_record"):
+        database.execute(
+            """
+            UPDATE shop
+            SET publish_count = (
+                SELECT COUNT(*) FROM publish_record r
+                WHERE r.shop_id = shop.id
+                  AND r.shop_id != ''
+                  AND r.status = 'success'
+            )
+            WHERE id IN (
+                SELECT DISTINCT shop_id FROM publish_record
+                WHERE shop_id != '' AND status = 'success'
+            )
+            AND publish_count = 0
+            """
         )

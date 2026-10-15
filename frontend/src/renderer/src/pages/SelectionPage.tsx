@@ -475,6 +475,7 @@ function ShopTab({
               <th className="px-3 py-2.5 text-left font-medium">商品</th>
               <th className="px-3 py-2.5 text-left font-medium">有佣金</th>
               <th className="px-3 py-2.5 text-left font-medium">佣金率</th>
+              <th className="px-3 py-2.5 text-left font-medium" title="累计发布成功的视频数">发布次数</th>
               <th className="px-3 py-2.5 text-left font-medium">TOP SPU</th>
               <th className="px-3 py-2.5 text-left font-medium">创建时间</th>
               <th className="px-3 py-2.5 text-left font-medium">操作</th>
@@ -532,6 +533,11 @@ function ShopTab({
                         {rt.text}
                       </span>
                     )}
+                  </td>
+                  <td className="px-3 py-2 text-left text-xs">
+                    {s.publish_count > 0
+                      ? <span className="font-medium" title={`累计发布成功 ${s.publish_count} 次`}>{s.publish_count}</span>
+                      : <span className="text-muted-foreground/40" title="未发布过">0</span>}
                   </td>
                   <td className="px-3 py-2 text-left text-xs">
                     {s.top_spu_name ? (

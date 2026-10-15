@@ -2364,6 +2364,9 @@ def _publish_one_item_inner(item_id: str, info) -> str:
                         video = {"id": "", "file_path": new_abs}
                     record_id = _write_publish_record(item, account, shop, title, topic,
                                                       video, video_title, result["online_video_id"])
+                    # #publish-count：发布成功后门店 publish_count +1
+                    # （项目模式用 shop.id、video_dir 模式按 shop.name 反查；详见 _inc_shop_publish_count）
+                    _inc_shop_publish_count(d, is_video_dir, shop)
                     d.update_by_id("publish_task_item", item_id, {
                         "status": "success", "publish_record_id": record_id, "fail_reason": None})
                     _refresh_task_progress(item["task_id"])
@@ -2606,6 +2609,50 @@ def _write_publish_record(item: dict, account: dict, shop: dict, title: str, top
         "declaration": item.get("declaration"),
         "allow_download": item.get("allow_download"),
     })
+
+
+def _inc_shop_publish_count(d, is_video_dir: bool, shop: dict | None) -> None:
+    """视频发布成功后，给门店 publish_count +1（#publish-count）。
+
+    两种模式：
+    - 项目模式（is_video_dir=False）：shop["id"] 直接就是真 shop.id，单条 UPDATE。
+    - 视频目录模式（is_video_dir=True）：shop["id"] 是店名占位符（v46 之后
+      publish_record.shop_id=""，#fix-video-dir-shop-name 前置修复留下的兼容；
+      v46 之前曾存店名）。按 shop["name"] 反查真实 shop.id
+      （is_added=1 AND is_cps=1 的第一家，与 wizard list_project_shops 加载约束
+      对齐——只统计「发布中心在用」的店）。
+
+    静默策略：
+      - shop 缺失 / shop["id"] 空 / 按 name 反查不到 → 不计入
+      - 不抛错：发布次数是 UI 统计指标，不应阻塞发布主流程
+
+    注意：故意不查 shop.deleted=0（反查 SQL 里 already 加 AND s.deleted=0）。
+    """
+    if not shop:
+        return
+    target_id: str | None = None
+    if is_video_dir:
+        name = (shop.get("name") or "").strip()
+        if not name:
+            return
+        row = d.query_one(
+            "SELECT id FROM shop "
+            "WHERE name=? AND deleted=0 "
+            "  AND is_added_to_library=1 AND is_cps=1 "
+            "ORDER BY id LIMIT 1",
+            (name,),
+        )
+        if not row:
+            return
+        target_id = row["id"]
+    else:
+        target_id = (shop.get("id") or "").strip()
+        if not target_id:
+            return
+    d.execute(
+        "UPDATE shop SET publish_count = publish_count + 1 WHERE id=?",
+        (target_id,),
+    )
 
 
 def _release_video(video_id: str) -> None:

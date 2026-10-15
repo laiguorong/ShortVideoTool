@@ -78,7 +78,7 @@ _NOT_NULL_DEFAULTS: dict[str, Any] = {
 _SHOP_SORT_COLS = {
     "spu_count", "cps_spu_count", "total_gmv", "total_sold",
     "commission_rate", "take_rate_avg", "detail_updated_time",
-    "create_time", "update_time", "city",
+    "create_time", "update_time", "city", "publish_count",
 }
 
 

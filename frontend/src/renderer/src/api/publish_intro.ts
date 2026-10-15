@@ -22,6 +22,9 @@ export interface ProjectShopItem {
   city?: string | null
   category?: string | null
   poi_id?: string | null
+  /** #publish-count：累计发布成功次数（视频发布成功后 +1）。
+   *  后端 list_project_shops v47 起必返回（0 表示从没发过）；后端已按 publish_count ASC 排序。 */
+  publish_count: number
 }
 
 export const publishIntroApi = {
