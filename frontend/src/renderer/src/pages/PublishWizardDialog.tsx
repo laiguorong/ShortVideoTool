@@ -199,7 +199,6 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     accountApi.list({ status: 'normal', page_size: 100 }).then((r) => setAccounts(r.list))
     // #448：改用 listPublishableProjects（带 shop_count + status='normal' + generated_idle），让 step2 能识别 0 绑店项目并禁用勾选
     publishIntroApi.listPublishableProjects().then((rows) => {
-      console.log('[WizardDebug] listPublishableProjects rows:', rows)
       setProjects(rows.map((r) => ({
         ...r,
         shot_count_real: 0, clip_count: 0, generated_total: r.generated_idle ?? 0,
@@ -641,6 +640,16 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   // 强制用户主动勾选（或点"全选"按钮）才能进入下一步。
   // #451：删除旧 initedShopSelRef / useEffect（无任何代码读它，纯死代码）。
 
+  // #450：把 ProjectShopItem 转成 ShopDraftEntry 对象数组（统一 store 结构）。
+  // #fix-shop-stale-on-reopen：提到组件顶层——过滤 useEffect（下方）也需要复用。
+  // 用 ?? 而非 ||：空字符串保持空字符串（与 wizard step 3 全选/反选时 toShopEntry 行为一致）。
+  const toShopEntry = (s: { shop_id: string; shop_name?: string | null; city?: string | null; poi_id?: string | null }): ShopDraftEntry => ({
+    id: s.shop_id,
+    name: s.shop_name ?? '',
+    city: s.city ?? '',
+    poi_id: s.poi_id ?? '',
+  })
+
   // #fix-shop-stale-on-reopen：projShops 加载完后，静默过滤掉 selectedShops 中已失效的店。
   // 场景：复制 / 编辑任务时回填的店集合（draft.selectedShops）包含原任务里已取消加库 / 无佣金的店；
   // 后端 _resolve_projects_payload 会触发 stale_in_draft 校验 + 阻断 preview（toast「门店配置已变更」）。
@@ -649,6 +658,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   // 静默处理：不弹 toast、不打日志——UI 反映在 step 3 "共 X 家 / 已选 Y 家" 上自然告知。
   // 新建任务 selectedShops 默认空，过滤空→空→不动，行为不变。
   // dedupe 用 projShops 加载指纹：StrictMode 下 effect 二次执行早返回，不重 setState。
+  // 用 projectDraftRef 同步读最新 draft（避免 setState callback 收集导致 StrictMode 双调累计翻倍）。
   const projectDraftRef = useRef(projectDraft)
   useEffect(() => { projectDraftRef.current = projectDraft }, [projectDraft])
   const shopFilterFingerprintRef = useRef<string>('')
@@ -663,9 +673,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     for (const pid of Object.keys(cur)) {
       const avail = projShops[pid]
       if (!avail) continue  // 还没加载完，跳过
-      const availIds = new Set(avail.map((s) => s.shop_id))
       const sel = cur[pid].selectedShops
-      const filtered = sel.filter((s) => availIds.has(s.id))
+      const availIds = new Set(sel.map((s) => s.id))
+      const filtered = avail.filter((s) => availIds.has(s.shop_id)).map(toShopEntry)
       if (filtered.length !== sel.length) {
         next[pid] = { ...cur[pid], selectedShops: filtered }
         changed = true
@@ -713,70 +723,6 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     }
     if (nextStep > 2 && projectSource === 'video_dir' && videoDirs.length === 0) {
       toast('请先添加成品视频目录（步骤 2）', 'error'); return
-    }
-    // #449 调试：每步点「下一步」前输出当前 step 选中记录，便于排查新建发布任务异常
-    // #452：撤掉 DEV 守护，所有环境都打 [WizardDebug] 前缀。
-    // 想关掉：DevTools console 跑 `localStorage.setItem('__wizard_debug_off','1')`
-    const curStep = nextStep - 1
-    if (!localStorage.getItem('__wizard_debug_off') && curStep === 1) {
-      console.log('[WizardDebug] step1→2 选中账号:', {
-        task_name: taskName,
-        account_ids: selAccounts.map((a) => a.id),
-        accounts: selAccounts.map((a) => ({
-          id: a.id, nickname: a.nickname, remark: a.remark, status: a.status,
-        })),
-      })
-    } else if (!localStorage.getItem('__wizard_debug_off') && curStep === 2) {
-      console.log('[WizardDebug] step2→3 选中项目:', {
-        project_ids: selProjects.map((p) => p.id),
-        projects: selProjects.map((p) => ({
-          id: p.id, title: p.title, status: p.status,
-          shop_count: (p as unknown as { shop_count?: number } | undefined)?.shop_count,
-          generated_idle: p.generated_idle,
-        })),
-      })
-    } else if (!localStorage.getItem('__wizard_debug_off') && curStep === 3) {
-      console.log('[WizardDebug] step3→4 挂载门店:', {
-        project_ids: selProjects.map((p) => p.id),
-        per_project: selProjects.map((p) => {
-          const draft = projectDraft[p.id]
-            ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
-          const allShops = projShops[p.id] ?? []
-          return {
-            project_id: p.id,
-            project_title: p.title,
-            selected_shops: draft.selectedShops,
-            available_in_db: allShops.length,
-            missing_in_db: draft.selectedShops
-              .filter((s) => !allShops.some((x) => x.shop_id === s.id)),
-          }
-        }),
-      })
-    } else if (!localStorage.getItem('__wizard_debug_off') && curStep === 4) {
-      console.log('[WizardDebug] step4→5 视频简介:', {
-        project_ids: selProjects.map((p) => p.id),
-        per_project: selProjects.map((p) => {
-          const d = projectDraft[p.id]
-          // #fix-intro-mode-independent：按 introMode 取对应数组
-          const intros = d
-            ? (d.introMode === 'list' ? d.selectedIntrosList : d.selectedIntrosManual)
-            : []
-          return { project_id: p.id, project_title: p.title, intros }
-        }),
-      })
-    } else if (!localStorage.getItem('__wizard_debug_off') && curStep === 5) {
-      console.log('[WizardDebug] step5→6 排期规则:', {
-        task_name: taskName,
-        daily_limit_mode: dailyLimitMode,
-        daily_limit_global: dailyLimitGlobal,
-        daily_limit_per_account: dailyLimitPerAccount,
-        start_time: startTime,
-        end_time: endTime,
-        schedule_mode: scheduleMode,
-        fixed_interval_min: fixedIntervalMin,
-        balanced_step_min: balancedStepMin,
-        declaration, allow_download: allowDownload,
-      })
     }
     goStep(nextStep)
   }, [selProjects, selAccounts, projects, projectDraft, projShops, taskName,
@@ -1339,13 +1285,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
             const draft = projectDraft[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
             // #413 走查 #7 W1：只显示项目已绑定的门店，避免全量 200+ 误导
             const projShopList = projShops[p.id]
-            // #450：把 ProjectShopItem 转成 ShopDraftEntry 对象数组（统一 store 结构）
-            const toShopEntry = (s: { shop_id: string; shop_name?: string | null; city?: string | null; poi_id?: string | null }): ShopDraftEntry => ({
-              id: s.shop_id,
-              name: s.shop_name ?? '',
-              city: s.city ?? '',
-              poi_id: s.poi_id ?? '',
-            })
+            // #450：toShopEntry 提到组件顶层（L1370 附近）——上方过滤 useEffect 复用
             return (
               <div key={p.id} className="rounded-md border border-border p-3">
                 <div className="mb-2 flex items-center justify-between">
@@ -1754,16 +1694,11 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
 
       {step === 6 && preview && (
         <div className="space-y-2">
-          {/* #450：把 wizard 内每个项目选中的店名汇总成 shopNameById 字典，
-              供 PreviewPane 渲染时取（不再依赖全量 shops）。 */}
+          {/* #fix-preview-display：店名 / 项目名 / 账号昵称 / 视频路径 全部从 preview.items 拿（后端已带），
+              不再依赖 wizard state 反查——预览/确认页用统一数据源。 */}
           <PreviewPane preview={preview}
-            shopNameById={Object.fromEntries(
-              selProjects.flatMap((p) =>
-                (projectDraft[p.id]?.selectedShops ?? []).map((s) => [s.id, s.name])
-              )
-            )}
             projects={projects}
-            accounts={accounts} startTime={startTime} endTime={endTime}
+            startTime={startTime} endTime={endTime}
             onJumpToShops={() => goStep(3)} />
         </div>
       )}
@@ -1879,19 +1814,21 @@ function IntroManualEditor({ projectId, selectedIntros, onChange }: {
 
 // ---------- 步骤 8：预览 ----------
 
-function PreviewPane({ preview, shopNameById, projects, accounts, startTime, endTime, onJumpToShops }: {
+function PreviewPane({ preview, projects, startTime, endTime, onJumpToShops }: {
   preview: PreviewResult
-  /** #450：店 id → 店名 字典（wizard 拼自每个项目的 selectedShops）。 */
-  shopNameById: Record<string, string>
   projects: ProjectRow[]
-  accounts: Account[]
   startTime: string
   endTime: string
   /** #439：点击 banner 上的「回到第 3 步重选门店」按钮回调 */
   onJumpToShops?: () => void
 }) {
   const projMap = new Map(projects.map((p) => [p.id, p.title]))
-  const accMap = new Map(accounts.map((a) => [a.id, a.remark || a.nickname || a.id]))
+  // #fix-preview-display：项目模式 / 视频目录模式统一从 items[*] 拿账号显示名（后端已补 account_remark/ nickname）。
+  // 不用 wizard.accounts 反查（新建任务时 selAccounts 已含，复制/编辑也可能差异）—— 保持单数据源。
+  const accLabel = (it: PreviewItem) => it.account_remark || it.account_nickname || it.account_id
+  // 同上，店名用 it.shop_name（后端从 projects[].shop_names / manual_shops 拼好）。
+  // 兼容 video_dir 模式 shop_id 字段值=店名的情况——直接用 it.shop_name。
+  const shopLabel = (it: PreviewItem) => it.shop_name || it.shop_id
 
   if (preview.overflow) {
     return (
@@ -1904,7 +1841,15 @@ function PreviewPane({ preview, shopNameById, projects, accounts, startTime, end
 
   // #439：draft 与 DB 不一致 → 顶部黄色 banner + 一键回 step3
   const warnings = preview.validation?.warnings ?? []
-  const shopName = (sid: string) => shopNameById[sid] ?? sid.slice(0, 8)
+  // #fix-preview-display：警告 banner 也用 items[*] 拿店名（stale/extra 列表里只有 id，
+  // 拿不到对应 item；用全局 group 一次按 id → name 反查）。
+  const shopNameByIt = new Map<string, string>()
+  for (const it of preview.items) {
+    if (it.shop_name && !shopNameByIt.has(it.shop_id)) {
+      shopNameByIt.set(it.shop_id, it.shop_name)
+    }
+  }
+  const shopName = (sid: string) => shopNameByIt.get(sid) ?? sid.slice(0, 8)
 
   // #426 + #454-补：按账号分组渲染，每组独立表格；组内明细就是该账号的过滤结果
   // #454-改：序号改用组内 1..M（不再用全局 1..N），每账号组自 1 开始
@@ -1959,7 +1904,7 @@ function PreviewPane({ preview, shopNameById, projects, accounts, startTime, end
           <div className="flex items-center justify-between border-b border-border bg-accent/5 px-3 py-2">
             <div className="flex items-center gap-2">
               <span className="rounded bg-accent px-2 py-0.5 text-xs font-medium text-white">
-                {accMap.get(accountId) ?? accountId}
+                {accLabel(items[0])}
               </span>
               {/* #456：去掉「账号 ID：xxx」短码 */}
             </div>
@@ -1986,10 +1931,11 @@ function PreviewPane({ preview, shopNameById, projects, accounts, startTime, end
                     <td className="px-2 py-1.5 text-muted-foreground">{i + 1}</td>
                     <td className="px-2 py-1.5 font-mono">{it.plan_time}</td>
                     <td className="px-2 py-1.5">
-                      {/* #418：video_dir 模式后端回填 project_title（= dir_name），与 wizard step2 显示一致 */}
+                      {/* #fix-preview-display：项目模式 = projects[].project_title；video_dir 模式 = dir_name；后端均已带 */}
                       {it.project_title ?? projMap.get(it.project_id) ?? it.project_id}
                     </td>
-                    <td className="px-2 py-1.5">{shopNameById[it.shop_id] ?? it.shop_id}</td>
+                    {/* #fix-preview-display：店名统一从 it.shop_name 读（后端从 projects[].shop_names / manual_shops 拼好） */}
+                    <td className="px-2 py-1.5">{shopLabel(it)}</td>
                     {/* #428：line-clamp-2 在 td 内不生效，改在 td 内的 div 上做：
                         max-width + display:-webkit-box + -webkit-line-clamp:2 + overflow:hidden */}
                     <td className="px-2 py-1.5" style={{ maxWidth: 240 }}>

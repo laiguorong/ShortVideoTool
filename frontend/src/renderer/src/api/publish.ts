@@ -219,15 +219,21 @@ export interface DraftRequest {
 
 export interface PreviewItem {
   account_id: string
+  /** #fix-preview-display：账号昵称（来自 account_snapshots.nickname） */
+  account_nickname?: string
+  /** #fix-preview-display：账号备注（来自 account_snapshots.remark） */
+  account_remark?: string
   project_id: string
-  /** #418 video_dir 模式：目录名（dir_name），与 wizard step2 显示一致 */
+  /** #418 video_dir 模式：目录名（dir_name），与 wizard step2 显示一致；项目模式：项目名（projects[].project_title） */
   project_title?: string
   shop_id: string
+  /** #fix-preview-display：店名（项目模式 = projects[].shop_names；视频目录模式 = manual_shops 文本） */
   shop_name?: string
   intro_id: string
   intro_content: string
   intro_topics: string[]
   plan_time: string
+  /** 仅视频目录模式有值；项目模式为空字符串 */
   video_path?: string
   // #596：preview 行带算模式 + 当前 mode 对应间隔（per_account 模式按账号不同；global 与顶层一致）
   schedule_mode?: 'fixed' | 'balanced'

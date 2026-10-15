@@ -653,68 +653,6 @@ def confirm_task(task_id: str) -> dict:
 
 # ---------- #441 直传 payload 版预览/确认（wizard 临时化） ----------
 
-def _log_payload_snapshot(stage: str, payload: dict) -> None:
-    """#449 + #450：把 wizard 上传的 payload（含 task_name / 账号标签 / 项目名 / 店名 / 简介内容）
-    打到后端日志。仅日志——排期逻辑完全不依赖这些字段，缺失也无所谓。
-    #451 修复——支持读取新形态 snapshots（项目结构 / 店对象 / 简介对象）；
-    调用方应在 _normalize_payload 之后调用，否则新形态走下来取不到字段。
-    #审查修：用顶部 loguru logger（统一走项目日志 sink），不要 shadow 成 stdlib logging。"""
-    # #451：账号 ID / 标签——优先 snapshots（新形态），回退 account_ids（旧形态）
-    acc_snaps = payload.get("account_snapshots") or []
-    if acc_snaps:
-        acc_pairs = [
-            (a.get("id") or "", a.get("nickname") or a.get("remark") or "")
-            for a in acc_snaps
-        ]
-    else:
-        ids = payload.get("account_ids") or []
-        labels = payload.get("account_labels") or []
-        acc_pairs = [(a, labels[i] if i < len(labels) else "") for i, a in enumerate(ids)]
-    proj_snaps = payload.get("project_snapshots") or []
-    if proj_snaps:
-        proj_list = proj_snaps
-    else:
-        proj_list = payload.get("projects") or []
-    logger.info(
-        "[%s] task=%s | accounts=[%s] | projects=%d",
-        stage,
-        payload.get("task_name"),
-        ", ".join(f"{aid}/{lbl}" for aid, lbl in acc_pairs),
-        len(proj_list),
-    )
-    for i, p in enumerate(proj_list, 1):
-        if "shops" in p:  # 新形态
-            shop_ids = [s.get("id", "") for s in (p.get("shops") or [])]
-            shop_names = [s.get("name", "") for s in (p.get("shops") or [])]
-            shop_cities = [s.get("city", "") for s in (p.get("shops") or [])]
-            intro_ids = [it.get("id", "") for it in (p.get("intros") or [])]
-            intro_contents = [it.get("content", "") for it in (p.get("intros") or [])]
-            proj_id = p.get("id", "")
-            proj_title = p.get("title", "")
-        else:  # 旧形态
-            shop_ids = p.get("shop_ids") or []
-            shop_names = p.get("shop_names") or []
-            shop_cities = p.get("shop_cities") or []
-            intro_ids = p.get("intro_ids") or []
-            intro_contents = p.get("intro_contents") or []
-            proj_id = p.get("project_id", "")
-            proj_title = p.get("project_title", "")
-        logger.info(
-            "[%s] project#%d id=%s title=%s shops=%d intros=%d",
-            stage, i, proj_id, proj_title, len(shop_ids), len(intro_ids),
-        )
-        for j, sid in enumerate(shop_ids):
-            logger.info(
-                "[%s]   shop[%d] %s / name=%s / city=%s",
-                stage, j, sid,
-                shop_names[j] if j < len(shop_names) else "",
-                shop_cities[j] if j < len(shop_cities) else "",
-            )
-        for j, iid in enumerate(intro_ids):
-            content = intro_contents[j] if j < len(intro_contents) else ""
-            logger.info("[%s]   intro[%d] %s / content=%s", stage, j, iid, content)
-
-
 def _resolve_projects_payload(payload: dict) -> tuple[list, list]:
     """#441：从 payload.projects 构造 ProjectSpec 列表 + 收集 warnings（draft vs DB 不一致）。
     纯函数 + 只读；不写 DB，不依赖 task_id。
@@ -923,11 +861,22 @@ def _preview_video_dir(payload: dict) -> dict:
     # #596：账号→(mode, fixed_min, balanced_min) 映射（4 元组按 mode 取对应字段）
     sched_by_acc = {aid: (mode, fixed_min, balanced_min)
                     for aid, mode, fixed_min, balanced_min in per_acc_sched}
+    # #fix-preview-display：账号昵称/备注映射（与项目模式同源 = payload["account_snapshots"]）
+    acc_nickname_map: dict[str, str] = {
+        a.get("id", ""): (a.get("nickname") or "")
+        for a in (payload.get("account_snapshots") or [])
+    }
+    acc_remark_map: dict[str, str] = {
+        a.get("id", ""): (a.get("remark") or "")
+        for a in (payload.get("account_snapshots") or [])
+    }
     return {
         "overflow": False,
         "items": [
             {
                 "account_id": it.account_id,
+                "account_nickname": acc_nickname_map.get(it.account_id, ""),
+                "account_remark": acc_remark_map.get(it.account_id, ""),
                 "project_id": it.project_id,
                 "project_title": dir_name_map.get(it.project_id, it.project_id),
                 "shop_id": it.shop_name,
@@ -969,7 +918,6 @@ def _confirm_video_dir(payload: dict) -> dict:
     - 时间窗 / 排期字段统一算一次（之前重复两遍，bug 风险）
     """
     _normalize_payload(payload)
-    _log_payload_snapshot("confirm-direct-video-dir", payload)
     _validate_payload_video_dir(payload)
     # ===== 公共字段：scheduler cfg 构造 + INSERT 落库共用（统一计算） =====
     specs = _build_video_dir_specs(payload)
@@ -1427,8 +1375,28 @@ def preview_task_direct(payload: dict) -> dict:
         return _preview_video_dir(payload)
     # #451：先规整快照形态再打日志（否则新形态走下来取不到 projects/intro_contents）
     _normalize_payload(payload)
-    # #449：把 wizard 传来的 task_name / 账号标签 / 项目名称 / 店名称 / 简介内容快照打到日志
-    _log_payload_snapshot("preview-direct", payload)
+    # #fix-preview-display：构造渲染快照字典（不再让前端依赖 wizard state 反查）。
+    # 数据源 = payload 里 wizard 传来的 snapshots（_normalize_payload 后已落到 projects / account_snapshots）。
+    #  - 账号昵称/备注：account_snapshots[].nickname/remark
+    #  - 项目名：projects[].project_title
+    #  - 店名：projects[].shop_names（同 shop_id 出现多次时取首条；项目模式无重复）
+    acc_nickname_map: dict[str, str] = {
+        a.get("id", ""): (a.get("nickname") or "")
+        for a in (payload.get("account_snapshots") or [])
+    }
+    acc_remark_map: dict[str, str] = {
+        a.get("id", ""): (a.get("remark") or "")
+        for a in (payload.get("account_snapshots") or [])
+    }
+    proj_title_map: dict[str, str] = {
+        p.get("project_id", ""): (p.get("project_title") or "")
+        for p in (payload.get("projects") or [])
+    }
+    shop_name_map: dict[str, str] = {}
+    for p in (payload.get("projects") or []):
+        for sid, sname in zip(p.get("shop_ids") or [], p.get("shop_names") or []):
+            if sid and sname and sid not in shop_name_map:
+                shop_name_map[sid] = sname
     # 软校验（账号存在/项目存在/时间窗；店/intro 业务属性不卡）
     _soft_validate_payload(payload)
     # 构造 ProjectSpec + 收集 warnings
@@ -1485,12 +1453,18 @@ def preview_task_direct(payload: dict) -> dict:
         "items": [
             {
                 "account_id": it.account_id,
+                "account_nickname": acc_nickname_map.get(it.account_id, ""),
+                "account_remark": acc_remark_map.get(it.account_id, ""),
                 "project_id": it.project_id,
+                "project_title": proj_title_map.get(it.project_id, ""),
                 "shop_id": it.shop_id,
+                "shop_name": shop_name_map.get(it.shop_id, ""),
                 "intro_id": it.intro_id,
                 "intro_content": it.intro_content,
                 "intro_topics": list(it.intro_topics),
                 "plan_time": it.plan_time,
+                # 项目模式没有视频路径概念，留空字符串与视频目录模式对齐
+                "video_path": "",
                 # #596：preview 阶段带上算模式 + 间隔（confirm 路径 INSERT 时取用）
                 "schedule_mode": it.schedule_mode,
                 "interval_min": it.interval_min,
@@ -1517,8 +1491,6 @@ def confirm_task_direct(payload: dict) -> dict:
         return _confirm_video_dir(payload)
     # #451：先规整快照形态再打日志
     _normalize_payload(payload)
-    # #449：快照日志（含 task_name / 账号标签 / 项目名 / 店名 / 简介内容）便于排查
-    _log_payload_snapshot("confirm-direct", payload)
     d = get_db()
     # 1. 硬校验（任一不通过直接抛 ValueError，前端按 prefix 决定回退）
     _validate_payload(payload)
@@ -1754,10 +1726,10 @@ def confirm_task_direct(payload: dict) -> dict:
 
 
 def _build_account_labels(account_ids: list[str]) -> list[str]:
-    """按 account_ids 顺序查 account 表填 nickname/remark（_log_payload_snapshot 日志用）。
+    """按 account_ids 顺序查 account 表填 nickname/remark（duplicate_task 复制时填 account_labels 字段）。
 
-    publish_task 表不存 snapshots（运行时数据），duplicate_task 必须主动拼才能让
-    复制后 confirm-direct 日志有可读账号名。
+    publish_task 表不存 account snapshots（运行时数据），duplicate_task 必须主动拼才能让
+    复制后的 DraftRequest.account_labels 有可读账号名（前端 wizard 显示用）。
     """
     if not account_ids:
         return []
@@ -1810,8 +1782,8 @@ def duplicate_task(task_id: str) -> dict:
         "projects": projects_payload,  # 直接给前端，wizard step 3 解码
         "account_ids": json.loads(src["account_ids_json"] or "[]"),
         "daily_limit_mode": src["daily_limit_mode"],
-        # #review warning：实时查 account 表填 account_labels（_log_payload_snapshot 日志读这个）；
-        # publish_task 表不存 snapshots（运行时数据），必须主动拼才能让预览日志有可读名字
+        # #review warning：实时查 account 表填 account_labels（前端 wizard 显示用）；
+        # publish_task 表不存 account snapshots（运行时数据），必须主动拼
         "account_labels": _build_account_labels(json.loads(src["account_ids_json"] or "[]")),
         "daily_limit_global": src["daily_limit_global"] or 0,
         # #596：复制时把每账号的算模式 + 两个独立间隔字段都带上（老数据无 → fallback 顶层）
