@@ -74,7 +74,16 @@ def _draft_payload(per_account: bool = False) -> tuple:
         {"project_id": "projB"},
     ]
     if per_account:
-        limits = [("accA", 4), ("accB", 6)]
+        # #fix-calc-mode-per-acc-save：per_account 路径用 dict 形态传 5 个字段（跟前端 wizard + 路由层一致）
+        # 这样能验证 save_draft 真的把 schedule_mode + 两个 interval 存进 daily_limit_per_account_json
+        limits = [
+            {"account_id": "accA", "limit": 4,
+             "schedule_mode": "balanced",
+             "fixed_interval_min": 10, "balanced_step_min": 60},
+            {"account_id": "accB", "limit": 6,
+             "schedule_mode": "fixed",
+             "fixed_interval_min": 15, "balanced_step_min": 60},
+        ]
         return projects_payload, "per_account", 0, limits
     return projects_payload, "global", 5, []
 
@@ -467,6 +476,67 @@ def test_save_draft_fixed_mode_persists() -> None:
     assert task["schedule_mode"] == "fixed"
     assert task["fixed_interval_min"] == 10
     assert task["balanced_step_min"] == 60
+
+
+# ===== #normalize-self：DraftRequest 自归一化为旧形态字段 =====
+
+def test_draft_request_normalizes_snapshots_to_legacy_fields() -> None:
+    """#normalize-self：发新形态 snapshot（前端 wizard 实际形态），
+    DraftRequest 构造后 self.account_ids / self.projects / self.account_labels 自动归一好。
+    下游不管从 req.xxx 还是 req.model_dump() 后的 payload.get(...) 读，都能拿到值。
+
+    之前 #fix-save-draft-empty-projects 的根因是：normalize 是 dict mutation，
+    不写回 Pydantic 字段——本测试用 model 自归一一次性根除此类契约破裂。
+    """
+    from app.models.publish import DraftRequest
+    req = DraftRequest.model_validate({
+        "task_name": "normalize-test",
+        "account_snapshots": [
+            {"id": "accA", "nickname": "A", "remark": "A"},
+            {"id": "accB", "nickname": None, "remark": "备注B"},
+        ],
+        "project_snapshots": [
+            {
+                "id": "projA", "title": "项目A",
+                "shops": [
+                    {"id": "shop_A1", "name": "A门店1", "city": "广州", "poi_id": "poi_1"},
+                ],
+                "intros": [
+                    {"id": "manual_intro_0", "content": "简介0", "topics": ["#A0"]},
+                ],
+            },
+        ],
+        "daily_limit_mode": "global",
+        "daily_limit_global": 5,
+    })
+    # model 自归一后，Pydantic 字段都能直接读到
+    assert req.account_ids == ["accA", "accB"]
+    assert req.account_labels == ["A", "备注B"]
+    assert len(req.projects) == 1
+    assert req.projects[0].project_id == "projA"
+    assert req.projects[0].shop_ids == ["shop_A1"]
+    assert req.projects[0].intro_ids == ["manual_intro_0"]
+    assert req.projects[0].intro_topics == ['["#A0"]']
+    # model_dump 后 payload 同样带归一化字段（路由层从 payload 读也正常）
+    payload = req.model_dump()
+    assert payload["account_ids"] == ["accA", "accB"]
+    assert len(payload["projects"]) == 1
+    assert payload["projects"][0]["project_id"] == "projA"
+
+
+def test_draft_request_legacy_projects_not_overwritten_by_snapshots() -> None:
+    """#normalize-self：旧形态 projects 不会被 snapshots 覆盖（双形态兼容）。"""
+    from app.models.publish import DraftRequest
+    req = DraftRequest.model_validate({
+        "task_name": "legacy",
+        "account_ids": ["accX"],
+        "projects": [{"project_id": "projA", "shop_ids": ["shop_A1"]}],
+        "daily_limit_mode": "global",
+        "daily_limit_global": 5,
+    })
+    assert req.account_ids == ["accX"]  # 旧值不被空 snapshots 覆盖
+    assert len(req.projects) == 1
+    assert req.projects[0].project_id == "projA"
 
 
 if __name__ == "__main__":

@@ -948,6 +948,16 @@ MIGRATIONS: list[tuple[int, str]] = [
         -- （_apply_v45 函数里幂等补列；这里 DDL block 仅注释。）
         """,
     ),
+    (
+        46,
+        """
+        -- ============ v46 #fix-video-dir-shop-name 视频目录模式 item 落库区分店名 vs 店 ID ============
+        -- 之前 #418 video_dir 模式把店名（如「寿司店」）写到 publish_task_item.shop_id，
+        -- 下游 list_records / 详情页按 shop_id JOIN shop 表会 miss，UI 显示空白。
+        -- 修法：扩 publish_task_item.shop_name 列，video_dir 模式 INSERT 时把店名写到
+        -- shop_name，shop_id 留空字符串。DDL block 仅注释（_apply_v46 函数里幂等补列）。
+        """,
+    ),
 ]
 
 
@@ -992,6 +1002,8 @@ def migrate(database) -> int:
             _apply_v43(database)
         elif version == 45:
             _apply_v45(database)
+        elif version == 46:
+            _apply_v46(database)
         else:
             database.executescript(ddl)
         database.set_user_version(version)
@@ -1560,3 +1572,38 @@ def _apply_v45(database) -> None:
     for col, decl in cols:
         if not _has_column(database, "publish_task_item", col):
             database.execute(f"ALTER TABLE publish_task_item ADD COLUMN {col} {decl}")
+
+
+def _apply_v46(database) -> None:
+    """v46：#fix-video-dir-shop-name —— 视频目录模式 item 落库区分店名 vs 店 ID。
+
+    之前 #418 video_dir 模式把店名（如「寿司店」）存到 publish_task_item.shop_id 列，
+    后续 list_records / 详情页按 shop_id JOIN shop 表会 miss 门店，UI 显示空白。
+
+    修法：
+    1. 扩 publish_task_item.shop_name 列
+    2. video_dir 模式新行 INSERT 时把店名写到 shop_name，shop_id 留空字符串
+    3. **老行 backfill**：v46 之前写入的 video_dir 行，item.shop_id 实际是店名 →
+       把店名迁到 item.shop_name，再清空 item.shop_id
+    4. 下游查询 (get_task_detail items SQL) 用 COALESCE(NULLIF(item.shop_name, ''), s.name, '')
+       取展示店名
+
+    项目模式 shop_id 仍是真实门店 ID，shop_name 列空——不影响。
+    """
+    if not _has_table(database, "publish_task_item"):
+        return
+    if not _has_column(database, "publish_task_item", "shop_name"):
+        # 老行 shop_name 为 NULL；项目模式不写此列，video_dir 模式新行写入
+        database.execute(
+            "ALTER TABLE publish_task_item ADD COLUMN shop_name TEXT DEFAULT ''"
+        )
+        # v46 老行 backfill：v46 之前 video_dir 行的 shop_id 实际是店名（如「寿司店」）
+        # → 迁到 shop_name，然后清空 shop_id
+        # 项目模式 shop_id 是真店 ID，迁过去会显示店 ID 而不是店名——所以加 source 守卫
+        database.execute(
+            "UPDATE publish_task_item "
+            "SET shop_name = shop_id, shop_id = '' "
+            "WHERE source = 'video_dir' "
+            "  AND (shop_name IS NULL OR shop_name = '') "
+            "  AND shop_id != ''"
+        )

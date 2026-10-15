@@ -138,6 +138,9 @@ export interface ProjectDraftSnapshot {
   title: string
   shops: ShopDraftEntry[]
   intros: IntroDraftEntry[]
+  // #fix-intro-mode-roundtrip：复制/编辑回填时用——list 模式回填 list + 已选，
+  // manual 模式回填 manual + 文本。buildDraftPayload 时从 projectDraft[p.id].introMode 塞入。
+  introMode?: 'list' | 'manual'
 }
 
 /** 账号快照。 */

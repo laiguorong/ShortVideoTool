@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """发布与记录模块请求模型（F-05 / F-06 + #413）。"""
 
-from pydantic import BaseModel, Field
+import json
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class CreatePublishTaskRequest(BaseModel):
@@ -55,6 +57,9 @@ class ProjectDraftSnapshot(BaseModel):
     title: str = ""
     shops: list[ShopDraftEntry] = Field(default_factory=list, description="勾选顺序")
     intros: list[IntroDraftEntry] = Field(default_factory=list, description="勾选顺序；为文本输入模式")
+    # #fix-intro-mode-roundtrip：wizard step 4 选中的 'list' | 'manual' 模式——buildDraftPayload
+    # 输出时塞入，_normalize_snapshots 透传到 ProjectDraftEntry.intro_mode 落库。
+    introMode: str = Field(default="list", description="'list' | 'manual'；wizard step 4 当前模式")
 
 
 class AccountDraftSnapshot(BaseModel):
@@ -78,6 +83,9 @@ class ProjectDraftEntry(BaseModel):
     # #449：与 intro_ids 同长度 + 同序，存内容预览/话题
     intro_contents: list[str] = Field(default_factory=list, description="简介内容预览（截前 60 字），与 intro_ids 顺序一致")
     intro_topics: list[str] = Field(default_factory=list, description="简介话题 JSON 数组字符串（用于快照），与 intro_ids 顺序一致")
+    # #fix-intro-mode-roundtrip：复制/编辑回填时用——list 模式回填 list + 已选，
+    # manual 模式回填 manual + 文本。落库 projects_payload_json 持久化（与 intro_ids 同级）。
+    intro_mode: str = Field(default="list", description="'list' | 'manual'；wizard step 4 用户选的模式")
 
 
 class DailyLimitEntry(BaseModel):
@@ -154,6 +162,50 @@ class DraftRequest(BaseModel):
         default_factory=dict,
         description="手动输入视频简介（仅 video_dir 模式），key=video_dir.id，value=该目录下的简介数组",
     )
+
+    @model_validator(mode='after')
+    def _normalize_snapshots(self) -> 'DraftRequest':
+        """#normalize-self：把新形态 snapshot 自归一到旧形态字段。
+
+        - account_snapshots → account_ids + account_labels（新形态字段为空时）
+        - project_snapshots → projects（新形态字段为空时构造 ProjectDraftEntry 列表）
+
+        这样下游路由层不管是从 `req.xxx` 读还是从 `req.model_dump()` 后的
+        payload.get(...) 读，都能拿到归一化后的值——不再有「normalize 后忘改读」
+        这类契约破裂 bug（参见 #fix-save-draft-empty-projects 的根因）。
+
+        与 service 层的 `_normalize_payload` 行为一致，但比字典 mutation 更早发生，
+        且不存在「从 model 读 vs 从 dict 读」二选一的歧义。
+        """
+        # #451：model_dump 后 list，访问 .id/.nickname 等安全
+        acc_snaps = self.account_snapshots or []
+        if acc_snaps and not self.account_ids:
+            self.account_ids = [a.id for a in acc_snaps]
+            self.account_labels = [(a.nickname or a.remark or "") for a in acc_snaps]
+        proj_snaps = self.project_snapshots or []
+        if proj_snaps and not self.projects:
+            normalized: list[ProjectDraftEntry] = []
+            for pd in proj_snaps:
+                shops = pd.shops or []
+                intros = pd.intros or []
+                normalized.append(ProjectDraftEntry(
+                    project_id=pd.id,
+                    project_title=pd.title or "",
+                    shop_ids=[s.id for s in shops],
+                    shop_names=[s.name for s in shops],
+                    shop_cities=[s.city for s in shops],
+                    shop_poi_ids=[s.poi_id for s in shops],
+                    intro_ids=[i.id for i in intros],
+                    intro_contents=[i.content for i in intros],
+                    intro_topics=[
+                        json.dumps(i.topics or [], ensure_ascii=False)
+                        for i in intros
+                    ],
+                    # #fix-intro-mode-roundtrip：把 wizard 的 introMode 透传到 ProjectDraftEntry
+                    intro_mode=(pd.introMode if pd.introMode in ("list", "manual") else "list"),
+                ))
+            self.projects = normalized
+        return self
 
 
 # 触发 forward-reference 重建（video_dirs 用字符串前向引用 VideoDirEntry）

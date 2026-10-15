@@ -73,8 +73,11 @@ interface ProjectDraftState {
   project_id: string
   // #450：选中门店直接存完整 ShopDraftEntry 对象（id 可从 .id 派生）
   selectedShops: ShopDraftEntry[]
-  // #450：选中的视频简介——每条 {id, content, topics?}；list 模式 id 用 DB id；manual 模式用稳定派生
-  selectedIntros: { id: string; content: string; topics?: string[] }[]
+  // #fix-intro-mode-independent：list / manual 模式各自维护 selectedIntros，
+  // 两个数组独立——切模式时互不影响，list 模式选的内容切到 manual 不会被赋值到 textarea，
+  // manual 模式填的内容切到 list 也不会覆盖 list 模式已选。
+  selectedIntrosList: { id: string; content: string; topics?: string[] }[]
+  selectedIntrosManual: { id: string; content: string; topics?: string[] }[]
   // #452：视频简介输入模式——'list'（从项目已绑定的简介列表多选）/ 'manual'（多行文本框输入）
   introMode: 'list' | 'manual'
 }
@@ -287,6 +290,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
             const pp = JSON.parse(detail.projects_payload_json || '[]') as {
               project_id: string; shop_ids?: string[];
               shop_names?: string[]; shop_cities?: string[]; shop_poi_ids?: string[];
+              // #fix-intro-mode-roundtrip：编辑回填时读取 intro_ids / intro_mode / intro_contents / intro_topics
+              intro_ids?: string[]; intro_mode?: 'list' | 'manual';
+              intro_contents?: string[]; intro_topics?: string[];
             }[]
             const matched: ProjectRow[] = []
             const draftMap: Record<string, ProjectDraftState> = {}
@@ -300,15 +306,75 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                 city: p.shop_cities?.[i] || '',
                 poi_id: p.shop_poi_ids?.[i] || '',
               }))
+              // #fix-intro-mode-roundtrip：先填 placeholder + 空两个数组，
+              // 异步 IIFE 读完 DB intros 后按 intro_ids 命中情况再回填。
               draftMap[p.project_id] = {
                 project_id: p.project_id,
                 selectedShops: shops,
-                selectedIntros: [],
-                introMode: 'manual',
+                selectedIntrosList: [],
+                selectedIntrosManual: [],
+                introMode: (p.intro_mode === 'manual' ? 'manual' : 'list'),
               }
             }
             if (matched.length > 0) setSelProjects(matched)
             setProjectDraft(draftMap)
+
+            // #fix-intro-mode-roundtrip：异步加载项目已绑定 intros，
+            // 按 intro_ids 是否命中 DB 决定 list/manual 模式（list 模式从 DB 拉 content/topics）
+            void (async () => {
+              for (const p of pp) {
+                const iids = p.intro_ids || []
+                if (iids.length === 0) continue  // 没选简介，保持 placeholder
+                const row = projects.find((x) => x.id === p.project_id)
+                if (!row) continue
+                try {
+                  const dbIntros: VideoIntro[] = await publishIntroApi.listIntros(row.id)
+                  const dbMap = new Map(dbIntros.map((it) => [it.id, it]))
+                  let allHit = true
+                  const items = iids.map((iid, i) => {
+                    const hit = dbMap.get(iid)
+                    if (!hit) {
+                      allHit = false
+                      let topics: string[] = []
+                      const raw = p.intro_topics?.[i]
+                      if (raw) {
+                        try {
+                          const parsed = JSON.parse(raw)
+                          if (Array.isArray(parsed)) topics = parsed
+                        } catch { /* 静默失败 → 空 topics */ }
+                      }
+                      return {
+                        id: iid,
+                        content: p.intro_contents?.[i] || '',
+                        topics,
+                      }
+                    }
+                    return {
+                      id: hit.id,
+                      content: hit.content,
+                      topics: hit.topics ?? [],
+                    }
+                  })
+                  setProjectDraft((prev) => {
+                    const cur = prev[p.project_id]
+                    if (!cur) return prev
+                    // #fix-intro-mode-independent：根据 cur.introMode 选对应数组
+                    const isManual = cur.introMode === 'manual' || !allHit
+                    return {
+                      ...prev,
+                      [p.project_id]: {
+                        ...cur,
+                        // introMode 已由源数据决定；不命中 DB 时保守取 manual（保留 manual 文本）
+                        introMode: isManual ? 'manual' : cur.introMode,
+                        [isManual ? 'selectedIntrosManual' : 'selectedIntrosList']: items,
+                      },
+                    }
+                  })
+                } catch (e) {
+                  console.warn(`[Wizard] 编辑模式视频简介回填失败 ${p.project_id}:`, e)
+                }
+              }
+            })()
           } catch (e) { console.warn('[Wizard] 项目模式回填失败:', e) }
         }
         setEditingTaskIdHandled(editingTaskId)
@@ -417,6 +483,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         const pp = (p.projects || []) as {
           project_id: string; shop_ids?: string[];
           shop_names?: string[]; shop_cities?: string[]; shop_poi_ids?: string[];
+          // #fix-intro-mode-roundtrip：复制回填时读取 intro_ids / intro_mode / intro_contents / intro_topics
+          intro_ids?: string[]; intro_mode?: 'list' | 'manual';
+          intro_contents?: string[]; intro_topics?: string[];
         }[]
         const matched: ProjectRow[] = []
         const draftMap: Record<string, ProjectDraftState> = {}
@@ -430,15 +499,78 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
             city: proj.shop_cities?.[i] || '',
             poi_id: proj.shop_poi_ids?.[i] || '',
           }))
+          // #fix-intro-mode-roundtrip：placeholder + 空两个数组
+          // 异步 IIFE 读完 DB intros 后按 intro_ids 命中再回填
           draftMap[proj.project_id] = {
             project_id: proj.project_id,
             selectedShops: shops,
-            selectedIntros: [],
-            introMode: 'manual',
+            selectedIntrosList: [],
+            selectedIntrosManual: [],
+            introMode: (proj.intro_mode === 'manual' ? 'manual' : 'list'),
           }
         }
         if (matched.length > 0) setSelProjects(matched)
         setProjectDraft(draftMap)
+
+        // #fix-intro-mode-roundtrip：复制任务时回填视频简介到 wizard。
+        // - intro_ids 全部能命中 DB → list 模式，从 DB 拉内容（含 topics）
+        // - intro_ids 至少一条不命中（manual 模式派生 uuid 'intro_<pid>_<idx>'）→ manual 模式，
+        //   直接用 payload 里的 intro_contents / intro_topics 兜底回显
+        // - intro_ids 全部没选 → 保持默认 list 模式 + 空 selectedIntros
+        void (async () => {
+          for (const proj of pp) {
+            const iids = proj.intro_ids || []
+            if (iids.length === 0) continue
+            const row = projects.find((x) => x.id === proj.project_id)
+            if (!row) continue
+            try {
+              const dbIntros: VideoIntro[] = await publishIntroApi.listIntros(row.id)
+              const dbMap = new Map(dbIntros.map((it) => [it.id, it]))
+              let allHit = true
+              const items = iids.map((iid, i) => {
+                const hit = dbMap.get(iid)
+                if (!hit) {
+                  allHit = false
+                  let topics: string[] = []
+                  const raw = proj.intro_topics?.[i]
+                  if (raw) {
+                    try {
+                      const parsed = JSON.parse(raw)
+                      if (Array.isArray(parsed)) topics = parsed
+                    } catch { /* 静默失败 → 空 topics */ }
+                  }
+                  return {
+                    id: iid,
+                    content: proj.intro_contents?.[i] || '',
+                    topics,
+                  }
+                }
+                return {
+                  id: hit.id,
+                  content: hit.content,
+                  topics: hit.topics ?? [],
+                }
+              })
+              setProjectDraft((prev) => {
+                const cur = prev[proj.project_id]
+                if (!cur) return prev
+                // #fix-intro-mode-independent：根据 cur.introMode 选对应数组
+                const isManual = cur.introMode === 'manual' || !allHit
+                return {
+                  ...prev,
+                  [proj.project_id]: {
+                    ...cur,
+                    // introMode 已由源数据决定；不命中 DB 时保守取 manual（保留 manual 文本）
+                    introMode: isManual ? 'manual' : cur.introMode,
+                    [isManual ? 'selectedIntrosManual' : 'selectedIntrosList']: items,
+                  },
+                }
+              })
+            } catch (e) {
+              console.warn(`[Wizard] 复制模式视频简介回填失败 ${proj.project_id}:`, e)
+            }
+          }
+        })()
       } catch (e) { console.warn('[Wizard] 复制模式项目回填失败:', e) }
     }
     setInitialPayloadHandled(sig)
@@ -450,7 +582,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     setProjectDraft((prev) => {
       const next = { ...prev }
       for (const pid of selIds) {
-        if (!next[pid]) next[pid] = { project_id: pid, selectedShops: [], selectedIntros: [], introMode: 'list' }
+        if (!next[pid]) next[pid] = { project_id: pid, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
       }
       for (const k of Object.keys(next)) {
         if (!selIds.includes(k)) delete next[k]
@@ -575,7 +707,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         project_ids: selProjects.map((p) => p.id),
         per_project: selProjects.map((p) => {
           const draft = projectDraft[p.id]
-            ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }
+            ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
           const allShops = projShops[p.id] ?? []
           return {
             project_id: p.id,
@@ -590,11 +722,14 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     } else if (!localStorage.getItem('__wizard_debug_off') && curStep === 4) {
       console.log('[WizardDebug] step4→5 视频简介:', {
         project_ids: selProjects.map((p) => p.id),
-        per_project: selProjects.map((p) => ({
-          project_id: p.id,
-          project_title: p.title,
-          intros: projectDraft[p.id]?.selectedIntros ?? [],
-        })),
+        per_project: selProjects.map((p) => {
+          const d = projectDraft[p.id]
+          // #fix-intro-mode-independent：按 introMode 取对应数组
+          const intros = d
+            ? (d.introMode === 'list' ? d.selectedIntrosList : d.selectedIntrosManual)
+            : []
+          return { project_id: p.id, project_title: p.title, intros }
+        }),
       })
     } else if (!localStorage.getItem('__wizard_debug_off') && curStep === 5) {
       console.log('[WizardDebug] step5→6 排期规则:', {
@@ -630,12 +765,17 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
     }))
     const project_snapshots: ProjectDraftSnapshot[] = selProjects.map((p) => {
       const draft = projectDraft[p.id]
-        ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }
+        ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
+      // #fix-intro-mode-independent：按 introMode 取对应数组提交（不混用）
+      const intros = draft.introMode === 'list' ? draft.selectedIntrosList : draft.selectedIntrosManual
       return {
         id: p.id,
         title: p.title,
         shops: draft.selectedShops,
-        intros: draft.selectedIntros,
+        intros,
+        // #fix-intro-mode-roundtrip：把 wizard state 的 introMode 塞入 snapshot；
+        // 后端 model_validator 透传到 ProjectDraftEntry.intro_mode，落 projects_payload_json。
+        introMode: draft.introMode,
       }
     })
     return {
@@ -719,8 +859,18 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
             .then((rows) => setProjShops((prev) => ({ ...prev, [proj.id]: rows })))
             .catch((e) => console.warn('[Wizard] 刷新项目门店失败:', e))
         ))
+        // #fix-toast-detail：toast 文案带"哪个项目 + 哪些店"——业务约束触发的具体店
+        // （stale=业务失效，extra=绑定被解除）。用户能直接定位到要重选的店。
+        const detail = p.validation.warnings.map((w) => {
+          const parts: string[] = []
+          if (w.stale_in_draft?.length) parts.push(`业务失效: ${w.stale_in_draft.join('/')}`)
+          if (w.extra_in_draft?.length) parts.push(`绑定已解除: ${w.extra_in_draft.join('/')}`)
+          return parts.length ? `${w.project_id}: ${parts.join('、')}` : null
+        }).filter(Boolean).join('；')
         toast(
-          `${p.validation.warnings.length} 个项目门店配置已变更，请回第 3 步重新选择`,
+          detail
+            ? `门店配置已变更：${detail}。请回第 3 步重新选择`
+            : `${p.validation.warnings.length} 个项目门店配置已变更，请回第 3 步重新选择`,
           'info'
         )
         goStep(3)
@@ -1153,7 +1303,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
           ) : (
           /* 原项目模式门店选择 */
           selProjects.map((p) => {
-            const draft = projectDraft[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }
+            const draft = projectDraft[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
             // #413 走查 #7 W1：只显示项目已绑定的门店，避免全量 200+ 误导
             const projShopList = projShops[p.id]
             // #450：把 ProjectShopItem 转成 ShopDraftEntry 对象数组（统一 store 结构）
@@ -1174,13 +1324,13 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                         onClick={() => setProjectDraft((prev) => ({
                           ...prev,
                           [p.id]: {
-                            ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }),
+                            ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }),
                             selectedShops: projShopList.map(toShopEntry),
                           },
                         }))}>全选</button>
                       <button type="button" className="ml-2 text-accent hover:underline"
                         onClick={() => setProjectDraft((prev) => {
-                          const cur = prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }
+                          const cur = prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
                           const curIds = new Set(cur.selectedShops.map((s) => s.id))
                           const next = projShopList
                             .filter((s) => !curIds.has(s.shop_id))
@@ -1206,7 +1356,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                             <input type="checkbox" checked={checked}
                               onChange={(e) => setProjectDraft((prev) => {
                                 const cur = prev[p.id]
-                                  ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }
+                                  ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
                                 const entry = toShopEntry(s)
                                 const next = e.target.checked
                                   ? (cur.selectedShops.some((x) => x.id === s.shop_id)
@@ -1265,8 +1415,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
           <Fragment>
           {selProjects.map((p) => {
             const draft = projectDraft[p.id]
-              ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }
-            const intros = draft.selectedIntros
+              ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }
+            // #fix-intro-mode-independent：按 mode 取对应数组
+            const intros = draft.introMode === 'list' ? draft.selectedIntrosList : draft.selectedIntrosManual
             return (
               <div key={p.id} className="rounded-md border border-border p-3">
                 <div className="mb-2 flex items-center justify-between gap-3 text-xs">
@@ -1277,8 +1428,11 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                         checked={draft.introMode === 'list'}
                         onChange={() => setProjectDraft((prev) => ({
                           ...prev,
-                          [p.id]: { ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }),
-                            introMode: 'list', selectedIntros: [] },
+                          [p.id]: { ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }),
+                            // #fix-intro-mode-switch-preserve：切换模式不**清空** selectedIntros。
+                            // 两模式 id 形态不同：list 模式是 DB uuid，manual 模式是 `intro_<pid>_<idx>` 派生 uuid。
+                            // 切回时 IntroManualEditor 用 content join textarea / IntroListPicker 用 id 勾选——保留就行。
+                            introMode: 'list' },
                         }))} />
                       已绑定列表
                     </label>
@@ -1287,8 +1441,8 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                         checked={draft.introMode === 'manual'}
                         onChange={() => setProjectDraft((prev) => ({
                           ...prev,
-                          [p.id]: { ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }),
-                            introMode: 'manual', selectedIntros: [] },
+                          [p.id]: { ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }),
+                            introMode: 'manual' },
                         }))} />
                       手动输入
                     </label>
@@ -1301,8 +1455,8 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                       onChange={(items) => setProjectDraft((prev) => ({
                         ...prev,
                         [p.id]: {
-                          ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }),
-                          selectedIntros: items,
+                          ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }),
+                          selectedIntrosList: items,
                         },
                       }))}
                     />
@@ -1320,8 +1474,8 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                     onChange={(items) => setProjectDraft((prev) => ({
                       ...prev,
                       [p.id]: {
-                        ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }),
-                        selectedIntros: items,
+                        ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }),
+                        selectedIntrosList: items,
                       },
                     }))}
                   />
@@ -1334,8 +1488,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                     onChange={(items) => setProjectDraft((prev) => ({
                       ...prev,
                       [p.id]: {
-                        ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntros: [], introMode: 'list' }),
-                        selectedIntros: items,
+                        ...(prev[p.id] ?? { project_id: p.id, selectedShops: [], selectedIntrosList: [], selectedIntrosManual: [], introMode: 'list' }),
+                        // #fix-intro-mode-independent：manual 模式写入 selectedIntrosManual
+                        selectedIntrosManual: items,
                       },
                     }))}
                   />

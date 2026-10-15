@@ -36,17 +36,24 @@ def scan_video_dir(req: ScanVideoDirRequest):
 def save_draft(req: DraftRequest):
     """保存草稿到 publish_task(status=draft)；R12：传 task_id 则更新已有 draft。"""
     try:
-        # #新形态归一：account_snapshots → account_ids（preview-direct 走 _preview_video_dir/_normalize_payload 也有，save_draft 补齐）
+        # #新形态归一：account_snapshots → account_ids + project_snapshots → projects
+        # （save_draft 只校验 projects_payload 非空，但前端 wizard 走新形态 project_snapshots，
+        #  _normalize_payload 把 snapshot 转旧形态 dict → 写进 payload["projects"]；
+        #  但 req.projects 仍是空 list——之前从 req.projects 取 projects_payload 会拿到 [] 触发
+        #  "项目列表不能为空" ValueError。）
         payload = req.model_dump()
         publish_service._normalize_payload(payload)
         account_ids = payload.get("account_ids") or []
+        # #fix-save-draft-empty-projects：projects_payload 从 normalize 后的 payload 取
         return publish_service.save_draft(
             task_name=req.task_name,
-            projects_payload=[p.model_dump() for p in req.projects],
+            projects_payload=payload.get("projects") or [],
             account_ids=account_ids,
             daily_limit_mode=req.daily_limit_mode,
             daily_limit_global=req.daily_limit_global,
-            daily_limit_per_account=[(e.account_id, e.limit) for e in req.daily_limit_per_account],
+            # #fix-calc-mode-per-acc-save：原 tuple 丢字段——改成 model_dump() 透传 5 个字段
+            # （account_id / limit / schedule_mode / fixed_interval_min / balanced_step_min）
+            daily_limit_per_account=[e.model_dump() for e in req.daily_limit_per_account],
             start_time=req.start_time,
             end_time=req.end_time,
             same_project_interval_min=req.same_project_interval_min,

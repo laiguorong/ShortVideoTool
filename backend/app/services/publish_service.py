@@ -66,6 +66,59 @@ def _default_start_end() -> tuple[str, str]:
             end.strftime("%Y-%m-%d %H:%M:%S"))
 
 
+def _serialize_per_account_json(
+    per_acc: list | tuple,
+    daily_limit_mode: str,
+    fallback_schedule_mode: str,
+    fallback_fixed_min: int,
+    fallback_balanced_min: int,
+) -> str:
+    """#fix-calc-mode-per-acc-save：save_draft 入 daily_limit_per_account_json 的统一序列化。
+
+    - 推荐形态 list[dict]（来自路由层 model_dump()）：含 account_id / limit / schedule_mode /
+      fixed_interval_min / balanced_step_min。daily_limit_mode='per_account' 时写完整 4 字段；
+      'global' 时只取 account_id + limit（保持原行为）。
+    - 兼容形态 list[tuple[str, int]]：取 account_id + limit，schedule_mode / interval 字段
+      走顶层 fallback（旧测试/旧调用方不会因签名变更挂掉）。
+    - 老数据 interval_min 单字段（#save_draft 老版本写了 interval_min，但当前调用方不再传）
+      也兜底兼容。
+
+    返回:
+        JSON 字符串，可直接写 daily_limit_per_account_json 列。
+    """
+    if not per_acc:
+        return json.dumps([], ensure_ascii=False)
+    # 兼容旧 tuple 形态：list[dict] 的第一项是 dict，反之 tuple
+    if isinstance(per_acc[0], dict):
+        records: list[dict] = []
+        for r in per_acc:
+            entry: dict = {
+                "account_id": r["account_id"],
+                "limit": int(r["limit"]),
+            }
+            if daily_limit_mode == "per_account":
+                entry["schedule_mode"] = (
+                    r.get("schedule_mode") or fallback_schedule_mode
+                )
+                entry["fixed_interval_min"] = int(
+                    r.get("fixed_interval_min")
+                    or r.get("interval_min")  # 老数据兼容
+                    or fallback_fixed_min
+                )
+                entry["balanced_step_min"] = int(
+                    r.get("balanced_step_min")
+                    or r.get("interval_min")  # 老数据兼容
+                    or fallback_balanced_min
+                )
+            records.append(entry)
+        return json.dumps(records, ensure_ascii=False)
+    # tuple 形态（旧路径）
+    return json.dumps(
+        [{"account_id": aid, "limit": lim} for aid, lim in per_acc],
+        ensure_ascii=False,
+    )
+
+
 def _resolve_intros(project_id: str) -> list[dict]:
     """取项目所有启用的简介 + 话题，顺序按 create_time。"""
     from app.services import publish_intro_service
@@ -127,7 +180,11 @@ def save_draft(task_name: str,
                account_ids: list[str],
                daily_limit_mode: str,
                daily_limit_global: int,
-               daily_limit_per_account: list[tuple[str, int]],
+               # #fix-calc-mode-per-acc-save：原 list[tuple[str, int]] → list[dict]
+               # 路由层从 Pydantic DailyLimitEntry 直接 model_dump() 过来，带 5 个字段：
+               # account_id / limit / schedule_mode / fixed_interval_min / balanced_step_min
+               # 老 tuple 形态也兼容（调用方不传 mode 时走顶层 fallback）
+               daily_limit_per_account: list[dict] | list[tuple[str, int]] = (),
                start_time: str | None = None,
                end_time: str | None = None,
                # #calc_mode 新字段（默认 balanced 60min，向后兼容旧调用）
@@ -153,6 +210,13 @@ def save_draft(task_name: str,
     参数:
         projects_payload: [{"project_id": str, "shop_ids": [..], "intro_ids": [..]}, ...]
             shop_ids / intro_ids 是用户在前端勾选的顺序（可选；为空时回查项目绑定）
+        daily_limit_per_account：list[dict]（推荐）或 list[tuple[str, int]]（兼容旧调用）
+            dict 推荐形态：
+              {"account_id": str, "limit": int,
+               "schedule_mode": "fixed"|"balanced",
+               "fixed_interval_min": int, "balanced_step_min": int}
+            daily_limit_mode='per_account' 时入 daily_limit_per_account_json 完整保存；
+            daily_limit_mode='global' 时 JSON 也保存但只取 account_id+limit（保持原行为）。
         #calc_mode：schedule_mode / fixed_interval_min / balanced_step_min 三个新字段；
             旧调用只传 same/diff_project_interval_min 也兼容——会落 balanced_step_min。
     返回:
@@ -212,9 +276,10 @@ def save_draft(task_name: str,
             "end_time": end_time,
             "daily_limit_mode": daily_limit_mode,
             "daily_limit_global": daily_limit_global,
-            "daily_limit_per_account_json": json.dumps(
-                [{"account_id": aid, "limit": lim} for aid, lim in daily_limit_per_account],
-                ensure_ascii=False),
+            # #fix-calc-mode-per-acc-save：per_account 时写入完整 4 字段（含 schedule_mode + 两个 interval）
+            "daily_limit_per_account_json": _serialize_per_account_json(
+                daily_limit_per_account, daily_limit_mode,
+                schedule_mode, fixed_interval_min, balanced_step_min),
             # #calc_mode 新字段
             "schedule_mode": schedule_mode,
             "fixed_interval_min": fixed_interval_min,
@@ -249,9 +314,10 @@ def save_draft(task_name: str,
         "end_time": end_time,
         "daily_limit_mode": daily_limit_mode,
         "daily_limit_global": daily_limit_global,
-        "daily_limit_per_account_json": json.dumps(
-            [{"account_id": aid, "limit": lim} for aid, lim in daily_limit_per_account],
-            ensure_ascii=False),
+        # #fix-calc-mode-per-acc-save：per_account 时写入完整 4 字段（含 schedule_mode + 两个 interval）
+        "daily_limit_per_account_json": _serialize_per_account_json(
+            daily_limit_per_account, daily_limit_mode,
+            schedule_mode, fixed_interval_min, balanced_step_min),
         # #calc_mode 新字段
         "schedule_mode": schedule_mode,
         "fixed_interval_min": fixed_interval_min,
@@ -1039,7 +1105,12 @@ def _confirm_video_dir(payload: dict) -> dict:
                 "project_id": it["project_id"],
                 "video_id": "",
                 "video_path": it["video_path"],
-                "shop_id": it["shop_id"],
+                # #fix-video-dir-shop-name（v46）：video_dir 模式没真实门店 ID，
+                # 之前把店名（如「寿司店」）写到 shop_id 列会让 list_records JOIN miss；
+                # 修法：shop_id 留空，店名写 shop_name 列。items_raw 里的 shop_id
+                # 实际是 shop_name（items_raw 由 build_video_dir_schedule 填的 it.shop_name）。
+                "shop_id": "",
+                "shop_name": it["shop_id"],
                 "intro_id": "",
                 "intro_snapshot": it.get("intro_content") or "",  # #292：写入 manual intro
                 "topics_snapshot": "[]",
@@ -1458,8 +1529,12 @@ def confirm_task_direct(payload: dict) -> dict:
         raise ValueError(
             f"[门店] {len(warnings)} 个项目门店配置已变更，请回第 3 步重新选择"
         )
+    # #fix-confirm-direct-dlm-name：先把 daily_limit_mode 落成 local，后续 L1586-1599
+    # 直接引用 —— 否则 NameError（之前误把 daily_limit_mode= 当成 ScheduleConfig 的 kwarg，
+    # 实际 L1594 / L1597 表达式里没有这个 local）。生产触发条件：复制→confirm-direct → per_account。
+    daily_limit_mode = payload["daily_limit_mode"]
     # 3. 解析 daily_limit
-    if payload["daily_limit_mode"] == "global":
+    if daily_limit_mode == "global":
         per_acc = ()
         global_lim = int(payload.get("daily_limit_global") or 0)
         per_acc_sched = ()
@@ -1517,6 +1592,9 @@ def confirm_task_direct(payload: dict) -> dict:
     project_ids_set = {it.project_id for it in items}
     account_ids_json = json.dumps(payload["account_ids"], ensure_ascii=False)
     # #596：per_account 下写入 JSON 时带 schedule_mode / fixed_interval_min / balanced_step_min（编辑回显 + 历史留痕）
+    # #fix-confirm-direct-dlm-name L600：per_acc_sched 是 4 元组 (aid, mode, fixed, balanced)
+    # （与 ScheduleConfig.daily_limit_per_account_schedule 类型一致，见 publish_schedule.py:164），
+    # 解包时跳过第 1 位 aid（已从 per_acc 拿）；之前解成 3 元组 → too many values to unpack。
     daily_limit_per_account_json = json.dumps(
         [
             {
@@ -1527,12 +1605,23 @@ def confirm_task_direct(payload: dict) -> dict:
                     "balanced_step_min": balanced_min}
                    if daily_limit_mode == "per_account" else {}),
             }
-            for (aid, lim), (mode, fixed_min, balanced_min) in zip(per_acc, per_acc_sched)
+            for (aid, lim), (_, mode, fixed_min, balanced_min) in zip(per_acc, per_acc_sched)
         ] if daily_limit_mode == "per_account"
         else [{"account_id": aid, "limit": lim} for aid, lim in per_acc],
         ensure_ascii=False)
+    # #fix-intro-mode-roundtrip：持久化 wizard step 4 选中的 introMode（list / manual），
+    # 复制/编辑回填时还原。publish_task 表无 intro_mode 列（wizard 概念）所以落到 projects_payload_json 内。
+    _projects_intro_mode = {
+        pp.get("project_id"): pp.get("intro_mode", "list")
+        for pp in payload.get("projects") or []
+        if pp.get("project_id")
+    }
     projects_payload_json = json.dumps(
-        [{"project_id": p.id, "shop_ids": list(p.shop_ids), "intro_ids": [it.id for it in p.intros]}
+        [{"project_id": p.id,
+          "shop_ids": list(p.shop_ids),
+          "intro_ids": [it.id for it in p.intros],
+          "intro_mode": "manual" if _projects_intro_mode.get(p.id) == "manual" else "list",
+         }
          for p in projects], ensure_ascii=False)
     # shop_ids_json 用 dict.fromkeys 保序（按勾选顺序去重；不影响实际派发）
     shop_ids_ordered = list(dict.fromkeys(
@@ -1704,6 +1793,10 @@ def duplicate_task(task_id: str) -> dict:
         raise ValueError("源任务不存在")
     # #453：不再过滤状态（运行中/暂停也可复制——前端 wizard 允许用户在确认前调整时间窗/账号）
     projects_payload = json.loads(src.get("projects_payload_json") or "[]")
+    # #fix-intro-mode-roundtrip：老数据没 intro_mode 字段时默认 'list'（保持历史行为——不命中）
+    for _pp in projects_payload:
+        if "intro_mode" not in _pp:
+            _pp["intro_mode"] = "list"
     per_acc = json.loads(src.get("daily_limit_per_account_json") or "[]")
     schedule_mode = src.get("schedule_mode") if src.get("schedule_mode") is not None else _DEFAULT_SCHEDULE_MODE
     fixed_interval_min = int(src["fixed_interval_min"]) if src.get("fixed_interval_min") is not None else _DEFAULT_FIXED_INTERVAL
@@ -1900,8 +1993,25 @@ def get_task_detail(task_id: str) -> dict:
     if not task:
         raise ValueError("任务不存在")
     items = d.query_all(
-        """SELECT i.*, a.nickname AS account_nickname, a.remark AS account_remark,
-                  s.name AS shop_name, v.file_path AS video_path,
+        # #fix-detail-shop-name-video-path：项目模式 shop_name / video_path 之前一直显示空。
+        # 根因：原 SQL 写 `SELECT i.*, ... AS shop_name, v.file_path AS video_path`：
+        #   1) `i.*` 展开含 i.shop_name（v46 加的列，default `''`）和 i.video_path（默认 NULL）
+        #   2) `COALESCE(...) AS shop_name` 和 `v.file_path AS video_path` 是同名 AS 别名
+        #   3) Python `sqlite3.Row` + `dict(row)` 在**列名重复时保留第一个**——所以 dict['shop_name']
+        #      拿到的是 i.shop_name=''，永远不是 COALESCE 算出的 'A门店1'；video_path 同理
+        # 修法：手工枚举 i 的列，**跳过 i.shop_name / i.video_path**（让同名 AS 别名唯一）。
+        """SELECT i.id, i.task_id, i.plan_time, i.account_id, i.project_id, i.video_id,
+                  i.shop_id, i.status, i.fail_reason, i.retry_count, i.publish_record_id,
+                  i.create_time, i.update_time, i.intro_id, i.intro_snapshot, i.topics_snapshot,
+                  i.declaration, i.allow_download, i.source, i.schedule_mode, i.interval_min,
+                  a.nickname AS account_nickname, a.remark AS account_remark,
+                  -- #fix-video-dir-shop-name（v46）：video_dir 模式 shop_id='' → LEFT JOIN miss
+                  -- 改用 i.shop_name 兜底（v46 写入的列）；项目模式 i.shop_name='' → s.name
+                  COALESCE(NULLIF(i.shop_name, ''), s.name, '') AS shop_name,
+                  -- #fix-video-dir-video-path：video_dir 模式 i.video_id='' → LEFT JOIN generated_video miss
+                  -- 改用 i.video_path 兜底（_confirm_video_dir 行 1055 写入的列）；
+                  -- 项目模式 i.video_path=NULL → 走 v.file_path
+                  COALESCE(NULLIF(i.video_path, ''), v.file_path, '') AS video_path,
                   v.combination_key AS video_combination_key,
                   COALESCE(p.title, json_extract(vd.value, '$.dir_name')) AS video_title
            FROM publish_task_item i
@@ -2157,10 +2267,13 @@ def _publish_one_item_inner(item_id: str, info) -> str:
         # 视频目录模式：构造伪 video dict（_write_publish_record 取 file_path）
         video = {"id": "", "file_path": video_path}
         abs_video = Path(video_path)
-        # 虚拟 shop 行（poi_id 留空 → publish_video 走按名称匹配路径）
+        # #fix-video-dir-shop-name（v46）：item.shop_id 已统一留空字符串，店名在 item.shop_name；
+        # 同时兼容老数据（v46 migration 之前的行——item.shop_id 实际是店名）做兜底。
+        # id 仍放店名占位（publish_video 走"按名称匹配"路径），name 用真实店名。
+        item_shop_name = item.get("shop_name") or item.get("shop_id") or ""
         shop = {
-            "id": item.get("shop_id") or "",  # 实际是 manual shop name
-            "name": item.get("shop_id") or "",
+            "id": item_shop_name,  # 占位 id = 店名（publish_video 走"按名称匹配"）
+            "name": item_shop_name,
             "poi_id": "",
         }
     else:
