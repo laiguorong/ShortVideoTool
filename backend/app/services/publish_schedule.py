@@ -700,10 +700,7 @@ class VideoDirScheduleConfig:
                 raise ValueError(f"目录 {d.title} 下无合规视频")
             if not d.shop_names:
                 raise ValueError(f"目录 {d.title} 门店列表不能为空（手动输入）")
-            # 视频简介-按项目一一对应：每个目录必须有 ≥1 条简介
-            intros_for_dir = self.manual_intros.get(d.id) or ()
-            if not intros_for_dir:
-                raise ValueError(f"目录 {d.title} 必须至少输入 1 条视频简介")
+            # 视频简介-按项目一一对应：#456 允许空（不输入 = 不添加视频简介；下游用占位 '' 兜底）
         # #596：per_account 模式下 daily_limit_per_account_schedule 必须给每账号一条
         # 4 元组：(account_id, schedule_mode, fixed_interval_min, balanced_step_min)
         if self.daily_limit_mode == "per_account":
@@ -807,10 +804,10 @@ def _schedule_video_dir_balanced(account_id: str,
                 f"请减少每账号发布数或增加目录内视频。"
             )
         vp = d.video_paths[k]
-        # 门店 / 简介轮转（__post_init__ 已强制非空）
+        # 门店 / 简介轮转（#456 允许 intros 为空——空时 intro_content='' 表示不添加视频简介）
         shop_name = d.shop_names[k % len(d.shop_names)]
         intros_for_dir = manual_intros.get(d.id) or ()
-        intro_content = intros_for_dir[k % len(intros_for_dir)]
+        intro_content = intros_for_dir[k % len(intros_for_dir)] if intros_for_dir else ""
         items.append(VideoDirScheduleItem(
             account_id=account_id,
             project_id=d.id,
@@ -879,7 +876,7 @@ def _schedule_video_dir_single_account_fixed(account_id: str,
         vp = d.video_paths[k]
         shop_name = d.shop_names[k % len(d.shop_names)]
         intros_for_dir = manual_intros.get(d.id) or ()
-        intro_content = intros_for_dir[k % len(intros_for_dir)]
+        intro_content = intros_for_dir[k % len(intros_for_dir)] if intros_for_dir else ""
         items.append(VideoDirScheduleItem(
             account_id=account_id,
             project_id=d.id,

@@ -35,6 +35,19 @@ function defaultEnd(): string {
   d.setHours(22, 0, 0, 0)
   return fmtLocal(d)
 }
+/** 复制任务时把原任务的日期改为明天，但时间部分（HH:mm）保持不变。
+ * 原任务是今天/昨天的过期日期——直接搬到明天；时间仍按用户当时选的（如 07:00 / 22:00）。
+ * 输入空字符串/格式异常时回退到 fallback。 */
+function tomorrowWithSameTime(orig: string | null | undefined, fallback: string): string {
+  if (!orig) return fallback
+  const m = orig.match(/(\d{2}):(\d{2})/)
+  if (!m) return fallback
+  const d = new Date(Date.now() + 86400000)
+  const yyyy = d.getFullYear()
+  const mo = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${yyyy}-${mo}-${dd} ${m[1]}:${m[2]}`
+}
 function fmtLocal(d: Date): string {
   // #420：发布时间统一去掉秒数，格式 yyyy-MM-dd HH:mm
   const p = (n: number) => String(n).padStart(2, '0')
@@ -391,8 +404,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
 
     const p = initialPayload
     setTaskName(p.task_name || '')
-    setStartTime(p.start_time || defaultStart())
-    setEndTime(p.end_time || defaultEnd())
+    // 复制任务：日期改为明天，时间部分（HH:mm）保持原值不变——避免原任务日期已过期
+    setStartTime(tomorrowWithSameTime(p.start_time, defaultStart()))
+    setEndTime(tomorrowWithSameTime(p.end_time, defaultEnd()))
     setScheduleMode(p.schedule_mode || 'balanced')
     setFixedIntervalMin(p.fixed_interval_min ?? 10)
     setBalancedStepMin(p.balanced_step_min ?? 60)
@@ -927,13 +941,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       return selProjects.every((p) => (projectDraft[p.id]?.selectedShops.length ?? 0) > 0)
     }
     if (step === 4) {
-      // 视频简介-按项目一一对应：每个视频目录都必须至少 1 条 intro
-      if (projectSource === 'video_dir') {
-        return videoDirs.every((d) => {
-          const lines = (manualIntroTexts[d.id] ?? '').split('\n').map((s) => s.trim()).filter(Boolean)
-          return lines.length > 0
-        })
-      }
+      // #456：视频简介允许为空（不勾/不输入表示不添加视频简介，后端 _validate_payload 已接受空 intro_ids）
+      // - 项目模式：selectedIntrosList/selectedIntrosManual 任意一个空数组即合法
+      // - 视频目录模式：manualIntroTexts 任意 dir 为空字符串即合法
       return true
     }
     if (step === 5) {
