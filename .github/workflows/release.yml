@@ -65,8 +65,10 @@ jobs:
         run: npm ci && npm run dist
 
       # 7. 上传到 GitHub Releases
-      #    workflow_dispatch 触发时此步会跳过（不是 tag 触发的不会建 Release）
+      #    只在 tag 触发的运行里执行（workflow_dispatch 没 tag 会报"requires a tag"）
+      #    github.ref 在 tag 触发时是 'refs/tags/v1.0.4'，手测时是 'refs/heads/main'
       - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
