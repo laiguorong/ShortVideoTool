@@ -84,15 +84,24 @@ function downloadWithRedirects(url, outPath, maxRedirects = 5) {
       }
       const totalBytes = parseInt(res.headers['content-length'] || '0', 10);
       let received = 0;
+      let lastReportedMilestone = 0;
       const file = fs.createWriteStream(outPath);
       res.on('data', (chunk) => {
         received += chunk.length;
         if (totalBytes) {
-          const pct = ((received / totalBytes) * 100).toFixed(1);
-          process.stdout.write(
-            `\r[prepare-assets] 下载进度: ${pct}% ` +
-            `(${(received / 1024 / 1024).toFixed(1)}MB / ${(totalBytes / 1024 / 1024).toFixed(1)}MB)   `
-          );
+          // 实际百分比（浮点，不要遮）
+          const pctNow = (received / totalBytes) * 100;
+          // 每跨过一个 10% 整数倍就打一次（10/20/…/90/100）
+          const milestoneNow = Math.min(Math.floor(pctNow / 10) * 10, 100);
+          if (milestoneNow > lastReportedMilestone) {
+            // 显示实际值（保留 1 位精度），不强行四舍五入到 10% 倍数
+            const displayPct = Math.min(pctNow, 100).toFixed(1);
+            process.stdout.write(
+              `\r[prepare-assets] 下载进度: ${displayPct}% ` +
+              `(${(received / 1024 / 1024).toFixed(1)}MB / ${(totalBytes / 1024 / 1024).toFixed(1)}MB)   `
+            );
+            lastReportedMilestone = milestoneNow;
+          }
         }
       });
       res.pipe(file);
