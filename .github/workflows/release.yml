@@ -40,8 +40,11 @@ jobs:
       #    本地用 setup_venv.py 已经跑了；CI 上 runner 干净，没 venv 跑不了 build:backend
       #    setup_venv.py 自身校验 Python 3.12.x（与 setup-python 一致）
       #    加 -E 标志屏蔽 PYTHONPATH，防 CI 环境的 shim 干扰
+      #    PYTHONIOENCODING=utf-8 让脚本里的中文 print 不被 cp1252 干掉（CI runner 默认编码）
       #    此步骤 cwd 是 repo 根，路径用 frontend/scripts/...（不带 ../）
       - name: Setup backend venv
+        env:
+          PYTHONIOENCODING: utf-8
         run: python -E frontend/scripts/setup_venv.py
 
       # 5. 下载后端资源包（ms-playwright + ffmpeg）
