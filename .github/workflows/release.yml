@@ -36,7 +36,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 4. 下载后端资源包（ms-playwright + ffmpeg）
+      # 4. 建后端 venv + 装 requirements + pyinstaller
+      #    本地用 setup_venv.py 已经跑了；CI 上 runner 干净，没 venv 跑不了 build:backend
+      #    setup_venv.py 自身校验 Python 3.12.x（与 setup-python 一致）
+      #    加 -E 标志屏蔽 PYTHONPATH，防 CI 环境的 shim 干扰
+      - name: Setup backend venv
+        run: python -E ../frontend/scripts/setup_venv.py
+
+      # 5. 下载后端资源包（ms-playwright + ffmpeg）
       #    版本读 backend/assets_version.txt，Release tag = assets-{version}
       #    GITHUB_TOKEN 自动注入，用于私有 Release 鉴权
       - name: Download backend assets
@@ -45,7 +52,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/prepare-assets.cjs
 
-      # 5. 装依赖 + 打包（npm run dist = build:backend + build + electron-builder）
+      # 6. 装依赖 + 打包（npm run dist = build:backend + build + electron-builder）
       #    CSC_IDENTITY_AUTO_DISCOVERY=false 跳过代码签名（无证书时）
       - name: Install deps + build
         working-directory: frontend
@@ -53,7 +60,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm ci && npm run dist
 
-      # 6. 上传到 GitHub Releases
+      # 7. 上传到 GitHub Releases
       #    workflow_dispatch 触发时此步会跳过（不是 tag 触发的不会建 Release）
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
