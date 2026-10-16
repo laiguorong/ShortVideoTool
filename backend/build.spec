@@ -21,11 +21,65 @@ if os.path.isdir(face_model_dir):
         for p in glob(os.path.join(face_model_dir, '*.tflite'))
     ]
 
+# RapidOCR 数据文件（config.yaml + models/*.onnx）
+# PyInstaller onedir 模式下默认不收包内的非 .py 文件，但 RapidOCR.main 用
+# `Path(__file__).parent / 'config.yaml'` 读配置、读 models/*.onnx 加载权重，
+# 所以必须显式声明。不声明时 RapidOCR() 抛 FileNotFoundError → 字幕检测失效。
+# 路径解析：优先从已 import 的包定位 site-packages；dev 环境没装则回退到 venv 路径。
+try:
+    import rapidocr_onnxruntime as _rapidocr_mod
+    _rapidocr_dir = os.path.dirname(_rapidocr_mod.__file__)
+except ImportError:
+    _rapidocr_dir = os.path.join(
+        SPECPATH, 'venv', 'Lib', 'site-packages', 'rapidocr_onnxruntime'
+    )
+
+rapidocr_datas = []
+_rapidocr_yaml = os.path.join(_rapidocr_dir, 'config.yaml')
+if os.path.isfile(_rapidocr_yaml):
+    rapidocr_datas.append((_rapidocr_yaml, 'rapidocr_onnxruntime'))
+_rapidocr_models_dir = os.path.join(_rapidocr_dir, 'models')
+if os.path.isdir(_rapidocr_models_dir):
+    for _f in os.listdir(_rapidocr_models_dir):
+        if _f.endswith('.onnx'):
+            rapidocr_datas.append(
+                (os.path.join(_rapidocr_models_dir, _f),
+                 os.path.join('rapidocr_onnxruntime', 'models'))
+            )
+
+# MediaPipe Tasks API 原生 dll（libmediapipe.dll, ~55 MB）
+# mediapipe.tasks.python.core.mediapipe_c_bindings 用
+# `importlib.resources.files('mediapipe.tasks.c')` 解析 dll 路径，
+# onedir 下 dll 必须位于 _internal/mediapipe/tasks/c/libmediapipe.dll。
+# PyInstaller 默认会按扩展名收 .dll，但前提是 Analysis 扫到 mediapipe.tasks.c
+# 这个子包——所以 hiddenimports 里必须显式声明 'mediapipe.tasks.c'。
+try:
+    import mediapipe.tasks.c as _mp_c_mod
+    _mp_c_dir = os.path.dirname(_mp_c_mod.__file__)
+except ImportError:
+    # mediapipe.tasks.c 不是 mediapipe.tasks.python.c——
+    # mediapipe 1.0.1 把 libmediapipe.dll 直接放在 mediapipe/tasks/c/，
+    # 跟 mediapipe.tasks.python 平级，不是 python 包下的子模块
+    try:
+        import mediapipe as _mp
+        _mp_c_dir = os.path.join(os.path.dirname(_mp.__file__), 'tasks', 'c')
+    except ImportError:
+        _mp_c_dir = os.path.join(SPECPATH, 'venv', 'Lib', 'site-packages', 'mediapipe', 'tasks', 'c')
+
+mediapipe_c_binaries = []
+if os.path.isdir(_mp_c_dir):
+    for _f in os.listdir(_mp_c_dir):
+        if _f.endswith(('.dll', '.so', '.dylib')):
+            mediapipe_c_binaries.append(
+                (os.path.join(_mp_c_dir, _f),
+                 os.path.join('mediapipe', 'tasks', 'c'))
+            )
+
 a = Analysis(
     ['run_backend.py'],
     pathex=[SPECPATH],
-    binaries=[],
-    datas=face_model_datas,
+    binaries=mediapipe_c_binaries,
+    datas=face_model_datas + rapidocr_datas,
     hiddenimports=[
         # uvicorn 动态导入
         'uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto', 'uvicorn.loops.asyncio',
@@ -38,16 +92,19 @@ a = Analysis(
         'apscheduler.schedulers.background', 'apscheduler.triggers.interval', 'apscheduler.triggers.cron',
         # 应用包
         'app', 'app.api', 'app.models', 'app.services', 'app.core', 'app.core.douyin', 'app.db',
-        # MediaPipe Tasks API（PyInstaller 默认不扫到 tasks.* 子模块）
+        # MediaPipe Tasks API 1.0.1（PyInstaller 默认不扫到 tasks.* 子模块）
+        # 1.0.1 用 ctypes + importlib.resources 加载 libmediapipe.dll，
+        # 老的 mediapipe.framework / mediapipe.python._framework_bindings / mediapipe.tasks.cc
+        # 这 5 条都是 0.10.x 时代的死路径，1.0.1 已删除，PyInstaller 找不到会默默跳过。
+        # 必须显式列出 mediapipe.tasks.c 让 Analysis 扫到那个目录的 binaries，
+        # 否则 ~55MB libmediapipe.dll 不会被收集 → ctypes.CDLL 加载失败 → import mediapipe 抛错。
         'mediapipe.tasks',
         'mediapipe.tasks.python',
         'mediapipe.tasks.python.vision',
         'mediapipe.tasks.python.core',
-        'mediapipe.tasks.cc',
-        'mediapipe.framework',
-        'mediapipe.framework.formats',
-        'mediapipe.framework.tool',
-        'mediapipe.python._framework_bindings',
+        'mediapipe.tasks.c',
+        'mediapipe.tasks.python.vision.face_detector',
+        'mediapipe.tasks.python.vision.core.image',
     ],
     hookspath=[],
     runtime_hooks=[],
