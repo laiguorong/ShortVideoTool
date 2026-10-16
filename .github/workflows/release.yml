@@ -1,0 +1,66 @@
+name: Release
+
+# 触发条件：
+#   1. 推送形如 v1.0.4 的 tag -> 自动构建并上传到对应 Release
+#   2. workflow_dispatch -> 手动触发（仅验证打包，不会上传 Release）
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 写 Release 必须的权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # 1. 拉代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 装 Node（与项目 dev 一致：Node 20）
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # 3. 装 Python（PyInstaller 需要；windows-latest 默认不带）
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 4. 下载后端资源包（ms-playwright + ffmpeg）
+      #    版本读 backend/assets_version.txt，Release tag = assets-{version}
+      #    GITHUB_TOKEN 自动注入，用于私有 Release 鉴权
+      - name: Download backend assets
+        working-directory: frontend
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/prepare-assets.cjs
+
+      # 5. 装依赖 + 打包（npm run dist = build:backend + build + electron-builder）
+      #    CSC_IDENTITY_AUTO_DISCOVERY=false 跳过代码签名（无证书时）
+      - name: Install deps + build
+        working-directory: frontend
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm ci && npm run dist
+
+      # 6. 上传到 GitHub Releases
+      #    workflow_dispatch 触发时此步会跳过（不是 tag 触发的不会建 Release）
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            frontend/release/*.exe
+            frontend/release/*.blockmap
+            frontend/release/latest.yml
+          generate_release_notes: true
+          fail_on_unmatched_files: false
