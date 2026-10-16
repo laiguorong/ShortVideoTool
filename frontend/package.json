@@ -74,6 +74,7 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "shortcutName": "短视频工具",
+      "license": "./build/LICENSE.txt",
       "include": "./build/installer.nsh"
     },
     "electronDownload": {

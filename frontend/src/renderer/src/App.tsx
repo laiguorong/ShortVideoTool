@@ -15,6 +15,7 @@ import { RecordsPage } from '@/pages/RecordsPage'
 import { TasksPage } from '@/pages/TasksPage'
 import { StartupPage } from '@/pages/StartupPage'
 import { RiskNoticeDialog } from '@/components/shared/RiskNotice'
+import { AboutDialog } from '@/components/shared/AboutDialog'
 
 /** 导航配置（界面交互设计 9.1.1） */
 const NAV_ITEMS: { page: Page; label: string; icon: string }[] = [
@@ -69,6 +70,8 @@ export default function App() {
           startupComplete, setStartupComplete } =
     useAppStore()
   const [healthLoading, setHealthLoading] = useState(true)
+  // 关于系统弹窗：顶栏 ❓ 按钮触发
+  const [showAbout, setShowAbout] = useState(false)
 
   // 后端就绪轮询（1 秒重试，参考 VideoMatrix App 模式）
   useEffect(() => {
@@ -180,6 +183,14 @@ export default function App() {
               </span>
             )}
           </button>
+          {/* 关于系统按钮：复用铃铛的样式 */}
+          <button
+            className="rounded p-1.5 hover:bg-muted"
+            title="关于系统"
+            onClick={() => setShowAbout(true)}
+          >
+            ❓
+          </button>
         </div>
       </header>
 
@@ -236,11 +247,12 @@ export default function App() {
               }`
             : '● 空闲'}
         </div>
-        <div>v1.0.0</div>
+        <div>v{__APP_VERSION__}</div>
       </footer>
 
       <ToastContainer />
       <RiskNoticeDialog open={!riskConfirmed} onConfirm={() => setRiskConfirmed(true)} />
+      <AboutDialog open={showAbout} onOpenChange={setShowAbout} />
     </div>
   )
 }
