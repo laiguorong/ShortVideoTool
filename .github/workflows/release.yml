@@ -60,11 +60,13 @@ jobs:
 
       # 6. 装依赖 + 打包（npm run dist = build:backend + build + electron-builder）
       #    CSC_IDENTITY_AUTO_DISCOVERY=false 跳过代码签名（无证书时）
+      #    #lockfile-policy：frontend/package-lock.json 不入库，不能用 npm ci（会报 EUSAGE）
+      #    改用 npm install——会按 package.json 解析安装（CI 每次都重装，比 npm ci 慢 30-60s）
       - name: Install deps + build
         working-directory: frontend
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npm ci && npm run dist
+        run: npm install && npm run dist
 
       # 7. 上传到 GitHub Releases
       #    只在 tag 触发的运行里执行（workflow_dispatch 没 tag 会报"requires a tag"）
