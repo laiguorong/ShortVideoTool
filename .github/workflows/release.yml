@@ -28,7 +28,9 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          # frontend/package-lock.json 不入库，改用 package.json 作为 cache 触发文件
+          # 粒度变粗（package.json 任意改动都会重 cache），但仍能命中
+          cache-dependency-path: frontend/package.json
 
       # 3. 装 Python（PyInstaller 需要；windows-latest 默认不带）
       - name: Setup Python
