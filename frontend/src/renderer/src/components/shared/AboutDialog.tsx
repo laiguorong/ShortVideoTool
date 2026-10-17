@@ -1,5 +1,6 @@
 import { Dialog } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { UpdateBadge } from './UpdateBadge'
 
 /** 关于系统弹窗（顶栏 ❓ 按钮触发）
  *  内容包含：系统版本号 / 所有权 / 系统说明 / 开源协议 / 免责声明 / 支持作者
@@ -26,13 +27,11 @@ export function AboutDialog({
       }
     >
       <div className="space-y-5 text-sm">
-        {/* 1. 系统版本号 */}
+        {/* 1. 系统版本号（点击触发检查更新 / 显示"有更新"徽标） */}
         <section>
           <div className="flex items-center gap-2">
             <span className="font-medium">系统版本号</span>
-            <span className="rounded bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground">
-              v{__APP_VERSION__}
-            </span>
+            <UpdateBadge variant="about" />
           </div>
         </section>
 

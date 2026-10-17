@@ -1,5 +1,5 @@
 {
-  "name": "shortvideo-tool",
+  "name": "rong-info-shortvideotool",
   "version": "1.0.3",
   "private": true,
   "description": "短视频工具桌面端（ShortVideoTool）",
@@ -25,6 +25,7 @@
     "@radix-ui/react-tabs": "^1.1.21",
     "@radix-ui/react-toast": "^1.2.23",
     "clsx": "^2.1.1",
+    "electron-updater": "^6.3.9",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "tailwind-merge": "^3.6.0",
@@ -45,7 +46,7 @@
     "vite-plugin-electron": "^0.28.2"
   },
   "build": {
-    "appId": "com.shortvideo.tool",
+    "appId": "com.rong-info.shortvideotool",
     "productName": "ShortVideoTool",
     "directories": {
       "output": "release"
@@ -69,6 +70,11 @@
     ],
     "win": {
       "target": "nsis"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "laiguorong",
+      "repo": "ShortVideoTool"
     },
     "nsis": {
       "oneClick": false,

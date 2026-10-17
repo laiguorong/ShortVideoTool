@@ -16,6 +16,8 @@ import { TasksPage } from '@/pages/TasksPage'
 import { StartupPage } from '@/pages/StartupPage'
 import { RiskNoticeDialog } from '@/components/shared/RiskNotice'
 import { AboutDialog } from '@/components/shared/AboutDialog'
+import { UpdateBadge } from '@/components/shared/UpdateBadge'
+import { setupUpdateEventBindings, triggerUpdateCheck } from '@/store/updateStore'
 
 /** 导航配置（界面交互设计 9.1.1） */
 const NAV_ITEMS: { page: Page; label: string; icon: string }[] = [
@@ -151,6 +153,21 @@ export default function App() {
       .catch((e) => console.warn('[App] 请求失败:', e))
   }, [backendReady, startupComplete, setRiskConfirmed])
 
+  // 进入首页后：挂 autoUpdater 事件订阅 + 自动查一次更新
+  // 不用 backendReady 依赖——后端 health 与 autoUpdater 完全独立
+  useEffect(() => {
+    if (!startupComplete) return
+    const cleanup = setupUpdateEventBindings()
+    // 延 1s 触发，避开启动页焦点切换和首页初始渲染压力
+    const timer = window.setTimeout(() => {
+      triggerUpdateCheck()
+    }, 1000)
+    return () => {
+      cleanup()
+      window.clearTimeout(timer)
+    }
+  }, [startupComplete])
+
   if (healthLoading) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3">
@@ -247,7 +264,9 @@ export default function App() {
               }`
             : '● 空闲'}
         </div>
-        <div>v{__APP_VERSION__}</div>
+        <div>
+          <UpdateBadge variant="footer" />
+        </div>
       </footer>
 
       <ToastContainer />

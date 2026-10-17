@@ -47,6 +47,14 @@ if (process.platform === 'win32') {
 }
 
 // ===== 全局状态 =====
+// #rename-appid：让 userData 路径走 dots 风格（com.rong-info.shortvideotool），
+// 跟 appId 视觉一致。package.json → name 保留 npm dashes 惯例（rong-info-shortvideotool）
+// 供 npm / package-lock 用；运行时通过 app.setName 覆盖让 app.getPath('userData')
+// 返回跟 appId 一样的 dots 路径。__APP_ID__ 由 vite.main.config.ts 编译期注入。
+// runtime 兜底：万一 vite define 漏配 / pkg 解析失败，__APP_ID__ 可能是空串/undefined
+const APP_ID_FALLBACK = 'com.rong-info.shortvideotool'
+app.setName(typeof __APP_ID__ === 'string' && __APP_ID__ ? __APP_ID__ : APP_ID_FALLBACK)
+
 let mainWindow: BrowserWindow | null = null
 let backendProcess: ChildProcess | null = null
 let isQuitting = false
@@ -58,10 +66,12 @@ const STDERR_BUFFER_LIMIT = 8 * 1024
 
 const isDev = !app.isPackaged
 const BACKEND_PORT = 8765
+// #rename-appid：去掉 setName 后的 logDev——logDev 链路依赖 ANSI_RE（TDZ 风险）。
+// 验证 setName 效果直接看 app.getPath('userData') 输出，更可靠
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 // #108：统一 logger —— info 受 isDev 守卫（生产 debug 噪音屏蔽），error/warn 不守卫（生产必落盘）
-// 文件日志写到 app.getPath('logs')/shortvideo-tool/main-YYYY-MM-DD.log，每日轮转。
+// 文件日志写到 app.getPath('logs')/main-YYYY-MM-DD.log，每日轮转。
 let _logFilePath: string | null = null
 let _logFileDate = ''
 
@@ -100,7 +110,7 @@ function _ensureLogFile(): string | null {
   const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
   if (_logFilePath && _logFileDate === ymd) return _logFilePath
   try {
-    const logDir = path.join(app.getPath('logs'), 'shortvideo-tool')
+    const logDir = app.getPath('logs')
     fs.mkdirSync(logDir, { recursive: true })
     const file = path.join(logDir, `main-${ymd}.log`)
     // 启动时追加一行分隔，方便 grep；时间戳格式与 _writeLog 一致
@@ -349,7 +359,7 @@ async function waitForBackendReady(timeoutMs: number): Promise<boolean> {
 
 const MAX_RETRY = 5
 
-/** 写独立启动错误日志：app.getPath('logs')/shortvideo-tool/backend-startup-error-YYYY-MM-DD.log
+/** 写独立启动错误日志：app.getPath('logs')/backend-startup-error-YYYY-MM-DD.log
  *  与主进程 log 分离，便于用户反馈启动失败问题时单独附此文件。
  *  每次失败追加一段（含 ISO 时间戳 + 失败原因 + 关键上下文）。
  *  异步 + 串行队列（防止并发 appendFile 字节错位 + 不阻塞主线程）。
@@ -358,7 +368,7 @@ let _writeErrorLogQueue: Promise<string | null> = Promise.resolve(null)
 function writeStartupErrorLog(reason: string, extras?: Record<string, unknown>): Promise<string | null> {
   const job = _writeErrorLogQueue.then(async () => {
     try {
-      const logDir = path.join(app.getPath('logs'), 'shortvideo-tool')
+      const logDir = app.getPath('logs')
       await fs.promises.mkdir(logDir, { recursive: true })
       const now = new Date()
       const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
@@ -575,7 +585,7 @@ async function handleBackendStartupFailure(): Promise<boolean> {
   // 错误框 detail 末尾追加日志路径
   const logHint = errorLogPath
     ? `\n\n详细信息已写入日志：\n${errorLogPath}`
-    : `\n\n详细信息请查看主进程日志：\n${path.join(app.getPath('logs'), 'shortvideo-tool', 'main-*.log')}`
+    : `\n\n详细信息请查看主进程日志：\n${path.join(app.getPath('logs'), 'main-*.log')}`
 
   // 启动页 (StartupPage) 会通过 /api/startup/check 给出结构化错误。
   // 这里只负责让用户知道后端进程没起来 + 让出选择（退出）。
@@ -936,6 +946,61 @@ ipcMain.handle('app:relaunch', async () => {
   }
   app.relaunch(buildRelaunchArgs(app))
   app.exit(0)
+})
+
+// ===== 自动更新（electron-updater，dev 模式禁用，仅打包后生效） =====
+import { autoUpdater } from 'electron-updater'
+
+// 设计：发现新版本 → 自动下载（不需要用户确认弹窗）；关 app 时自动装
+autoUpdater.autoDownload = true
+autoUpdater.autoInstallOnAppQuit = true
+// dev 模式（`npm run dev` / `electron .`）不打 release，不期望去 GitHub 查更新
+if (!app.isPackaged) {
+  autoUpdater.autoDownload = false
+  logDev('[autoUpdater] dev 模式，跳过自动下载（仅打包后生效）')
+}
+
+// 事件 → 转发给 renderer
+autoUpdater.on('update-available', (info) => {
+  logDev(`[autoUpdater] 发现新版本: v${info.version}（当前 v${app.getVersion()}）`)
+  mainWindow?.webContents.send('update:available', {
+    version: info.version,
+    releaseDate: info.releaseDate,
+  })
+})
+
+// #check-not-available：renderer 显式收到此事件才能确认 upToDate
+// 否则只靠 8s 兜底判断，遇到慢网络会把 available 误判为 upToDate
+autoUpdater.on('update-not-available', (info) => {
+  logDev(`[autoUpdater] 已是最新: v${info.version}`)
+  mainWindow?.webContents.send('update:not-available', { version: info.version })
+})
+
+autoUpdater.on('update-downloaded', (info) => {
+  logDev(`[autoUpdater] 下载完成: v${info.version}（点击版本号可安装）`)
+  mainWindow?.webContents.send('update:downloaded', { version: info.version })
+})
+
+// 静默错误：spec 要求"其他状态不需要额外反馈提示"——只走 logDev 留痕
+autoUpdater.on('error', (err) => {
+  logDev(`[autoUpdater] error: ${err.message}`)
+})
+
+// IPC：renderer 调
+ipcMain.handle('update:check', async () => {
+  try {
+    const result = await autoUpdater.checkForUpdates()
+    return { ok: true, version: result?.updateInfo?.version ?? null }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    logDev(`[autoUpdater] checkForUpdates 失败: ${msg}`)
+    return { ok: false, error: msg }
+  }
+})
+
+ipcMain.handle('update:install', () => {
+  // quitAndInstall 关 app → 调 NSIS 静默安装
+  autoUpdater.quitAndInstall()
 })
 
 // ===== 应用生命周期 =====

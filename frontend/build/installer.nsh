@@ -41,8 +41,10 @@
 
   ; 写注册表（HKCU 不需要管理员权限，重装/升级时用相同用户身份保持一致）
   ; 路径在 NSIS Unicode 模式下自动处理中文（如 "C:\Program Files\短视频工具\"）
-  WriteRegStr HKCU "Software\ShortVideoTool" "InstallPath" "$INSTDIR"
-  WriteRegStr HKCU "Software\ShortVideoTool" "Version" "${VERSION}"
+  ; #rename-appid：注册表键对齐 appId（com.rong-info.shortvideotool），跟 electron-updater
+  ; 的 HKCU\Software\<appId> 路径风格一致，避免两套并存
+  WriteRegStr HKCU "Software\com.rong-info.shortvideotool" "InstallPath" "$INSTDIR"
+  WriteRegStr HKCU "Software\com.rong-info.shortvideotool" "Version" "${VERSION}"
 
   ; 清临时备份（成功恢复后清理；保留仅供排查）
   RMDir /r "$TEMP\ShortVideoToolBackup"
@@ -50,13 +52,13 @@
 
 !macro customUnInstall
   ; #598 删注册表 + 保留 dc29cac 硬删 Electron userData
-  ; - 删注册表：HKCU\Software\ShortVideoTool（InstallPath + Version）
+  ; - 删注册表：HKCU\Software\com.rong-info.shortvideotool（InstallPath + Version）
   ; - 硬删 userData：不显示勾选框（vs electron-builder deleteAppDataOnUninstall）
   ; - 数据目录（<盘根>/ShortVideoToolData/）NSIS 不知道在哪，自动安全保留
   ; - 若目录不存在则跳过（NSIS 静默忽略更稳，IfFileExists 仅消除日志噪音）
-  DeleteRegKey HKCU "Software\ShortVideoTool"
+  DeleteRegKey HKCU "Software\com.rong-info.shortvideotool"
 
   SetShellVarContext current
-  IfFileExists "$APPDATA\shortvideo-tool" 0 +2
-    RMDir /r "$APPDATA\shortvideo-tool"
+  IfFileExists "$APPDATA\com.rong-info.shortvideotool" 0 +2
+    RMDir /r "$APPDATA\com.rong-info.shortvideotool"
 !macroend

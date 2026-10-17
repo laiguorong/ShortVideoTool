@@ -34,6 +34,14 @@ export interface ElectronAPI {
   defaultDataDirHint: () => Promise<{ disk: string; abs_path: string } | null>
   /** 重启 Electron（写入数据目录后立即生效） */
   relaunch: () => Promise<void>
+  /** 手动触发检查更新（点击版本号时调） */
+  checkUpdate: () => Promise<{ ok: boolean; version?: string | null; error?: string }>
+  /** 立即安装已下载的更新（点击"有更新"标签时调） */
+  installUpdate: () => void
+  /** 订阅 autoUpdater 事件（进入首页时调一次，统一管理订阅生命周期） */
+  onUpdateAvailable: (cb: (info: { version: string; releaseDate?: string | null }) => void) => () => void
+  onUpdateNotAvailable: (cb: (info: { version: string }) => void) => () => void
+  onUpdateDownloaded: (cb: (info: { version: string }) => void) => () => void
 }
 
 const api: ElectronAPI = {
@@ -50,6 +58,24 @@ const api: ElectronAPI = {
   chooseDataDirFlow: () => ipcRenderer.invoke('dataDir:choose'),
   defaultDataDirHint: () => ipcRenderer.invoke('settings:defaultDataDirHint'),
   relaunch: () => ipcRenderer.invoke('app:relaunch'),
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  // 订阅事件：返回 unsubscribe 函数，调用方在 unmount 时清理
+  onUpdateAvailable: (cb) => {
+    const listener = (_: unknown, info: { version: string; releaseDate?: string | null }) => cb(info)
+    ipcRenderer.on('update:available', listener)
+    return () => ipcRenderer.removeListener('update:available', listener)
+  },
+  onUpdateNotAvailable: (cb) => {
+    const listener = (_: unknown, info: { version: string }) => cb(info)
+    ipcRenderer.on('update:not-available', listener)
+    return () => ipcRenderer.removeListener('update:not-available', listener)
+  },
+  onUpdateDownloaded: (cb) => {
+    const listener = (_: unknown, info: { version: string }) => cb(info)
+    ipcRenderer.on('update:downloaded', listener)
+    return () => ipcRenderer.removeListener('update:downloaded', listener)
+  },
 }
 
 contextBridge.exposeInMainWorld('electronAPI', api)

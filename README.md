@@ -378,8 +378,8 @@ H:\ShortVideoToolData\                                     ← 数据目录（�
 ├── accounts\<id>\profile\ + storage.json
 ├── material\ + create\ + finished\ + cache\ + temp\ + log\
 
-%APPDATA%\shortvideo-tool\                                 ← Electron 用户态（自动管）
-└── main-YYYY-MM-DD.log + Cache + Local Storage
+%APPDATA%\com.rong-info.shortvideotool\                    ← Electron 用户态（自动管）
+└── logs\main-YYYY-MM-DD.log + Cache + Local Storage
 ```
 
 应用目录（安装时可选）+ 数据目录（设置面板可改）+ 用户态目录（不可改）三段分工详见 `docs/DATA_LAYOUT.md`。
