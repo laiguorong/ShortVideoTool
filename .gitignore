@@ -8,6 +8,11 @@ backend/.venv/
 frontend/dist/
 frontend/release/
 frontend/release-*/  # 兼容时间戳隔离的 build 目录
+# 根目录的孤儿 package-lock.json（项目根无 package.json，是 npm 误跑产物 / 6 行空 stub）
+# 前导 / 限定只匹配根目录，frontend/package-lock.json 不受影响
+/package-lock.json
+# frontend/package-lock.json 不入库（团队约定：clone 后跑 npm install 重新生成）
+/frontend/package-lock.json
 __pycache__/
 *.py[cod]
 # 临时 pip freeze 备份（不应该入库，用 pip freeze 时会重生成）
