@@ -312,12 +312,15 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
               const row = projects.find((x) => x.id === p.project_id)
               if (!row) continue
               matched.push(row)
-              const shops = (p.shop_ids || []).map((sid, i) => ({
-                id: sid,
-                name: p.shop_names?.[i] || '',
-                city: p.shop_cities?.[i] || '',
-                poi_id: p.shop_poi_ids?.[i] || '',
-              }))
+              const shops = (p.shop_ids || []).map((sid, i) => {
+              const name = p.shop_names?.[i] || ''
+              return {
+                  id: sid,
+                  name,
+                  city: p.shop_cities?.[i] || '',
+                  poi_id: p.shop_poi_ids?.[i] || '',
+                }
+              })
               // #fix-intro-mode-roundtrip：先填 placeholder + 空两个数组，
               // 异步 IIFE 读完 DB intros 后按 intro_ids 命中情况再回填。
               draftMap[p.project_id] = {
@@ -506,12 +509,15 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
           const row = projects.find((x) => x.id === proj.project_id)
           if (!row) continue
           matched.push(row)
-          const shops = (proj.shop_ids || []).map((sid, i) => ({
-            id: sid,
-            name: proj.shop_names?.[i] || '',
-            city: proj.shop_cities?.[i] || '',
-            poi_id: proj.shop_poi_ids?.[i] || '',
-          }))
+          const shops = (proj.shop_ids || []).map((sid, i) => {
+            const name = proj.shop_names?.[i] || ''
+            return {
+              id: sid,
+              name,
+              city: proj.shop_cities?.[i] || '',
+              poi_id: proj.shop_poi_ids?.[i] || '',
+            }
+          })
           // #fix-intro-mode-roundtrip：placeholder + 空两个数组
           // 异步 IIFE 读完 DB intros 后按 intro_ids 命中再回填
           draftMap[proj.project_id] = {
@@ -657,12 +663,15 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
   // #450：把 ProjectShopItem 转成 ShopDraftEntry 对象数组（统一 store 结构）。
   // #fix-shop-stale-on-reopen：提到组件顶层——过滤 useEffect（下方）也需要复用。
   // 用 ?? 而非 ||：空字符串保持空字符串（与 wizard step 3 全选/反选时 toShopEntry 行为一致）。
-  const toShopEntry = (s: { shop_id: string; shop_name?: string | null; city?: string | null; poi_id?: string | null }): ShopDraftEntry => ({
-    id: s.shop_id,
-    name: s.shop_name ?? '',
-    city: s.city ?? '',
-    poi_id: s.poi_id ?? '',
-  })
+  const toShopEntry = (s: { shop_id: string; shop_name?: string | null; city?: string | null; poi_id?: string | null }): ShopDraftEntry => {
+    const name = s.shop_name ?? ''
+    return {
+      id: s.shop_id,
+      name,
+      city: s.city ?? '',
+      poi_id: s.poi_id ?? '',
+    }
+  }
 
   // #fix-shop-stale-on-reopen：projShops 加载完后，静默过滤掉 selectedShops 中已失效的店。
   // 场景：复制 / 编辑任务时回填的店集合（draft.selectedShops）包含原任务里已取消加库 / 无佣金的店；
@@ -688,10 +697,18 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       const avail = projShops[pid]
       if (!avail) continue  // 还没加载完，跳过
       const sel = cur[pid].selectedShops
-      const availIds = new Set(sel.map((s) => s.id))
-      const filtered = avail.filter((s) => availIds.has(s.shop_id)).map(toShopEntry)
-      if (filtered.length !== sel.length) {
-        next[pid] = { ...cur[pid], selectedShops: filtered }
+      if (!sel || sel.length === 0) continue
+      const availMap = new Map(avail.map((s) => [s.shop_id, s]))
+      const dropped = sel.filter((s) => !availMap.has(s.id))
+      const kept = sel.filter((s) => availMap.has(s.id))
+      // #fix-name-authoritative：以候选列表（projShops）为权威补全 name/city/poi_id。
+      // 背景：编辑/复制回填的 selectedShops.name 来自 projects_payload_json.shop_names，
+      // 而保存分支（publish_service L1591）漏存该字段 → 回填 name 为空；原 effect 仅在存在失效店（dropped>0）
+      // 时才重建，无失效店时空 name 会一路带进 preview-direct 入参。改为：只要已选门店存在空 meta 项就用候选项补全。
+      const hasEmptyMeta = sel.some((s) => !s.name || !s.city || !s.poi_id)
+      const corrected = kept.map((s) => toShopEntry(availMap.get(s.id)!))
+      if (dropped.length > 0 || hasEmptyMeta) {
+        next[pid] = { ...cur[pid], selectedShops: corrected }
         changed = true
       }
     }

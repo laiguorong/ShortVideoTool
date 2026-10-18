@@ -113,6 +113,13 @@ class ProjectSpec:
     title: str
     shop_ids: tuple[str, ...]          # 门店顺序敏感
     intros: tuple[IntroSpec, ...]      # 简介顺序敏感
+    # #fix-shop-name-persist：与 shop_ids 同序同长的门店快照（名称/城市/POI）。
+    # 保存时落库到 projects_payload_json，供编辑/复制回填及任务记录展示使用；
+    # 前端向导以候选列表为权威补全 name（见 PublishWizardDialog 过滤回显 effect），
+    # 此处落库仅为数据完整 + 不依赖候选即能还原快照。
+    shop_names: tuple[str, ...] = ()
+    shop_cities: tuple[str, ...] = ()
+    shop_poi_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

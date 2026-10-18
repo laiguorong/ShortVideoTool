@@ -428,7 +428,10 @@ def preview_task(task_id: str) -> dict:
         # 门店名/类目查 shop（用于快照，但 preview 不入快照——仅 items 返回）
         projects.append(ProjectSpec(
             id=project_id, title="",
-            shop_ids=tuple(shop_ids), intros=tuple(intros)))
+            shop_ids=tuple(shop_ids), intros=tuple(intros),
+            shop_names=tuple(p.get("shop_names") or []),
+            shop_cities=tuple(p.get("shop_cities") or []),
+            shop_poi_ids=tuple(p.get("shop_poi_ids") or [])))
 
     # 每天上限解析（#413 审查 #9：避免 None/0 误判——显式 None 检查）
     if task["daily_limit_mode"] == "global":
@@ -730,7 +733,10 @@ def _resolve_projects_payload(payload: dict) -> tuple[list, list]:
             intros.append(IntroSpec(id=iid, content=content, topics=topics_tuple))
         projects.append(ProjectSpec(
             id=project_id, title="",
-            shop_ids=tuple(shop_ids), intros=tuple(intros)))
+            shop_ids=tuple(shop_ids), intros=tuple(intros),
+            shop_names=tuple(p.get("shop_names") or []),
+            shop_cities=tuple(p.get("shop_cities") or []),
+            shop_poi_ids=tuple(p.get("shop_poi_ids") or [])))
     return projects, warnings
 
 
@@ -1591,6 +1597,9 @@ def confirm_task_direct(payload: dict) -> dict:
     projects_payload_json = json.dumps(
         [{"project_id": p.id,
           "shop_ids": list(p.shop_ids),
+          "shop_names": list(p.shop_names),
+          "shop_cities": list(p.shop_cities),
+          "shop_poi_ids": list(p.shop_poi_ids),
           "intro_ids": [it.id for it in p.intros],
           "intro_mode": "manual" if _projects_intro_mode.get(p.id) == "manual" else "list",
          }
