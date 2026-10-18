@@ -9,6 +9,7 @@ import json
 import shutil
 from pathlib import Path
 
+from fastapi import HTTPException
 from loguru import logger
 
 from app.core import crypto, notifier
@@ -156,7 +157,7 @@ def get_cookie(account_id: str) -> str:
     d = get_db()
     row = d.query_one("SELECT cookie_encrypted FROM account WHERE id=? AND deleted=0", (account_id,))
     if not row:
-        raise ValueError("账号不存在")
+        raise HTTPException(status_code=404, detail="账号不存在")
     return crypto.decrypt(row["cookie_encrypted"])
 
 
@@ -197,7 +198,7 @@ def check_account(account_id: str) -> dict:
     d = get_db()
     row = d.query_one("SELECT * FROM account WHERE id=? AND deleted=0", (account_id,))
     if not row:
-        raise ValueError("账号不存在")
+        raise HTTPException(status_code=404, detail="账号不存在")
 
     # 1. profile_dir 不存在或无 Cookies 文件 → 直接 invalid（#fix-unify-profile-storage）
     from app.services.douyin_account import get_profile_dir as _get_profile_dir
@@ -374,7 +375,7 @@ def relogin(account_id: str, new_cookie: str, profile: dict | None = None) -> di
     d = get_db()
     row = d.query_one("SELECT * FROM account WHERE id=? AND deleted=0", (account_id,))
     if not row:
-        raise ValueError("账号不存在")
+        raise HTTPException(status_code=404, detail="账号不存在")
     new_cookie = new_cookie.strip()
     if "sessionid" not in new_cookie:
         raise ValueError("新 Cookie 缺少 sessionid，请重新登录")
@@ -451,7 +452,13 @@ def relogin(account_id: str, new_cookie: str, profile: dict | None = None) -> di
 
 def update_remark(account_id: str, remark: str) -> None:
     """编辑备注名。"""
-    get_db().update_by_id("account", account_id, {"remark": remark})
+    d = get_db()
+    # 存在性校验（#fix-update-missing-check）：update_by_id 找不到 id 时静默返 0 行
+    # 会导致"对不存在的账号 PUT 返 200"假成功，违反 REST 语义
+    row = d.query_one("SELECT id FROM account WHERE id=? AND deleted=0", (account_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    d.update_by_id("account", account_id, {"remark": remark})
 
 
 def toggle_disable(account_id: str, disabled: bool) -> None:
@@ -459,7 +466,7 @@ def toggle_disable(account_id: str, disabled: bool) -> None:
     d = get_db()
     row = d.query_one("SELECT status FROM account WHERE id=? AND deleted=0", (account_id,))
     if not row:
-        raise ValueError("账号不存在")
+        raise HTTPException(status_code=404, detail="账号不存在")
     if disabled:
         d.update_by_id("account", account_id, {"status": "disabled"})
     else:
@@ -478,7 +485,7 @@ def delete_account(account_id: str) -> None:
     d = get_db()
     row = d.query_one("SELECT remark, nickname FROM account WHERE id=? AND deleted=0", (account_id,))
     if not row:
-        raise ValueError("账号不存在")
+        raise HTTPException(status_code=404, detail="账号不存在")
     d.soft_delete_by_id("account", account_id)
     # 物理删除账号目录（含 storage.json / meta.json / 子目录）
     try:

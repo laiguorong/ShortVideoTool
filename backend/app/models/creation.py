@@ -37,11 +37,6 @@ class CopyProjectRequest(BaseModel):
     new_title: str
 
 
-class DeleteProjectRequest(BaseModel):
-    """删除项目。"""
-    delete_files: bool = Field(default=False, description="是否一并删除成品文件")
-
-
 class AddShotRequest(BaseModel):
     """添加分镜。"""
     name: str = Field(default="")
@@ -98,11 +93,6 @@ class AddBgmsRequest(BaseModel):
     material_ids: list[str] = Field(min_length=1)
 
 
-class RemoveBgmRequest(BaseModel):
-    """移除 BGM。"""
-    material_id: str
-
-
 class AddTextPoolRequest(BaseModel):
     """批量添加文案池条目。"""
     contents: list[str] = Field(min_length=1, description="每行一条")
@@ -113,8 +103,3 @@ class AddTextPoolRequest(BaseModel):
 class CreateGenerateTaskRequest(BaseModel):
     """创建生成任务。"""
     count: int = Field(default=10, ge=1, le=1000, description="本次生成条数")
-
-
-class DeleteVideoRequest(BaseModel):
-    """删除成品。"""
-    keep_file: bool = Field(default=False)

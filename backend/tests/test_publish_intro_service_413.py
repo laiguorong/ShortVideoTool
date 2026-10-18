@@ -90,8 +90,14 @@ def test_project_shop_set_overwrites_in_order() -> None:
     n = publish_intro_service.set_project_shops("p1", ["s3", "s1", "s2"])
     assert n == 3
     rows = publish_intro_service.list_project_shops("p1")
-    assert [r["shop_id"] for r in rows] == ["s3", "s1", "s2"]
-    assert [r["sort_order"] for r in rows] == [0, 1, 2]
+    # #publish-count：list_project_shops 按 publish_count 排序返回（覆盖 sort_order 显示顺序），
+    # 故直接查 project_shop 表验证 set_project_shops 的写入顺序（sort_order 重排）正确
+    from app.db import get_db
+    raw = get_db().query_all(
+        "SELECT shop_id, sort_order FROM project_shop WHERE project_id=? ORDER BY sort_order",
+        ("p1",))
+    assert [r["shop_id"] for r in raw] == ["s3", "s1", "s2"]
+    assert [r["sort_order"] for r in raw] == [0, 1, 2]
 
     # 第三次：清空只留 s1
     n = publish_intro_service.set_project_shops("p1", ["s1"])
@@ -110,8 +116,8 @@ def test_projects_with_shops_count() -> None:
 
 def test_imports() -> None:
     """模块导入无错（路由注册的最小烟测）。"""
-    from app.api import publish_intro  # noqa: F401
-    assert publish_intro.router
+    from app.api import publish  # noqa: F401
+    assert any(getattr(r, "path", "").startswith("/publish/intro") for r in publish.router.routes)
 
 
 if __name__ == "__main__":

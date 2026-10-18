@@ -1,7 +1,8 @@
 // -*- coding: utf-8 -*-
-/** 启动检查 API 封装（与后端 app/api/startup.py 对应）。 */
+/** 启动检查 API 封装（与后端 app/api/startup.py 对应）。
+ *  #publish-contract：所有响应统一包 ApiResp 信封，方法内部 .data! 解包。 */
 
-import { request } from './client'
+import { request, type ApiResp } from './client'
 
 export interface CheckResult {
   key: string
@@ -24,21 +25,24 @@ export const STARTUP_STEPS: { key: string; label: string; description: string }[
 
 /** 拉取所有步骤当前状态（页面刷新/初次挂载用） */
 export async function getState(): Promise<Record<string, CheckResult>> {
-  return request<Record<string, CheckResult>>('/startup/state')
+  const r = await request<ApiResp<Record<string, CheckResult>>>('/startup/state')
+  return r.data!
 }
 
 /** 执行某步（已 ok 返缓存，其他重跑） */
 export async function check(key: string): Promise<CheckResult> {
-  return request<CheckResult>(
+  const r = await request<ApiResp<CheckResult>>(
     `/startup/check/${encodeURIComponent(key)}`,
     { method: 'POST' },
   )
+  return r.data!
 }
 
 /** 设置数据目录（步骤 2 用户选完路径调） */
 export async function setDataDir(path: string): Promise<{ ok: boolean; data_dir: string }> {
-  return request<{ ok: boolean; data_dir: string }>(
+  const r = await request<ApiResp<{ ok: boolean; data_dir: string }>>(
     '/startup/data-dir',
     { method: 'POST', body: JSON.stringify({ path }) },
   )
+  return r.data!
 }

@@ -77,68 +77,6 @@ class ShopPullLogRead(BaseModel):
     create_time: str
 
 
-# ============ 门店模型 ============
-
-class ShopRead(BaseModel):
-    """门店详情（响应）。"""
-    id: str
-    poi_id: str
-    name: str
-
-    # 地理
-    province: str | None = None
-    city: str | None = None
-    district: str | None = None
-    ad_code: str | None = None
-    address: str | None = None
-    lat_gcj02: float | None = None
-    lng_gcj02: float | None = None
-
-    # 分类
-    category: str | None = None
-    category_full: str | None = None
-
-    # CPS
-    is_cps: int = 0
-
-    # 佣金 / 比率
-    commission_rate: float | None = None
-    take_rate_min: int | None = None
-    take_rate_max: int | None = None
-    take_rate_avg: float | None = None
-
-    # 销量 / GMV
-    total_sold: int | None = None
-    total_gmv: float | None = None
-    total_commission: float | None = None
-
-    # 商品
-    spu_count: int = 0
-    cps_spu_count: int = 0
-    delivery_spu_count: int = 0
-    spu_type_groupon: int = 0
-    spu_type_delivery: int = 0
-
-    # 平台
-    platform_name: str | None = None
-    platform_source: int | None = None
-
-    # TOP SPU
-    top_spu_name: str | None = None
-    top_spu_sold: int | None = None
-
-    # 详情
-    detail_fetched: int = 0
-    detail_updated_time: str | None = None
-
-    # #publish-count：累计发布成功次数（视频发布成功后 +1；前端按升序排）
-    publish_count: int = 0
-
-    # 通用
-    create_time: str
-    update_time: str
-
-
 # ============ 素材 / 视频拉取相关（保留不动）============
 
 class VideoPullConditions(BaseModel):

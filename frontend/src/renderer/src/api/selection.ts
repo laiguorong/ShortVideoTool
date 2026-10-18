@@ -1,4 +1,4 @@
-import { request, type PageResult } from './client'
+import { request, type PageResult, type ApiResp } from './client'
 
 /** 间隔配置（与后端 IntervalConfig 对齐）。 */
 export interface IntervalConfig {
@@ -124,7 +124,7 @@ export interface ShopQueryParams {
 
 export const selectionApi = {
   /** 任务列表（创建/查询/编辑/删除/启停/触发/日志） */
-  createTask: (body: {
+  createTask: async (body: {
     task_name: string
     keyword: string
     cities: string[]
@@ -132,17 +132,27 @@ export const selectionApi = {
     interval: IntervalConfig
     shop_name_pattern?: string
     city_pattern?: string
-  }) => request<ShopPullTask>('/selection/tasks', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  }),
+  }): Promise<ShopPullTask> => {
+    const r = await request<ApiResp<ShopPullTask>>('/selection/tasks', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    return r.data!
+  },
 
-  listTasks: (page = 1, pageSize = 20) =>
-    request<PageResult<ShopPullTask>>(`/selection/tasks?page=${page}&page_size=${pageSize}`),
+  listTasks: async (page = 1, pageSize = 20): Promise<PageResult<ShopPullTask>> => {
+    const r = await request<ApiResp<PageResult<ShopPullTask>>>(
+      `/selection/tasks?page=${page}&page_size=${pageSize}`,
+    )
+    return r.data!
+  },
 
-  getTask: (id: string) => request<ShopPullTask>(`/selection/tasks/${id}`),
+  getTask: async (id: string): Promise<ShopPullTask> => {
+    const r = await request<ApiResp<ShopPullTask>>(`/selection/tasks/${id}`)
+    return r.data!
+  },
 
-  updateTask: (id: string, body: Partial<{
+  updateTask: async (id: string, body: Partial<{
     task_name: string
     keyword: string
     cities: string[]
@@ -150,45 +160,60 @@ export const selectionApi = {
     interval: IntervalConfig
     shop_name_pattern: string
     city_pattern: string
-  }>) => request<ShopPullTask>(`/selection/tasks/${id}`, {
-    method: 'PATCH',
-    body: JSON.stringify(body),
-  }),
+  }>): Promise<ShopPullTask> => {
+    const r = await request<ApiResp<ShopPullTask>>(`/selection/tasks/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+    return r.data!
+  },
 
-  deleteTask: (id: string) =>
-    request<{ ok: boolean }>(`/selection/tasks/${id}`, { method: 'DELETE' }),
+  deleteTask: async (id: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/selection/tasks/${id}`, { method: 'DELETE' })
+    return r.data!
+  },
 
-  toggleTask: (id: string, enabled: boolean) =>
-    request<ShopPullTask>(`/selection/tasks/${id}/toggle`, {
+  toggleTask: async (id: string, enabled: boolean): Promise<ShopPullTask> => {
+    const r = await request<ApiResp<ShopPullTask>>(`/selection/tasks/${id}/toggle`, {
       method: 'POST',
       body: JSON.stringify({ enabled }),
-    }),
+    })
+    return r.data!
+  },
 
-  runTask: (id: string) =>
-    request<{ ok: boolean; bg_task_id: string }>(`/selection/tasks/${id}/run`, {
-      method: 'POST',
-    }),
+  runTask: async (id: string): Promise<{ ok: boolean; bg_task_id: string }> => {
+    const r = await request<ApiResp<{ ok: boolean; bg_task_id: string }>>(
+      `/selection/tasks/${id}/run`, { method: 'POST' },
+    )
+    return r.data!
+  },
 
-  taskLogs: (id: string, page = 1, pageSize = 50) =>
-    request<PageResult<ShopPullLog>>(
+  taskLogs: async (id: string, page = 1, pageSize = 50): Promise<PageResult<ShopPullLog>> => {
+    const r = await request<ApiResp<PageResult<ShopPullLog>>>(
       `/selection/tasks/${id}/logs?page=${page}&page_size=${pageSize}`,
-    ),
+    )
+    return r.data!
+  },
 
   /** 全部门店拉取执行记录（任务 #407：任务执行记录页签使用） */
-  allLogs: (page = 1, pageSize = 50) =>
-    request<PageResult<ShopPullLog & { task_name: string | null }>>(
+  allLogs: async (page = 1, pageSize = 50): Promise<PageResult<ShopPullLog & { task_name: string | null }>> => {
+    const r = await request<ApiResp<PageResult<ShopPullLog & { task_name: string | null }>>>(
       `/selection/logs?page=${page}&page_size=${pageSize}`,
-    ),
+    )
+    return r.data!
+  },
 
   /** 批量删除门店拉取记录（任务 #408） */
-  batchDeleteLogs: (ids: string[]) =>
-    request<{ deleted: number; missing: string[] }>(
+  batchDeleteLogs: async (ids: string[]): Promise<{ deleted: number; missing: string[] }> => {
+    const r = await request<ApiResp<{ deleted: number; missing: string[] }>>(
       '/selection/logs/batch-delete',
       { method: 'POST', body: JSON.stringify({ ids }) },
-    ),
+    )
+    return r.data!
+  },
 
   /** 门店查询 */
-  listShops: (params: ShopQueryParams = {}) => {
+  listShops: async (params: ShopQueryParams = {}): Promise<PageResult<Shop>> => {
     // 仅过滤 null/undefined/空串；false 是三态筛选的"仅否"语义，必须保留
     // （之前一并过滤掉 false，导致"仅无佣金/仅未加库"形同虚设）
     const filtered = Object.entries(params).filter(
@@ -197,18 +222,35 @@ export const selectionApi = {
     const q = new URLSearchParams(
       filtered.map(([k, v]) => `${k}=${v}`).join('&'),
     )
-    return request<PageResult<Shop>>(`/selection/shops?${q}`)
+    const r = await request<ApiResp<PageResult<Shop>>>(`/selection/shops?${q}`)
+    return r.data!
   },
 
   /** 维度聚合（下拉数据源） */
-  fetchCities: () => request<{ cities: string[] }>('/selection/cities'),
-  fetchProvinces: () => request<{ provinces: string[] }>('/selection/provinces'),
-  fetchCategories: () => request<{ categories: string[] }>('/selection/categories'),
+  fetchCities: async (): Promise<{ cities: string[] }> => {
+    const r = await request<ApiResp<{ cities: string[] }>>('/selection/cities')
+    return r.data!
+  },
+  fetchProvinces: async (): Promise<{ provinces: string[] }> => {
+    const r = await request<ApiResp<{ provinces: string[] }>>('/selection/provinces')
+    return r.data!
+  },
+  fetchCategories: async (): Promise<{ categories: string[] }> => {
+    const r = await request<ApiResp<{ categories: string[] }>>('/selection/categories')
+    return r.data!
+  },
 
   /** 切换门店加库标记（enabled=true 加库，false 取消） */
-  toggleAdded: (shopId: string, enabled: boolean) =>
-    request<{ shop_id: string; is_added_to_library: number; added_time: string | null }>(
-      `/selection/shops/${shopId}/toggle-added?enabled=${enabled}`,
-      { method: 'POST' },
-    ),
+  toggleAdded: async (shopId: string, enabled: boolean): Promise<{
+    shop_id: string
+    is_added_to_library: number
+    added_time: string | null
+  }> => {
+    const r = await request<ApiResp<{
+      shop_id: string
+      is_added_to_library: number
+      added_time: string | null
+    }>>(`/selection/shops/${shopId}/toggle-added?enabled=${enabled}`, { method: 'POST' })
+    return r.data!
+  },
 }

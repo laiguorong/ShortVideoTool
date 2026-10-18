@@ -1,4 +1,4 @@
-import { request, type PageResult } from './client'
+import { request, type PageResult, type ApiResp } from './client'
 import type { IntervalConfig } from './selection'
 
 /** 分类节点（平铺，前端组树） */
@@ -118,61 +118,94 @@ export interface PullConditions {
 
 export const materialApi = {
   /** 分类树（平铺） */
-  categories: (type: 'video' | 'music', orientation?: 'vertical' | 'horizontal' | null) => {
+  categories: async (type: 'video' | 'music', orientation?: 'vertical' | 'horizontal' | null): Promise<Category[]> => {
     // #441：分类计数按项目画幅过滤（与 list 列表一致；方形项目 orientation=null 透传不过滤）
     const o = orientation ? `&orientation=${orientation}` : ''
-    return request<Category[]>(`/materials/categories?type=${type}${o}`)
+    const r = await request<ApiResp<Category[]>>(`/materials/categories?type=${type}${o}`)
+    return r.data!
   },
 
   /** 新增分类 */
-  createCategory: (name: string, type: 'video' | 'music', parentId = '') =>
-    request<Category>('/materials/categories', {
+  createCategory: async (name: string, type: 'video' | 'music', parentId = ''): Promise<Category> => {
+    const r = await request<ApiResp<Category>>('/materials/categories', {
       method: 'POST',
       body: JSON.stringify({ name, type, parent_id: parentId }),
-    }),
+    })
+    return r.data!
+  },
 
   /** 重命名分类 */
-  renameCategory: (id: string, name: string) =>
-    request<{ ok: boolean }>(`/materials/categories/${id}/rename`, {
+  renameCategory: async (id: string, name: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/materials/categories/${id}/rename`, {
       method: 'PUT',
       body: JSON.stringify({ name }),
-    }),
+    })
+    return r.data!
+  },
 
   /** 移动分类（换父级/排序） */
-  moveCategory: (id: string, newParentId: string, sortOrder = 0) =>
-    request<{ ok: boolean }>(`/materials/categories/${id}/move`, {
+  moveCategory: async (id: string, newParentId: string, sortOrder = 0): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/materials/categories/${id}/move`, {
       method: 'POST',
       body: JSON.stringify({ new_parent_id: newParentId, sort_order: sortOrder }),
-    }),
+    })
+    return r.data!
+  },
 
   /** 删除分类 */
-  deleteCategory: (id: string, strategy = 'to_parent') =>
-    request<{ ok: boolean }>(`/materials/categories/${id}?strategy=${strategy}`, { method: 'DELETE' }),
+  deleteCategory: async (id: string, strategy = 'to_parent'): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/materials/categories/${id}?strategy=${strategy}`, { method: 'DELETE' },
+    )
+    return r.data!
+  },
 
   /** 素材列表 */
-  list: (params: Record<string, string> = {}) => {
+  list: async (params: Record<string, string> = {}): Promise<PageResult<Material>> => {
     const q = new URLSearchParams(params)
-    return request<PageResult<Material>>(`/materials?${q}`)
+    const r = await request<ApiResp<PageResult<Material>>>(`/materials?${q}`)
+    return r.data!
   },
 
   /** 编辑素材 */
-  update: (id: string, body: { title?: string; category_id?: string }) =>
-    request<{ ok: boolean }>(`/materials/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  update: async (id: string, body: { title?: string; category_id?: string }): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/materials/${id}`, {
+      method: 'PUT', body: JSON.stringify(body),
+    })
+    return r.data!
+  },
 
   /** 删除素材 */
-  remove: (id: string, keepFile = false) =>
-    request<{ ok: boolean }>(`/materials/${id}?keep_file=${keepFile}`, { method: 'DELETE' }),
+  remove: async (id: string, keepFile = false): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/materials/${id}?keep_file=${keepFile}`, { method: 'DELETE' },
+    )
+    return r.data!
+  },
 
   /** 分享链接批量导入（异步） */
-  importShare: (shareTexts: string[], categoryId: string, type: 'video' | 'music') =>
-    request<{ task_id: string }>('/materials/import-share', {
+  importShare: async (shareTexts: string[], categoryId: string, type: 'video' | 'music'): Promise<{ task_id: string }> => {
+    const r = await request<ApiResp<{ task_id: string }>>('/materials/import-share', {
       method: 'POST',
       body: JSON.stringify({ share_texts: shareTexts, category_id: categoryId, type }),
-    }),
+    })
+    return r.data!
+  },
 
   /** 分享导入任务列表 */
-  listShareImportTasks: (page = 1, pageSize = 20) =>
-    request<PageResult<{
+  listShareImportTasks: async (page = 1, pageSize = 20): Promise<PageResult<{
+    id: string
+    category_id: string
+    type: 'video' | 'music'
+    category_name?: string | null
+    status: string
+    total: number
+    success_count: number
+    failed_count: number
+    message: string
+    create_time: string
+  }>> => {
+    const r = await request<ApiResp<PageResult<{
       id: string
       category_id: string
       type: 'video' | 'music'
@@ -183,33 +216,66 @@ export const materialApi = {
       failed_count: number
       message: string
       create_time: string
-    }>>(`/materials/import-tasks?page=${page}&page_size=${pageSize}`),
+    }>>>(`/materials/import-tasks?page=${page}&page_size=${pageSize}`)
+    return r.data!
+  },
 
   /** 查询分享导入任务进度 */
-  getShareImportTask: (taskId: string) => request<{
+  getShareImportTask: async (taskId: string): Promise<{
     task: { id: string; category_id: string; type: 'video' | 'music'; status: string; total: number; success_count: number; failed_count: number; message: string; create_time: string }
     items: { id: string; share_text: string; status: string; message: string; retry_count: number; material_id: string | null }[]
-  }>(`/materials/import-tasks/${taskId}`),
+  }> => {
+    const r = await request<ApiResp<{
+      task: { id: string; category_id: string; type: 'video' | 'music'; status: string; total: number; success_count: number; failed_count: number; message: string; create_time: string }
+      items: { id: string; share_text: string; status: string; message: string; retry_count: number; material_id: string | null }[]
+    }>>(`/materials/import-tasks/${taskId}`)
+    return r.data!
+  },
 
   /** 重试分享导入任务中的失败项 */
-  retryShareImportTask: (taskId: string) => request<{ ok: boolean; retry_count: number }>(`/materials/import-tasks/${taskId}/retry`, { method: 'POST' }),
+  retryShareImportTask: async (taskId: string): Promise<{ ok: boolean; retry_count: number }> => {
+    const r = await request<ApiResp<{ ok: boolean; retry_count: number }>>(
+      `/materials/import-tasks/${taskId}/retry`, { method: 'POST' },
+    )
+    return r.data!
+  },
 
   /** 重试单条分享导入失败项 */
-  retryShareImportItem: (taskId: string, itemId: string) => request<{ ok: boolean }>(`/materials/import-tasks/${taskId}/items/${itemId}/retry`, { method: 'POST' }),
+  retryShareImportItem: async (taskId: string, itemId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/materials/import-tasks/${taskId}/items/${itemId}/retry`, { method: 'POST' },
+    )
+    return r.data!
+  },
 
   /** 删除分享导入任务 */
-  deleteShareImportTask: (taskId: string) => request<{ ok: boolean }>(`/materials/import-tasks/${taskId}`, { method: 'DELETE' }),
+  deleteShareImportTask: async (taskId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/materials/import-tasks/${taskId}`, { method: 'DELETE' })
+    return r.data!
+  },
 
   /** 创建本地文件/文件夹上传任务（异步） */
-  upload: (filePaths: string[], categoryId: string) =>
-    request<{ task_id: string }>('/materials/upload', {
+  upload: async (filePaths: string[], categoryId: string): Promise<{ task_id: string }> => {
+    const r = await request<ApiResp<{ task_id: string }>>('/materials/upload', {
       method: 'POST',
       body: JSON.stringify({ file_paths: filePaths, category_id: categoryId }),
-    }),
+    })
+    return r.data!
+  },
 
   /** 上传任务列表 */
-  listUploadTasks: (page = 1, pageSize = 20) =>
-    request<PageResult<{
+  listUploadTasks: async (page = 1, pageSize = 20): Promise<PageResult<{
+    id: string
+    category_id: string
+    category_name?: string | null
+    status: string
+    total: number
+    success_count: number
+    failed_count: number
+    message: string
+    create_time: string
+  }>> => {
+    const r = await request<ApiResp<PageResult<{
       id: string
       category_id: string
       category_name?: string | null
@@ -219,47 +285,86 @@ export const materialApi = {
       failed_count: number
       message: string
       create_time: string
-    }>>(`/materials/upload-tasks?page=${page}&page_size=${pageSize}`),
+    }>>>(`/materials/upload-tasks?page=${page}&page_size=${pageSize}`)
+    return r.data!
+  },
 
   /** 查询上传任务进度 */
-  getUploadTask: (taskId: string) => request<{
+  getUploadTask: async (taskId: string): Promise<{
     task: { id: string; category_id: string; status: string; total: number; success_count: number; failed_count: number; message: string }
     items: { id: string; file_path: string; file_name: string; status: string; message: string; retry_count: number; material_id: string | null }[]
-  }>(`/materials/upload-tasks/${taskId}`),
+  }> => {
+    const r = await request<ApiResp<{
+      task: { id: string; category_id: string; status: string; total: number; success_count: number; failed_count: number; message: string }
+      items: { id: string; file_path: string; file_name: string; status: string; message: string; retry_count: number; material_id: string | null }[]
+    }>>(`/materials/upload-tasks/${taskId}`)
+    return r.data!
+  },
 
   /** 重试上传任务中的失败项 */
-  retryUploadTask: (taskId: string) => request<{ ok: boolean; retry_count: number }>(`/materials/upload-tasks/${taskId}/retry`, { method: 'POST' }),
+  retryUploadTask: async (taskId: string): Promise<{ ok: boolean; retry_count: number }> => {
+    const r = await request<ApiResp<{ ok: boolean; retry_count: number }>>(
+      `/materials/upload-tasks/${taskId}/retry`, { method: 'POST' },
+    )
+    return r.data!
+  },
 
   /** 重试单条上传失败项 */
-  retryUploadItem: (taskId: string, itemId: string) => request<{ ok: boolean }>(`/materials/upload-tasks/${taskId}/items/${itemId}/retry`, { method: 'POST' }),
+  retryUploadItem: async (taskId: string, itemId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/materials/upload-tasks/${taskId}/items/${itemId}/retry`, { method: 'POST' },
+    )
+    return r.data!
+  },
 
   /** 删除上传任务 */
-  deleteUploadTask: (taskId: string) => request<{ ok: boolean }>(`/materials/upload-tasks/${taskId}`, { method: 'DELETE' }),
+  deleteUploadTask: async (taskId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/materials/upload-tasks/${taskId}`, { method: 'DELETE' })
+    return r.data!
+  },
 
   /** 创建视频拉取任务 */
-  createPullTask: (body: {
+  createPullTask: async (body: {
     task_name: string
     conditions: PullConditions
     account_id: string
     category_id: string
     interval: IntervalConfig
-  }) => request<VideoPullTask>('/materials/pull-tasks', { method: 'POST', body: JSON.stringify(body) }),
+  }): Promise<VideoPullTask> => {
+    const r = await request<ApiResp<VideoPullTask>>(
+      '/materials/pull-tasks', { method: 'POST', body: JSON.stringify(body) },
+    )
+    return r.data!
+  },
 
   /** 视频拉取任务列表 */
-  pullTasks: (page = 1, pageSize = 20) =>
-    request<PageResult<VideoPullTask>>(`/materials/pull-tasks?page=${page}&page_size=${pageSize}`),
+  pullTasks: async (page = 1, pageSize = 20): Promise<PageResult<VideoPullTask>> => {
+    const r = await request<ApiResp<PageResult<VideoPullTask>>>(
+      `/materials/pull-tasks?page=${page}&page_size=${pageSize}`,
+    )
+    return r.data!
+  },
 
   /** 视频拉取任务执行日志 */
-  listPullLogs: (taskId: string, page = 1, pageSize = 20) => request<PageResult<{
+  listPullLogs: async (taskId: string, page = 1, pageSize = 20): Promise<PageResult<{
     id: string
     run_time: string
     new_count: number
     skip_count: number
     fail_reason: string | null
-  }>>(`/materials/pull-tasks/${taskId}/logs?page=${page}&page_size=${pageSize}`),
+  }>> => {
+    const r = await request<ApiResp<PageResult<{
+      id: string
+      run_time: string
+      new_count: number
+      skip_count: number
+      fail_reason: string | null
+    }>>>(`/materials/pull-tasks/${taskId}/logs?page=${page}&page_size=${pageSize}`)
+    return r.data!
+  },
 
   /** 拉取执行记录聚合列表（所有任务，按时间倒序，含任务名） */
-  listAllPullLogs: (page = 1, pageSize = 20) => request<PageResult<{
+  listAllPullLogs: async (page = 1, pageSize = 20): Promise<PageResult<{
     id: string
     task_id: string
     task_name: string | null
@@ -267,37 +372,68 @@ export const materialApi = {
     new_count: number
     skip_count: number
     fail_reason: string | null
-  }>>(`/materials/pull-logs?page=${page}&page_size=${pageSize}`),
+  }>> => {
+    const r = await request<ApiResp<PageResult<{
+      id: string
+      task_id: string
+      task_name: string | null
+      run_time: string
+      new_count: number
+      skip_count: number
+      fail_reason: string | null
+    }>>>(`/materials/pull-logs?page=${page}&page_size=${pageSize}`)
+    return r.data!
+  },
 
   /** #351：删除单条拉取执行日志（聚合列表批量删除，前端并发） */
-  deletePullLog: (logId: string) => request<{ ok: boolean }>(`/materials/pull-logs/${logId}`, { method: 'DELETE' }),
+  deletePullLog: async (logId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/materials/pull-logs/${logId}`, { method: 'DELETE' },
+    )
+    return r.data!
+  },
 
   /** 编辑视频拉取任务（全字段，下一轮生效） */
-  updatePullTask: (id: string, body: {
+  updatePullTask: async (id: string, body: {
     task_name: string
     conditions: PullConditions
     account_id: string
     category_id: string
     interval: IntervalConfig
-  }) => request<VideoPullTask>(`/materials/pull-tasks/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  }): Promise<VideoPullTask> => {
+    const r = await request<ApiResp<VideoPullTask>>(
+      `/materials/pull-tasks/${id}`, { method: 'PUT', body: JSON.stringify(body) },
+    )
+    return r.data!
+  },
 
   /** 任务启停 */
-  togglePullTask: (id: string, enabled: boolean) =>
-    request<VideoPullTask>(`/materials/pull-tasks/${id}/toggle`, {
+  togglePullTask: async (id: string, enabled: boolean): Promise<VideoPullTask> => {
+    const r = await request<ApiResp<VideoPullTask>>(`/materials/pull-tasks/${id}/toggle`, {
       method: 'POST',
       body: JSON.stringify({ enabled }),
-    }),
+    })
+    return r.data!
+  },
 
   /** v22 阶梯重置并重新启用：清零 pull_round + total_pulled，重新启用任务。
    *  适用：达 max_count 自动停用后的"重新启用"按钮。仅对 status='disabled' 生效。 */
-  restartPullTask: (id: string) =>
-    request<VideoPullTask>(`/materials/pull-tasks/${id}/restart`, { method: 'POST' }),
+  restartPullTask: async (id: string): Promise<VideoPullTask> => {
+    const r = await request<ApiResp<VideoPullTask>>(`/materials/pull-tasks/${id}/restart`, { method: 'POST' })
+    return r.data!
+  },
 
   /** 手动触发 */
-  runPullTask: (id: string) =>
-    request<{ ok: boolean; bg_task_id: string }>(`/materials/pull-tasks/${id}/run`, { method: 'POST' }),
+  runPullTask: async (id: string): Promise<{ ok: boolean; bg_task_id: string }> => {
+    const r = await request<ApiResp<{ ok: boolean; bg_task_id: string }>>(
+      `/materials/pull-tasks/${id}/run`, { method: 'POST' },
+    )
+    return r.data!
+  },
 
   /** 删除任务 */
-  deletePullTask: (id: string) =>
-    request<{ ok: boolean }>(`/materials/pull-tasks/${id}`, { method: 'DELETE' }),
+  deletePullTask: async (id: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/materials/pull-tasks/${id}`, { method: 'DELETE' })
+    return r.data!
+  },
 }

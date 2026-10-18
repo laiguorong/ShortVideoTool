@@ -10,6 +10,8 @@
 后实际路径是 /api/startup/*。前端 request() 拼 baseUrl 时不要再加 /api 前缀
 （baseUrl 已含），路径直接写 /startup/... 即可。两端任一改路径会立即 404
 （不再是静默路径错位），便于排查。
+
+#publish-contract：成功响应统一包 ApiResp[data] 信封。
 """
 
 import os
@@ -20,19 +22,24 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.core import startup_state
+from app.models.common import ok
 from app.services.setting_service import init_data_dir, save_settings
 
 router = APIRouter(prefix="/startup", tags=["startup"])
 
 
 @router.get("/state", summary="拉取所有启动检查步骤的当前状态")
-def get_state() -> dict:
-    """前端页面刷新 / 重新挂载时拉取，避免每步都跑一次。"""
-    return {key: result.to_dict() for key, result in startup_state.get_all().items()}
+def get_state():
+    """前端页面刷新 / 重新挂载时拉取，避免每步都跑一次。
+
+    #fix: 不显式声明 -> dict（FastAPI 会推断 response_model=dict，
+    # 与 ok() 返回的 ApiResp 模型冲突，触发 dict_type 校验失败 500）。
+    """
+    return ok({key: result.to_dict() for key, result in startup_state.get_all().items()})
 
 
 @router.post("/check/{key}", summary="执行某步启动检查")
-def check_step(key: str) -> dict:
+def check_step(key: str):
     """执行 startup_state.check(key)。
 
     - 已 ok：返缓存（禁止重复调用）
@@ -40,7 +47,7 @@ def check_step(key: str) -> dict:
     - 未注册：返 failed
     """
     result = startup_state.check(key)
-    return result.to_dict()
+    return ok(result.to_dict())
 
 
 class SetDataDirBody(BaseModel):
@@ -109,7 +116,7 @@ def _rollback_settings_data_dir(old_value: str | None) -> None:
 
 
 @router.post("/data-dir", summary="设置数据目录（步骤 2 用户选完路径调）")
-def set_data_dir(body: SetDataDirBody) -> dict:
+def set_data_dir(body: SetDataDirBody):
     """初始化新数据目录 + 持久化到 settings.json + 清下游步骤缓存。
 
     步骤 2 用户在启动页选完路径 → 前端调此端点 → 前端再 POST /api/startup/check/data_dir。
@@ -158,4 +165,4 @@ def set_data_dir(body: SetDataDirBody) -> dict:
         _rollback_settings_data_dir(old_data_dir)
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
-    return {"ok": True, "data_dir": str(p)}
+    return ok({"ok": True, "data_dir": str(p)})

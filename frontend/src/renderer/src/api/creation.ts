@@ -1,4 +1,4 @@
-import { request, type PageResult } from './client'
+import { request, type PageResult, type ApiResp } from './client'
 
 /** 片段 */
 export interface Clip {
@@ -119,46 +119,83 @@ export interface TextPoolEntry {
 
 export const creationApi = {
   /** 项目 CRUD */
-  createProject: (title: string, width?: number, height?: number, fitMode?: string) =>
-    request<Project>('/creation/projects', {
+  createProject: async (title: string, width?: number, height?: number, fitMode?: string): Promise<Project> => {
+    const r = await request<ApiResp<Project>>('/creation/projects', {
       method: 'POST',
       body: JSON.stringify({ title, width, height, fit_mode: fitMode }),
-    }),
-  listProjects: (page = 1, pageSize = 20) =>
-    request<PageResult<ProjectRow>>(`/creation/projects?page=${page}&page_size=${pageSize}`),
+    })
+    return r.data!
+  },
+  listProjects: async (page = 1, pageSize = 20): Promise<PageResult<ProjectRow>> => {
+    const r = await request<ApiResp<PageResult<ProjectRow>>>(
+      `/creation/projects?page=${page}&page_size=${pageSize}`,
+    )
+    return r.data!
+  },
   /** #426：画幅预设列表（横竖屏/分辨率） */
-  resolutionPresets: () =>
-    request<Array<{ key: string; w: number; h: number; label: string }>>(
-      '/creation/resolution-presets'),
-  getProject: (id: string) => request<Project>(`/creation/projects/${id}`),
-  updateProject: (id: string, body: Partial<{
+  resolutionPresets: async (): Promise<Array<{ key: string; w: number; h: number; label: string }>> => {
+    const r = await request<ApiResp<Array<{ key: string; w: number; h: number; label: string }>>>(
+      '/creation/resolution-presets',
+    )
+    return r.data!
+  },
+  getProject: async (id: string): Promise<Project> => {
+    const r = await request<ApiResp<Project>>(`/creation/projects/${id}`)
+    return r.data!
+  },
+  updateProject: async (id: string, body: Partial<{
     title: string; bgm_strategy: string; dedup_rules: Record<string, unknown>;
     output_resolution: string; keep_original_audio: boolean; bgm_volume: number;
     fit_mode: 'cover' | 'contain' | 'fill' | 'blur_bg';
-  }>) =>
-    request<Project>(`/creation/projects/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
-  copyProject: (id: string, newTitle: string) =>
-    request<Project>(`/creation/projects/${id}/copy`, { method: 'POST', body: JSON.stringify({ new_title: newTitle }) }),
-  deleteProject: (id: string, deleteFiles: boolean) =>
-    request<{ ok: boolean }>(`/creation/projects/${id}?delete_files=${deleteFiles}`, { method: 'DELETE' }),
+  }>): Promise<Project> => {
+    const r = await request<ApiResp<Project>>(`/creation/projects/${id}`, {
+      method: 'PUT', body: JSON.stringify(body),
+    })
+    return r.data!
+  },
+  copyProject: async (id: string, newTitle: string): Promise<Project> => {
+    const r = await request<ApiResp<Project>>(
+      `/creation/projects/${id}/copy`,
+      { method: 'POST', body: JSON.stringify({ new_title: newTitle }) },
+    )
+    return r.data!
+  },
+  deleteProject: async (id: string, deleteFiles: boolean): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/projects/${id}?delete_files=${deleteFiles}`, { method: 'DELETE' },
+    )
+    return r.data!
+  },
 
   /** 分镜 */
-  addShot: (projectId: string, name = '', afterShotId?: string, beforeShotId?: string) =>
-    request<Shot>(`/creation/projects/${projectId}/shots`, {
+  addShot: async (projectId: string, name = '', afterShotId?: string, beforeShotId?: string): Promise<Shot> => {
+    const r = await request<ApiResp<Shot>>(`/creation/projects/${projectId}/shots`, {
       method: 'POST',
       body: JSON.stringify({
         name, after_shot_id: afterShotId || null, before_shot_id: beforeShotId || null,
       }),
-    }),
-  renameShot: (shotId: string, name: string) =>
-    request<{ ok: boolean }>(`/creation/shots/${shotId}/rename`, { method: 'PUT', body: JSON.stringify({ name }) }),
-  moveShot: (shotId: string, direction: 'up' | 'down') =>
-    request<{ ok: boolean }>(`/creation/shots/${shotId}/move`, { method: 'POST', body: JSON.stringify({ direction }) }),
-  deleteShot: (shotId: string) =>
-    request<{ ok: boolean }>(`/creation/shots/${shotId}`, { method: 'DELETE' }),
+    })
+    return r.data!
+  },
+  renameShot: async (shotId: string, name: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/shots/${shotId}/rename`, { method: 'PUT', body: JSON.stringify({ name }) },
+    )
+    return r.data!
+  },
+  moveShot: async (shotId: string, direction: 'up' | 'down'): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/shots/${shotId}/move`, { method: 'POST', body: JSON.stringify({ direction }) },
+    )
+    return r.data!
+  },
+  deleteShot: async (shotId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/creation/shots/${shotId}`, { method: 'DELETE' })
+    return r.data!
+  },
 
   /** 片段 */
-  addClips: (body: {
+  addClips: async (body: {
     project_id: string
     material_ids: string[]
     cut_mode: 'whole' | 'fixed' | 'scene' | 'trim_after'
@@ -167,38 +204,72 @@ export const creationApi = {
     trim_tail_s?: number
     min_clip_seconds?: number
     target_shot_ids?: string[]
-  }) =>
-    request<{ clip_count: number; skipped: number; per_shot: Record<string, number>; bg_task_id: string }>(
+  }): Promise<{ clip_count: number; skipped: number; per_shot: Record<string, number>; bg_task_id: string }> => {
+    const r = await request<ApiResp<{ clip_count: number; skipped: number; per_shot: Record<string, number>; bg_task_id: string }>>(
       '/creation/shots/add-clips', { method: 'POST', body: JSON.stringify(body) },
-    ),
-  moveClip: (clipId: string, targetShotId: string) =>
-    request<{ ok: boolean }>(`/creation/clips/${clipId}/move`, {
-      method: 'POST', body: JSON.stringify({ target_shot_id: targetShotId }),
-    }),
-  reorderClips: (shotId: string, clipIds: string[]) =>
-    request<{ ok: boolean }>(`/creation/shots/${shotId}/reorder-clips`, {
-      method: 'POST', body: JSON.stringify({ clip_ids: clipIds }),
-    }),
-  deleteClip: (clipId: string) =>
-    request<{ ok: boolean }>(`/creation/clips/${clipId}`, { method: 'DELETE' }),
-  mirrorClip: (clipId: string) =>
-    request<Clip>(`/creation/clips/${clipId}/mirror`, { method: 'POST' }),
+    )
+    return r.data!
+  },
+  moveClip: async (clipId: string, targetShotId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/clips/${clipId}/move`,
+      { method: 'POST', body: JSON.stringify({ target_shot_id: targetShotId }) },
+    )
+    return r.data!
+  },
+  reorderClips: async (shotId: string, clipIds: string[]): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/shots/${shotId}/reorder-clips`,
+      { method: 'POST', body: JSON.stringify({ clip_ids: clipIds }) },
+    )
+    return r.data!
+  },
+  deleteClip: async (clipId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/creation/clips/${clipId}`, { method: 'DELETE' })
+    return r.data!
+  },
+  mirrorClip: async (clipId: string): Promise<Clip> => {
+    const r = await request<ApiResp<Clip>>(`/creation/clips/${clipId}/mirror`, { method: 'POST' })
+    return r.data!
+  },
   /** 批量操作：delete / mirror / move / retry_render（#57） */
-  batchClips: (body: { clip_ids: string[]; action: 'delete' | 'mirror' | 'move' | 'retry_render'; target_shot_id?: string }) =>
-    request<{ ok: boolean; affected: number; failed: { clip_id: string; reason: string }[] }>(
-      '/creation/clips/batch', { method: 'POST', body: JSON.stringify(body) }),
+  batchClips: async (body: { clip_ids: string[]; action: 'delete' | 'mirror' | 'move' | 'retry_render'; target_shot_id?: string }): Promise<{ ok: boolean; affected: number; failed: { clip_id: string; reason: string }[] }> => {
+    const r = await request<ApiResp<{ ok: boolean; affected: number; failed: { clip_id: string; reason: string }[] }>>(
+      '/creation/clips/batch', { method: 'POST', body: JSON.stringify(body) },
+    )
+    return r.data!
+  },
   /** 重新渲染片段文件（失败重试 / 缩略图恢复） */
-  renderClip: (clipId: string) =>
-    request<Clip>(`/creation/clips/${clipId}/render`, { method: 'POST' }),
+  renderClip: async (clipId: string): Promise<Clip> => {
+    const r = await request<ApiResp<Clip>>(`/creation/clips/${clipId}/render`, { method: 'POST' })
+    return r.data!
+  },
   /** #399：按素材批量删除项目内片段（含落盘文件，保留素材库本身） */
-  deleteClipsByMaterials: (projectId: string, materialIds: string[]) =>
-    request<{ ok: boolean; deleted: number }>(
+  deleteClipsByMaterials: async (projectId: string, materialIds: string[]): Promise<{ ok: boolean; deleted: number }> => {
+    const r = await request<ApiResp<{ ok: boolean; deleted: number }>>(
       `/creation/projects/${projectId}/delete-by-materials`,
       { method: 'POST', body: JSON.stringify({ material_ids: materialIds }) },
-    ),
+    )
+    return r.data!
+  },
   /** 差异轮询：返 rev > since_rev 的片段状态（#轮询优化） */
-  clipsStatus: (projectId: string, sinceRev: number) =>
-    request<{
+  clipsStatus: async (projectId: string, sinceRev: number): Promise<{
+    clips: Array<{
+      id: string
+      shot_id: string
+      file_path: string
+      thumb_path: string | null
+      file_status: 'pending' | 'ready' | 'failed' | null
+      fail_reason: string | null
+      rev: number | null
+    }>
+    max_rev: number
+    pending: number
+    failed: number
+    /** #408：项目级"分切处理中"状态（pending > 0），前端顶部警示与轮询决策用 */
+    cutting: boolean
+  }> => {
+    const r = await request<ApiResp<{
       clips: Array<{
         id: string
         shot_id: string
@@ -211,38 +282,65 @@ export const creationApi = {
       max_rev: number
       pending: number
       failed: number
-      /** #408：项目级"分切处理中"状态（pending > 0），前端顶部警示与轮询决策用 */
       cutting: boolean
-    }>(`/creation/projects/${projectId}/clips-status?since_rev=${sinceRev}`),
+    }>>(`/creation/projects/${projectId}/clips-status?since_rev=${sinceRev}`)
+    return r.data!
+  },
 
   /** BGM（音量走项目级） */
-  addBgms: (projectId: string, materialIds: string[]) =>
-    request<{ ok: boolean; added: number }>(`/creation/projects/${projectId}/bgms`, {
-      method: 'POST', body: JSON.stringify({ material_ids: materialIds }),
-    }),
-  removeBgm: (projectId: string, materialId: string) =>
-    request<{ ok: boolean }>(`/creation/projects/${projectId}/bgms?material_id=${materialId}`, { method: 'DELETE' }),
-  listBgms: (projectId: string) => request<BgmItem[]>(`/creation/projects/${projectId}/bgms`),
+  addBgms: async (projectId: string, materialIds: string[]): Promise<{ ok: boolean; added: number }> => {
+    const r = await request<ApiResp<{ ok: boolean; added: number }>>(
+      `/creation/projects/${projectId}/bgms`,
+      { method: 'POST', body: JSON.stringify({ material_ids: materialIds }) },
+    )
+    return r.data!
+  },
+  removeBgm: async (projectId: string, materialId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/projects/${projectId}/bgms?material_id=${materialId}`, { method: 'DELETE' },
+    )
+    return r.data!
+  },
+  listBgms: async (projectId: string): Promise<BgmItem[]> => {
+    const r = await request<ApiResp<BgmItem[]>>(`/creation/projects/${projectId}/bgms`)
+    return r.data!
+  },
 
   /** 文案池 */
-  listTextPool: (poolType: 'title' | 'topic', scope: 'global' | 'project', projectId = '') =>
-    request<TextPoolEntry[]>(`/creation/text-pool?pool_type=${poolType}&scope=${scope}&project_id=${projectId}`),
-  addTextPool: (contents: string[], scope: 'global' | 'project', projectId?: string) =>
-    request<{ ok: boolean; added: number }>('/creation/text-pool', {
-      method: 'POST', body: JSON.stringify({ contents, scope, project_id: projectId }),
-    }),
-  deleteTextPool: (entryId: string) =>
-    request<{ ok: boolean }>(`/creation/text-pool/${entryId}`, { method: 'DELETE' }),
+  listTextPool: async (poolType: 'title' | 'topic', scope: 'global' | 'project', projectId = ''): Promise<TextPoolEntry[]> => {
+    const r = await request<ApiResp<TextPoolEntry[]>>(
+      `/creation/text-pool?pool_type=${poolType}&scope=${scope}&project_id=${projectId}`,
+    )
+    return r.data!
+  },
+  addTextPool: async (contents: string[], scope: 'global' | 'project', projectId?: string): Promise<{ ok: boolean; added: number }> => {
+    const r = await request<ApiResp<{ ok: boolean; added: number }>>(
+      '/creation/text-pool',
+      { method: 'POST', body: JSON.stringify({ contents, scope, project_id: projectId }) },
+    )
+    return r.data!
+  },
+  deleteTextPool: async (entryId: string): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(`/creation/text-pool/${entryId}`, { method: 'DELETE' })
+    return r.data!
+  },
 
   /** 生成与成品 */
-  generate: (projectId: string, count: number) =>
-    request<{ generate_task_id: string; bg_task_id: string; plan_count: number }>(
+  generate: async (projectId: string, count: number): Promise<{ generate_task_id: string; bg_task_id: string; plan_count: number }> => {
+    const r = await request<ApiResp<{ generate_task_id: string; bg_task_id: string; plan_count: number }>>(
       `/creation/projects/${projectId}/generate`, { method: 'POST', body: JSON.stringify({ count }) },
-    ),
-  listVideos: (params: { project_id?: string; status?: string; page?: number; page_size?: number } = {}) => {
-    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v) as [string, string][])
-    return request<PageResult<GeneratedVideo>>(`/creation/videos?${q}`)
+    )
+    return r.data!
   },
-  deleteVideo: (videoId: string, keepFile = false) =>
-    request<{ ok: boolean }>(`/creation/videos/${videoId}?keep_file=${keepFile}`, { method: 'DELETE' }),
+  listVideos: async (params: { project_id?: string; status?: string; page?: number; page_size?: number } = {}): Promise<PageResult<GeneratedVideo>> => {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v) as [string, string][])
+    const r = await request<ApiResp<PageResult<GeneratedVideo>>>(`/creation/videos?${q}`)
+    return r.data!
+  },
+  deleteVideo: async (videoId: string, keepFile = false): Promise<{ ok: boolean }> => {
+    const r = await request<ApiResp<{ ok: boolean }>>(
+      `/creation/videos/${videoId}?keep_file=${keepFile}`, { method: 'DELETE' },
+    )
+    return r.data!
+  },
 }

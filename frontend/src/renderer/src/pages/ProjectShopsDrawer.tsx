@@ -11,7 +11,7 @@ import { Dialog, ConfirmDialog } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toast'
 import { cn } from '@/lib/utils'
 import { selectionApi, type Shop } from '@/api/selection'
-import { publishIntroApi, type ProjectShopItem } from '@/api/publish_intro'
+import { publishIntroApi, type ProjectShopItem } from '@/api/publish'
 
 interface Props {
   project: { id: string; title: string } | null

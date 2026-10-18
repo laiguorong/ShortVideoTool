@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+from fastapi import HTTPException
+from fastapi import HTTPException
 from loguru import logger
 
 from app.core import video_edit, notifier
@@ -88,7 +90,7 @@ def get_project(project_id: str) -> dict:
     d = get_db()
     row = d.query_one("SELECT * FROM project WHERE id=? AND deleted=0", (project_id,))
     if not row:
-        raise ValueError("项目不存在")
+        raise HTTPException(status_code=404, detail="项目不存在")
     row["shots"] = list_shots(project_id)
     row["bgm_count"] = d.query_one(
         "SELECT COUNT(*) AS c FROM project_bgm WHERE project_id=?", (project_id,))["c"]
@@ -149,6 +151,12 @@ def update_project(project_id: str, title: str | None, bgm_strategy: str | None,
         fit_mode: #多画面适配 cover/contain/fill/blur_bg（项目内可改）
         width / height / output_resolution: #427 项目画幅；创建后锁定，update_project 忽略
     """
+    # 存在性预检（#fix-status-404）：先校验项目是否存在，缺失返 404（资源不存在语义）
+    # 之前末尾用 return get_project(project_id) 兜底，缺资源返 400（业务错误）—— 状态码不标准
+    d = get_db()
+    if not d.query_one("SELECT id FROM project WHERE id=? AND deleted=0", (project_id,)):
+        raise HTTPException(status_code=404, detail="项目不存在")
+
     fields: dict = {}
     if title is not None:
         fields["title"] = title
@@ -190,7 +198,7 @@ def delete_project(project_id: str, delete_files: bool) -> None:
     """
     d = get_db()
     if not d.query_one("SELECT id FROM project WHERE id=? AND deleted=0", (project_id,)):
-        raise ValueError("项目不存在")
+        raise HTTPException(status_code=404, detail="项目不存在")
     if delete_files:
         finished_dir = get_data_dir() / "finished" / project_id
         if finished_dir.exists():
@@ -205,6 +213,9 @@ def delete_project(project_id: str, delete_files: bool) -> None:
 def copy_project(project_id: str, new_title: str) -> dict:
     """复制项目（分镜/片段/BGM/文案池全拷贝，游标重置）。"""
     d = get_db()
+    # 存在性预检（#fix-status-404）：缺资源返 404 而非 400
+    if not d.query_one("SELECT id FROM project WHERE id=? AND deleted=0", (project_id,)):
+        raise HTTPException(status_code=404, detail="项目不存在")
     src = get_project(project_id)
     new_id_ = d.insert("project", {
         "title": new_title,
@@ -344,7 +355,7 @@ def add_shot(project_id: str, name: str = "", after_shot_id: str | None = None,
     """
     d = get_db()
     if not d.query_one("SELECT id FROM project WHERE id=? AND deleted=0", (project_id,)):
-        raise ValueError("项目不存在")
+        raise HTTPException(status_code=404, detail="项目不存在")
     count = d.query_one(
         "SELECT COUNT(*) AS c FROM project_shot WHERE project_id=?", (project_id,))["c"]
     if count >= MAX_SHOTS:
@@ -356,7 +367,7 @@ def add_shot(project_id: str, name: str = "", after_shot_id: str | None = None,
             "SELECT * FROM project_shot WHERE id=? AND project_id=?",
             (anchor_id, project_id))
         if not anchor:
-            raise ValueError("参照分镜不存在")
+            raise HTTPException(status_code=404, detail="参照分镜不存在")
         # before：占用该分镜的位置，它及其后整体后移；after：插到其后
         order = anchor["sort_order"] + (1 if after_shot_id else 0)
         d.execute(
@@ -384,7 +395,7 @@ def move_shot(shot_id: str, direction: str) -> None:
     d = get_db()
     shot = d.query_one("SELECT * FROM project_shot WHERE id=?", (shot_id,))
     if not shot:
-        raise ValueError("分镜不存在")
+        raise HTTPException(status_code=404, detail="分镜不存在")
     delta = -1 if direction == "up" else 1
     neighbor = d.query_one(
         "SELECT * FROM project_shot WHERE project_id=? AND sort_order=?",
@@ -400,7 +411,7 @@ def delete_shot(shot_id: str) -> None:
     d = get_db()
     shot = d.query_one("SELECT * FROM project_shot WHERE id=?", (shot_id,))
     if not shot:
-        raise ValueError("分镜不存在")
+        raise HTTPException(status_code=404, detail="分镜不存在")
     clip_rows = d.query_all("SELECT * FROM project_shot_clip WHERE shot_id=?", (shot_id,))
     d.execute("DELETE FROM project_shot_clip WHERE shot_id=?", (shot_id,))
     d.execute("DELETE FROM project_shot WHERE id=?", (shot_id,))
@@ -558,7 +569,7 @@ def add_clips_from_materials(project_id: str, material_ids: list[str],
     project_row = d.query_one(
         "SELECT width, height FROM project WHERE id=? AND deleted=0", (project_id,))
     if not project_row:
-        raise ValueError("项目不存在")
+        raise HTTPException(status_code=404, detail="项目不存在")
 
     # #429：按项目画幅过滤素材 orientation
     # 竖屏项目（h>w）只用 vertical 素材；横屏项目（w>h）只用 horizontal 素材；
@@ -1430,7 +1441,7 @@ def reorder_clips(shot_id: str, ordered_clip_ids: list[str]) -> None:
     """
     d = get_db()
     if not d.query_one("SELECT id FROM project_shot WHERE id=?", (shot_id,)):
-        raise ValueError("分镜不存在")
+        raise HTTPException(status_code=404, detail="分镜不存在")
     # 校验片段均属本分镜
     own = {r["id"] for r in d.query_all(
         "SELECT id FROM project_shot_clip WHERE shot_id=?", (shot_id,))}
@@ -1445,7 +1456,7 @@ def move_clip(clip_id: str, target_shot_id: str) -> None:
     """片段移动到其他分镜（追加到目标分镜末尾）。"""
     d = get_db()
     if not d.query_one("SELECT id FROM project_shot WHERE id=?", (target_shot_id,)):
-        raise ValueError("目标分镜不存在")
+        raise HTTPException(status_code=404, detail="目标分镜不存在")
     _check_clip_limit(target_shot_id, 1)
     next_order = d.query_one(
         "SELECT COALESCE(MAX(sort_order),-1)+1 AS o FROM project_shot_clip WHERE shot_id=?",
@@ -1521,7 +1532,7 @@ def mirror_clip(clip_id: str) -> dict:
     d = get_db()
     clip = d.query_one("SELECT * FROM project_shot_clip WHERE id=?", (clip_id,))
     if not clip:
-        raise ValueError("片段不存在")
+        raise HTTPException(status_code=404, detail="片段不存在")
     if clip["file_status"] != "ready" or not clip["file_path"]:
         raise ValueError("片段未就绪，无法镜像（请先完成分割）")
     d.update_by_id("project_shot_clip", clip_id, {
@@ -1543,7 +1554,7 @@ def render_clip(clip_id: str) -> dict:
     d = get_db()
     clip = d.query_one("SELECT * FROM project_shot_clip WHERE id=?", (clip_id,))
     if not clip:
-        raise ValueError("片段不存在")
+        raise HTTPException(status_code=404, detail="片段不存在")
     d.update_by_id("project_shot_clip", clip_id,
                    {"file_status": "pending", "fail_reason": None})
     _spawn_clip_retry(clip_id)
@@ -1656,7 +1667,7 @@ def batch_clips(clip_ids: list[str], action: str,
         if not target_shot_id:
             raise ValueError("移动需指定目标分镜")
         if not get_db().query_one("SELECT id FROM project_shot WHERE id=?", (target_shot_id,)):
-            raise ValueError("目标分镜不存在")
+            raise HTTPException(status_code=404, detail="目标分镜不存在")
 
     affected = 0
     failed: list[dict] = []
@@ -2079,7 +2090,7 @@ def create_generate_task(project_id: str, count: int) -> dict:
     d = get_db()
     project = d.query_one("SELECT * FROM project WHERE id=? AND deleted=0", (project_id,))
     if not project:
-        raise ValueError("项目不存在")
+        raise HTTPException(status_code=404, detail="项目不存在")
     # 入参基本校验（前置；先于 available 校验，避免 count=0 误报"素材池耗尽"）
     if count < 1:
         raise ValueError("本批生成数量至少 1 条")
@@ -2508,7 +2519,7 @@ def delete_generated_video(video_id: str, keep_file: bool) -> None:
     d = get_db()
     row = d.query_one("SELECT * FROM generated_video WHERE id=?", (video_id,))
     if not row:
-        raise ValueError("成品不存在")
+        raise HTTPException(status_code=404, detail="成品不存在")
     if row["status"] == "occupied":
         raise ValueError("成品已被发布占用，需先取消对应发布明细")
     if not keep_file:

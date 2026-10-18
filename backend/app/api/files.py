@@ -47,9 +47,9 @@ def _parse_range(range_header: str, size: int) -> tuple[int, int] | None:
     """解析单段 Range 请求头，返回闭区间 (start, end)；无法识别时返回 None。
 
     支持的三种形式：
-        bytes=100-200  指定起止
-        bytes=100-     从 100 到文件末尾
-        bytes=-500     最后 500 字节
+    bytes=100-200  指定起止
+    bytes=100-     从 100 到文件末尾
+    bytes=-500     最后 500 字节
     多段（含逗号）或非法值一律返回 None，由调用方退化为整文件响应。
     """
     if not range_header or not range_header.startswith("bytes=") or "," in range_header:
@@ -115,8 +115,8 @@ def get_file(rel_path: str, request: Request):
     # _stream_file 严格按闭区间读到 remaining=0，确保 yield 字节数 == Content-Length，
     # 避免大文件流式途中断导致 ERR_CONTENT_LENGTH_MISMATCH。
     return StreamingResponse(
-        _stream_file(file_path, start, end), status_code=206, media_type=media_type,
-        headers={
+    _stream_file(file_path, start, end), status_code=206, media_type=media_type,
+    headers={
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(end - start + 1),

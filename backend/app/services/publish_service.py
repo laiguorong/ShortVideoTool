@@ -912,6 +912,7 @@ def _preview_video_dir(payload: dict) -> dict:
             "by_account": stats.by_account,
             "by_project": stats.by_directory,
         },
+        "task_id": None,
         "validation": {"warnings": [], "has_warnings": False},
     }
 
@@ -1398,11 +1399,19 @@ def preview_task_direct(payload: dict) -> dict:
         p.get("project_id", ""): (p.get("project_title") or "")
         for p in (payload.get("projects") or [])
     }
+    # #453 修复：原 zip(shop_ids, shop_names) 以最短列表截断——遗留任务只存 shop_ids 时
+    # 店名会全空。改为按 shop_ids 索引构造，shop_names 缺失时回源 shop 表补齐。
+    all_preview_shop_ids: list[str] = []
+    for _p in (payload.get("projects") or []):
+        all_preview_shop_ids.extend(_p.get("shop_ids") or [])
+    preview_shop_lookup = _batch_shop_basic(all_preview_shop_ids)
     shop_name_map: dict[str, str] = {}
-    for p in (payload.get("projects") or []):
-        for sid, sname in zip(p.get("shop_ids") or [], p.get("shop_names") or []):
-            if sid and sname and sid not in shop_name_map:
-                shop_name_map[sid] = sname
+    for _p in (payload.get("projects") or []):
+        _snames = _p.get("shop_names") or []
+        for _i, _sid in enumerate(_p.get("shop_ids") or []):
+            _name = _snames[_i] if _i < len(_snames) else (preview_shop_lookup.get(_sid) or {}).get("name", "")
+            if _sid and _name and _sid not in shop_name_map:
+                shop_name_map[_sid] = _name
     # 软校验（账号存在/项目存在/时间窗；店/intro 业务属性不卡）
     _soft_validate_payload(payload)
     # 构造 ProjectSpec + 收集 warnings
@@ -1482,6 +1491,7 @@ def preview_task_direct(payload: dict) -> dict:
             "by_account": stats.by_account,
             "by_project": stats.by_project,
         },
+        "task_id": None,
         "validation": {"warnings": warnings, "has_warnings": bool(warnings)},
     }
 
@@ -1734,11 +1744,11 @@ def confirm_task_direct(payload: dict) -> dict:
     return {"task_id": task_id, "item_count": inserted, "running": True}
 
 
-def _build_account_labels(account_ids: list[str]) -> list[str]:
-    """按 account_ids 顺序查 account 表填 nickname/remark（duplicate_task 复制时填 account_labels 字段）。
+def _build_account_snapshots(account_ids: list[str]) -> list[dict]:
+    """按 account_ids 顺序查 account 表填 nickname/remark（duplicate_task 复制时填 account_snapshots 字段）。
 
     publish_task 表不存 account snapshots（运行时数据），duplicate_task 必须主动拼才能让
-    复制后的 DraftRequest.account_labels 有可读账号名（前端 wizard 显示用）。
+    复制后的向导 payload 含可读账号名（前端 wizard 显示用）。返回新形态 [{id,nickname,remark}]。
     """
     if not account_ids:
         return []
@@ -1749,32 +1759,106 @@ def _build_account_labels(account_ids: list[str]) -> list[str]:
         tuple(account_ids))
     by_id = {r["id"]: r for r in rows}
     return [
-        (lambda a: (a.get("nickname") or a.get("remark") or ""))(by_id[aid])
-        if aid in by_id else ""
+        {
+            "id": aid,
+            "nickname": (by_id[aid].get("nickname") if aid in by_id else None),
+            "remark": (by_id[aid].get("remark") if aid in by_id else None),
+        }
         for aid in account_ids
     ]
 
 
+def _safe_json_list(raw: object) -> list[str]:
+    """intro_topics 旧形态存 JSON 字符串（如 '["#A0"]'）→ list[str]；解析失败返回空列表。"""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    try:
+        parsed = json.loads(raw)
+        return [str(x) for x in parsed] if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _batch_shop_basic(shop_ids: list[str]) -> dict:
+    """一次性从 shop 表取 {id: {"name","city","poi_id"}}，用于补齐遗留任务缺失的门店属性。
+
+    #453 遗留 bug 修复：#450 前创建的任务在 projects_payload_json 只存了 shop_ids
+    （无 shop_names/shop_cities/shop_poi_ids），复制/编辑回显时门店 name/city/poi_id 应回源补齐。
+    """
+    if not shop_ids:
+        return {}
+    d = get_db()
+    marks = ",".join("?" * len(shop_ids))
+    rows = d.query_all(
+        f"SELECT id, name, city, poi_id FROM shop WHERE id IN ({marks}) AND deleted=0",
+        tuple(shop_ids),
+    )
+    return {
+        r["id"]: {
+            "name": r.get("name") or "",
+            "city": r.get("city") or "",
+            "poi_id": r.get("poi_id") or "",
+        }
+        for r in rows
+    }
+
+
+def _project_payload_to_snapshot(pp: dict, shop_lookup: dict | None = None) -> dict:
+    """旧形 projects_payload 单条 → 新形 project_snapshot（#453 修复 zip 塌空 bug）。
+
+    原实现用 `zip(shop_ids, shop_names, ...)` 按最短列表截断：遗留任务只存了 shop_ids
+    （平行数组缺失/为空），zip 即塌成 0 个元组 → 复制/编辑门店与简介回显全空。
+    改为按 shop_ids 索引构造，缺失的并行字段用 shop_lookup（shop 表）补齐；
+    intro 仅 id 可补（content/topics 无独立存储，遗留任务缺失则留空）。
+    """
+    shop_ids = pp.get("shop_ids") or []
+    shop_names = pp.get("shop_names") or []
+    shop_cities = pp.get("shop_cities") or []
+    shop_poi_ids = pp.get("shop_poi_ids") or []
+    intro_ids = pp.get("intro_ids") or []
+    intro_contents = pp.get("intro_contents") or []
+    intro_topics_raw = pp.get("intro_topics") or []
+    lookup = shop_lookup or {}
+    shops = []
+    for i, sid in enumerate(shop_ids):
+        basic = lookup.get(sid) or {}
+        shops.append({
+            "id": sid,
+            "name": shop_names[i] if i < len(shop_names) else basic.get("name", ""),
+            "city": shop_cities[i] if i < len(shop_cities) else basic.get("city", ""),
+            "poi_id": shop_poi_ids[i] if i < len(shop_poi_ids) else basic.get("poi_id", ""),
+        })
+    intros = []
+    for i, iid in enumerate(intro_ids):
+        topics = intro_topics_raw[i] if i < len(intro_topics_raw) else None
+        intros.append({
+            "id": iid,
+            "content": intro_contents[i] if i < len(intro_contents) else "",
+            "topics": _safe_json_list(topics) if topics is not None else [],
+        })
+    return {
+        "id": pp.get("project_id", ""),
+        "title": pp.get("project_title", ""),
+        "shops": shops,
+        "intros": intros,
+        "introMode": pp.get("intro_mode", "list"),
+    }
+
+
 def duplicate_task(task_id: str) -> dict:
-    """复制任务为向导 payload（#453 改）：不写库，返回等价 DraftRequest 让前端 wizard 回显。
+    """复制任务为向导 payload（#453 改 / #publish-contract 统一新形态）：不写库，返回新形态
+    project_snapshots / account_snapshots 让前端 wizard 回显（与首建 buildDraftPayload 形态一致）。
 
     用户在 wizard 里修改后点确认 → 走 confirm_task_direct 创建新任务（status=running）。
-
-    不限状态：running / paused / draft / finished / cancelled 均可复制。
-    源任务不受影响，原 publish_task 行不被改动。
-
-    返回结构（前端 PublishWizardDialog initialPayload 直接消费）：
-        {
-            "payload": { ...DraftRequest 字段... }
-        }
+    不限状态：running / paused / draft / finished / cancelled 均可复制。源任务不受影响。
     """
     d = get_db()
     src = d.query_one("SELECT * FROM publish_task WHERE id=? AND deleted=0", (task_id,))
     if not src:
         raise ValueError("源任务不存在")
-    # #453：不再过滤状态（运行中/暂停也可复制——前端 wizard 允许用户在确认前调整时间窗/账号）
     projects_payload = json.loads(src.get("projects_payload_json") or "[]")
-    # #fix-intro-mode-roundtrip：老数据没 intro_mode 字段时默认 'list'（保持历史行为——不命中）
     for _pp in projects_payload:
         if "intro_mode" not in _pp:
             _pp["intro_mode"] = "list"
@@ -1786,22 +1870,27 @@ def duplicate_task(task_id: str) -> dict:
         else (int(src["same_project_interval_min"]) if src.get("same_project_interval_min") is not None
               else _DEFAULT_BALANCED_STEP)
     )
+    account_ids = json.loads(src["account_ids_json"] or "[]")
+    account_snapshots = _build_account_snapshots(account_ids)
+    # 收集全部 shop_id 一次性回源补齐遗留任务缺失的 name/city/poi_id（#453 修复）
+    all_shop_ids: list[str] = []
+    for _pp in projects_payload:
+        all_shop_ids.extend(_pp.get("shop_ids") or [])
+    # #453 去重：同一门店可能跨多个项目重复出现，dict.fromkeys 收紧占位符数量
+    all_shop_ids = list(dict.fromkeys(all_shop_ids))
+    shop_lookup = _batch_shop_basic(all_shop_ids)
+    project_snapshots = [_project_payload_to_snapshot(pp, shop_lookup) for pp in projects_payload]
     payload = {
         "task_name": f"{src['task_name']}_副本",
-        "projects": projects_payload,  # 直接给前端，wizard step 3 解码
-        "account_ids": json.loads(src["account_ids_json"] or "[]"),
+        "account_snapshots": account_snapshots,
+        "project_snapshots": project_snapshots,
         "daily_limit_mode": src["daily_limit_mode"],
-        # #review warning：实时查 account 表填 account_labels（前端 wizard 显示用）；
-        # publish_task 表不存 account snapshots（运行时数据），必须主动拼
-        "account_labels": _build_account_labels(json.loads(src["account_ids_json"] or "[]")),
         "daily_limit_global": src["daily_limit_global"] or 0,
-        # #596：复制时把每账号的算模式 + 两个独立间隔字段都带上（老数据无 → fallback 顶层）
         "daily_limit_per_account": [
             {
                 "account_id": r["account_id"],
                 "limit": int(r["limit"]),
                 "schedule_mode": r.get("schedule_mode") or schedule_mode,
-                # 老数据可能只存 interval_min 单字段——按当前 mode 落到对应字段
                 "fixed_interval_min": int(r.get("fixed_interval_min") or r.get("interval_min") or fixed_interval_min),
                 "balanced_step_min": int(r.get("balanced_step_min") or r.get("interval_min") or balanced_step_min),
             }
@@ -1812,11 +1901,8 @@ def duplicate_task(task_id: str) -> dict:
         "schedule_mode": schedule_mode,
         "fixed_interval_min": fixed_interval_min,
         "balanced_step_min": balanced_step_min,
-        "same_project_interval_min": src.get("same_project_interval_min"),
-        "diff_project_interval_min": src.get("diff_project_interval_min"),
         "declaration": src["declaration"],
         "allow_download": bool(src["allow_download"]),
-        # #418：视频目录模式必备字段
         "project_source": src.get("project_source") or "project",
         "video_dirs": json.loads(src.get("video_dirs_json") or "[]"),
         "manual_shops": json.loads(src.get("manual_shops_json") or "{}"),
@@ -1828,89 +1914,6 @@ def duplicate_task(task_id: str) -> dict:
 def get_task_detail_ro(task_id: str) -> dict:
     """只读详情（#413）：与 get_task_detail 等价，但语义上不再支持编辑。"""
     return get_task_detail(task_id)
-
-
-def create_task(task_name: str, project_ids: list[str], account_ids: list[str],
-                shop_ids: list[str], per_account_count: int, start_time: str,
-                interval_minutes: int, shop_assign_mode: str = "round") -> dict:
-    """创建发布任务：预校验 → 生成排期明细 → 取用成品（置已占用）。
-
-    参数:
-        start_time: 开始时间 yyyy-MM-dd HH:mm:ss
-        interval_minutes: 同账号两条间隔（分钟，≥5）
-        shop_assign_mode: round 轮流 / random 随机
-    返回:
-        {"task_id", "item_count", "items": [排期预览]}
-    """
-    d = get_db()
-    if interval_minutes < 5:
-        raise ValueError("发布间隔最小 5 分钟（防风控）")
-    # 账号校验（须正常状态）
-    for aid in account_ids:
-        acc = d.query_one("SELECT status FROM account WHERE id=? AND deleted=0", (aid,))
-        if not acc:
-            raise ValueError("账号不存在")
-        if acc["status"] != "normal":
-            raise ValueError("存在非正常状态账号，请先处理登录态")
-    # 门店校验（未删除且未排除）
-    for sid in shop_ids:
-        shop = d.query_one("SELECT mark FROM shop WHERE id=? AND deleted=0", (sid,))
-        if not shop or shop["mark"] == "excluded":
-            raise ValueError("门店不存在或已排除")
-    # 水量预校验（F-05-R1）
-    total_need = per_account_count * len(account_ids)
-    marks = ",".join("?" * len(project_ids))
-    available = d.query_one(
-        f"SELECT COUNT(*) AS c FROM generated_video WHERE project_id IN ({marks}) AND status='idle'",
-        tuple(project_ids))["c"]
-    if available < total_need:
-        raise ValueError(f"可用水量不足：需 {total_need} 条，可用 {available} 条，缺 {total_need - available} 条")
-
-    # 取用成品（按项目顺序，即时置已占用）
-    videos: list[dict] = []
-    for tid in project_ids:
-        rows = d.query_all(
-            "SELECT * FROM generated_video WHERE project_id=? AND status='idle' ORDER BY create_time",
-            (tid,))
-        videos.extend(rows)
-    videos = videos[:total_need]
-
-    # 生成排期
-    task_id = d.insert("publish_task", {
-        "task_name": task_name,
-        "project_ids_json": json.dumps(project_ids),
-        "account_ids_json": json.dumps(account_ids),
-        "shop_ids_json": json.dumps(shop_ids),
-        "per_account_count": per_account_count,
-        "start_time": start_time,
-        "interval_minutes": interval_minutes,
-        "shop_assign_mode": shop_assign_mode,
-        "status": "running",
-    })
-    # #420：兼容无秒格式（与 publish_schedule._parse 一致）
-    start_dt = _parse_flexible(start_time)
-    items: list[dict] = []
-    idx = 0
-    for ai, account_id in enumerate(account_ids):
-        for i in range(per_account_count):
-            video = videos[idx]
-            idx += 1
-            # 门店分配：round 轮流 / random 随机
-            if shop_assign_mode == "random":
-                shop_id = random.choice(shop_ids)
-            else:
-                shop_id = shop_ids[(ai * per_account_count + i) % len(shop_ids)]
-            plan_time = (start_dt + timedelta(minutes=interval_minutes * i)).strftime("%Y-%m-%d %H:%M:%S")
-            item_id = d.insert("publish_task_item", {
-                "task_id": task_id, "plan_time": plan_time,
-                "account_id": account_id, "project_id": video["project_id"],
-                "video_id": video["id"], "shop_id": shop_id, "status": "waiting",
-            })
-            # 成品置已占用（generated_video 无 update_time 列，直接 execute）
-            d.execute("UPDATE generated_video SET status='occupied' WHERE id=?", (video["id"],))
-            items.append({"item_id": item_id, "plan_time": plan_time, "account_id": account_id,
-                          "video_id": video["id"], "shop_id": shop_id})
-    return {"task_id": task_id, "item_count": len(items), "items": items}
 
 
 def list_tasks(page: int = 1, page_size: int = 20,
@@ -1936,10 +1939,8 @@ def list_tasks(page: int = 1, page_size: int = 20,
                   (SELECT COUNT(*) FROM publish_task_item i WHERE i.task_id=t.id) AS item_total
            FROM publish_task t {where} ORDER BY t.create_time DESC""",
         params, page, page_size)
-    # #bugfix：派生 display_status——finished 但有失败明细 → 'partial'（前端徽标变红/黄）
-    # 部分失败是「成功 N + 失败 M + 总 K」中最直观的失败标志，比 status='finished' 单字段更有信息量
-    for row in page_data.get("list", []):
-        row["display_status"] = _derive_display_status(row)
+    # #publish-contract 出参：每行解析 *_json 为结构化对象（含 display_status）
+    page_data["list"] = [_task_row_to_response(r) for r in page_data.get("list", [])]
     return page_data
 
 
@@ -1959,6 +1960,61 @@ def _derive_display_status(task: dict) -> str:
     if status == "cancelled" and success > 0:
         return "partial"
     return status
+
+
+def _projects_payload_to_snapshots(projects_payload: list[dict]) -> list[dict]:
+    """#publish-contract：旧形 projects_payload（平行数组）→ 新形 project_snapshots（对象数组）。
+
+    与首建 buildDraftPayload / duplicate_task 形态一致，供 get_task_detail / list_tasks 出参复用。
+    #453 修复：遗留任务平行数组缺失时按 id 索引补齐（不再 zip 塌空）。
+    """
+    all_shop_ids: list[str] = []
+    for pp in (projects_payload or []):
+        all_shop_ids.extend(pp.get("shop_ids") or [])
+    # #453 去重：同一门店可能跨多个项目重复出现，dict.fromkeys 收紧占位符数量
+    all_shop_ids = list(dict.fromkeys(all_shop_ids))
+    shop_lookup = _batch_shop_basic(all_shop_ids)
+    return [_project_payload_to_snapshot(pp, shop_lookup) for pp in (projects_payload or [])]
+
+
+def _task_row_to_response(row: dict, with_snapshots: bool = False) -> dict:
+    """#publish-contract 出参：publish_task 行 → 统一结构化 dict。
+
+    - 所有 `*_json` 字符串列 json.loads → 去 `_json` 后缀字段（account_ids/project_ids/video_dirs/...）
+    - with_snapshots=True（详情/编辑）：额外返回新形态 account_snapshots/project_snapshots（与首建对齐）
+    - 删除原 `*_json` 字符串键，避免两套并存（前端不再 JSON.parse）
+    """
+    out = dict(row)
+    # 显式 list/dict 默认值映射。
+    # 注意：#publish-contract 阶段删了 account_ids / project_ids / projects_payload 旧字段
+    # （前端已改用 account_snapshots / project_snapshots 新形态，不再消费 *_json 旧形），
+    # 所以这里也不解析这些列——避免 CPU 浪费 + 与前端冗余字段保持一致。
+    json_cols: dict[str, tuple[str, object]] = {
+        "video_dirs_json": ("video_dirs", []),
+        "manual_shops_json": ("manual_shops", {}),
+        "manual_intros_json": ("manual_intros", {}),
+        "daily_limit_per_account_json": ("daily_limit_per_account", []),
+    }
+    task_id = row.get("id", "?")  # 仅日志用：定位损坏列所在任务
+    for src, (dst, default) in json_cols.items():
+        raw = out.get(src)
+        if raw:
+            try:
+                out[dst] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError) as e:
+                # 损坏数据不再静默 fallback——打 warn 便于排查（前端拿到空结构也无感）
+                logger.warning(
+                    "[publish] _task_row_to_response: 任务 {} 列 {} JSON 解析失败，使用 fallback={} err={}",
+                    task_id, src, default, e)
+                out[dst] = default
+        else:
+            out[dst] = default
+        out.pop(src, None)
+    out["display_status"] = _derive_display_status(row)
+    if with_snapshots:
+        out["account_snapshots"] = _build_account_snapshots(out.get("account_ids") or [])
+        out["project_snapshots"] = _projects_payload_to_snapshots(out.get("projects_payload") or [])
+    return out
 
 
 def get_task_detail(task_id: str) -> dict:
@@ -2004,7 +2060,8 @@ def get_task_detail(task_id: str) -> dict:
            LEFT JOIN json_each(t.video_dirs_json) vd ON json_extract(vd.value, '$.id') = i.project_id
            WHERE i.task_id=? ORDER BY i.plan_time""",
         (task_id,))
-    return {**task, "items": items, "display_status": _derive_display_status(task)}
+    task_resp = _task_row_to_response(task, with_snapshots=True)
+    return {**task_resp, "items": items}
 
 
 def toggle_task(task_id: str, paused: bool) -> dict:

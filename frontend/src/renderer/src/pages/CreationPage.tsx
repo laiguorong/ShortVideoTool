@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { creationApi, type Project, type ProjectRow, type Shot, type Clip, type GeneratedVideo, type BgmItem } from '@/api/creation'
-import { publishIntroApi } from '@/api/publish_intro'
+import { publishIntroApi } from '@/api/publish'
 import { fileUrl, request } from '@/api/client'
 import { materialApi, type Material, type Category } from '@/api/material'
 import { Button } from '@/components/ui/button'

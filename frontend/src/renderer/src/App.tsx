@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useAppStore, type Page } from '@/store/useAppStore'
 import { settingApi, taskApi } from '@/api/setting'
-import { getBaseUrl } from '@/api/client'
+import { ApiError, getBaseUrl } from '@/api/client'
 import { ToastContainer, toast } from '@/components/ui/toast'
 import { cn } from '@/lib/utils'
 import { DashboardPage } from '@/pages/DashboardPage'
@@ -74,6 +74,34 @@ export default function App() {
   const [healthLoading, setHealthLoading] = useState(true)
   // 关于系统弹窗：顶栏 ❓ 按钮触发
   const [showAbout, setShowAbout] = useState(false)
+
+  // #publish-contract：全局未捕获 Promise rejection handler
+  // 调用方没 catch 的 ApiError 也会自动 toast 出来，避免静默失败
+  // 业务侧 catch + toast 一致的会先 toast，本 handler 仅兜底漏 catch 的（不会重复 toast 因为 ApiError toast 完了就 resolve）
+  // 用 useEffect 确保 React 严格模式下也只挂一次
+  useEffect(() => {
+    const handler = (e: PromiseRejectionEvent) => {
+      const reason = e.reason
+      if (reason instanceof ApiError) {
+        // kind 分类：auth 跳登录 / network 提示重试 / 其他弹 toast
+        if (reason.kind === 'auth') {
+          // 401/403：理论上应跳登录页（暂时只 toast，登录跳转流程跨模块大改不在本轮范围）
+          toast('登录已失效，请重新登录', 'error')
+        } else if (reason.kind === 'network') {
+          toast(reason.message, 'error')
+        } else {
+          toast(reason.message, 'error')
+        }
+        e.preventDefault()  // 阻止浏览器默认 unhandledrejection 警告
+      } else if (reason instanceof Error) {
+        // 非 ApiError 异常（如业务代码 throw new Error("xxx")）
+        toast(reason.message, 'error')
+        e.preventDefault()
+      }
+    }
+    window.addEventListener('unhandledrejection', handler)
+    return () => window.removeEventListener('unhandledrejection', handler)
+  }, [])
 
   // 后端就绪轮询（1 秒重试，参考 VideoMatrix App 模式）
   useEffect(() => {

@@ -17,6 +17,7 @@ import json
 import re
 from typing import Any
 
+from fastapi import HTTPException
 from loguru import logger
 
 from app.core.douyin import poi_service
@@ -128,13 +129,14 @@ def _compile_pattern(pattern: str, label: str) -> re.Pattern | None:
         raise ValueError(f"{label}不合法: {e}")
 
 
-def get_task(task_id: str) -> dict | None:
+def get_task(task_id: str) -> dict:
     """读取单个任务（含 cities 反序列化）。"""
     db = get_db()
     row = db.query_one(
         "SELECT * FROM shop_pull_task WHERE id=? AND deleted=0", (task_id,))
     if not row:
-        return None
+        # #fix-status-404-consistent：service 层统一 raise HTTPException，路由层不再 None check
+        raise HTTPException(status_code=404, detail="任务不存在")
     return _serialize_task(row)
 
 
@@ -162,12 +164,13 @@ def update_task(task_id: str, task_name: str | None = None,
                 account_id: str | None = None,
                 interval: dict | None = None,
                 shop_name_pattern: str | None = None,
-                city_pattern: str | None = None) -> dict | None:
+                city_pattern: str | None = None) -> dict:
     """编辑任务（仅更新传入项，触发调度重置）。"""
     db = get_db()
     row = db.query_one("SELECT id FROM shop_pull_task WHERE id=? AND deleted=0", (task_id,))
     if not row:
-        return None
+        # #fix-status-404-consistent：service 层统一 raise HTTPException
+        raise HTTPException(status_code=404, detail="任务不存在")
 
     # 正则预校验
     if shop_name_pattern is not None:
@@ -205,20 +208,22 @@ def update_task(task_id: str, task_name: str | None = None,
 def delete_task(task_id: str) -> bool:
     """删除任务（软删 + 移除调度）。"""
     db = get_db()
-    row = db.query_one("SELECT id FROM shop_pull_task WHERE id=?", (task_id,))
+    row = db.query_one("SELECT id FROM shop_pull_task WHERE id=? AND deleted=0", (task_id,))
+    # #fix-status-404-consistent：service 层统一 raise HTTPException(404)
     if not row:
-        return False
+        raise HTTPException(status_code=404, detail="任务不存在")
     db.update_by_id("shop_pull_task", task_id, {"deleted": 1, "update_time": now_str()})
     remove_job(f"shop_pull:{task_id}")
     return True
 
 
-def toggle_task(task_id: str, enabled: bool) -> dict | None:
+def toggle_task(task_id: str, enabled: bool) -> dict:
     """启停任务。"""
     db = get_db()
     row = db.query_one("SELECT id FROM shop_pull_task WHERE id=? AND deleted=0", (task_id,))
     if not row:
-        return None
+        # #fix-status-404-consistent：service 层统一 raise HTTPException
+        raise HTTPException(status_code=404, detail="任务不存在")
 
     new_status = "enabled" if enabled else "disabled"
     db.update_by_id("shop_pull_task", task_id, {
@@ -764,7 +769,7 @@ def set_shop_added(shop_id: str, added: bool) -> dict:
     db = get_db()
     row = db.query_one("SELECT id FROM shop WHERE id=? AND deleted=0", (shop_id,))
     if not row:
-        raise ValueError("门店不存在")
+        raise HTTPException(status_code=404, detail="门店不存在")
     new_val = 1 if added else 0
     updates = {
         "is_added_to_library": new_val,

@@ -11,7 +11,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Dialog, ConfirmDialog } from '@/components/ui/dialog'
 import { toast } from '@/components/ui/toast'
-import { publishIntroApi, type VideoIntro } from '@/api/publish_intro'
+import { publishIntroApi, type VideoIntro } from '@/api/publish'
 
 interface Props {
   project: { id: string; title: string } | null

@@ -21,7 +21,7 @@ import {
 } from '@/api/publish'
 import { accountApi, type Account } from '@/api/account'
 import { type ProjectRow } from '@/api/creation'
-import { publishIntroApi, type ProjectShopItem, type VideoIntro } from '@/api/publish_intro'
+import { publishIntroApi, type ProjectShopItem, type VideoIntro } from '@/api/publish'
 
 /** 默认起始 = 明天 07:00 */
 function defaultStart(): string {
@@ -241,9 +241,9 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         setAllowDownload(!!detail.allow_download)
         setDailyLimitMode(detail.daily_limit_mode || 'global')
         setDailyLimitGlobal(detail.daily_limit_global || 75)
-        // #596：编辑模式回填分账号上限（每账号从 daily_limit_per_account_json 读完整 record）
+        // #596：编辑模式回填分账号上限（每账号从 daily_limit_per_account 读完整 record）
         try {
-          const perAccFromDB = JSON.parse(detail.daily_limit_per_account_json || '[]') as {
+          const perAccFromDB = (detail.daily_limit_per_account || []) as {
             account_id: string; limit: number
             schedule_mode?: string
             fixed_interval_min?: number; balanced_step_min?: number
@@ -269,99 +269,83 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         // project_source + video_dirs / manual_shops
         const source = detail.project_source || 'project'
         setProjectSource(source)
-        if (source === 'video_dir' && detail.video_dirs_json) {
+        if (source === 'video_dir' && detail.video_dirs) {
           try {
-            const vds = JSON.parse(detail.video_dirs_json) as VideoDirEntry[]
+            const vds = detail.video_dirs as VideoDirEntry[]
             setVideoDirs(vds)
-            const shops = JSON.parse(detail.manual_shops_json || '{}') as Record<string, ShopDraftEntry[]>
+            // #publish-contract：manual_shops / manual_intros 出参已为结构化对象
+            const shops = (detail.manual_shops || {}) as Record<string, ShopDraftEntry[]>
             const texts: Record<string, string> = {}
             for (const v of vds) {
               texts[v.id] = (shops[v.id] || []).map((s) => s.name).join('\n')
             }
             setManualShopTexts(texts)
-            // 视频简介-按项目一一对应：manual_intros_json = {dir_id: [str, ...]}
-            const introsMap = JSON.parse(detail.manual_intros_json || '{}') as Record<string, string[]>
+            // 视频简介-按项目一一对应：manual_intros = {dir_id: [str, ...]}
+            const introsMap = (detail.manual_intros || {}) as Record<string, string[]>
             const introTexts: Record<string, string> = {}
             for (const v of vds) {
               introTexts[v.id] = (introsMap[v.id] || []).join('\n')
             }
             setManualIntroTexts(introTexts)
-            // 视频目录模式也要还原已选账号（否则 step 1 已选=0 阻断继续）
-            const accountIds = JSON.parse(detail.account_ids_json || '[]') as string[]
-            const selAccs = accounts.filter((a) => accountIds.includes(a.id))
+            // #publish-contract：account_snapshots 出参已为结构化对象
+            const accSnaps = detail.account_snapshots || []
+            const selAccs = accounts.filter((a) => accSnaps.some((s) => s.id === a.id))
             if (selAccs.length > 0) setSelAccounts(selAccs)
           } catch (e) {
             console.warn('[Wizard] 回填 video_dir 失败:', e)
           }
-        } else if (source === 'project' && detail.projects_payload_json) {
-          // 项目模式回填 selAccounts + selProjects + projectDraft
+        } else if (source === 'project' && detail.project_snapshots) {
+          // 项目模式回填 selAccounts + selProjects + projectDraft（新形态快照）
           try {
-            const accountIds = JSON.parse(detail.account_ids_json || '[]') as string[]
-            const selAccs = accounts.filter((a) => accountIds.includes(a.id))
+            const accSnaps = detail.account_snapshots || []
+            const selAccs = accounts.filter((a) => accSnaps.some((s) => s.id === a.id))
             if (selAccs.length > 0) setSelAccounts(selAccs)
-            const pp = JSON.parse(detail.projects_payload_json || '[]') as {
-              project_id: string; shop_ids?: string[];
-              shop_names?: string[]; shop_cities?: string[]; shop_poi_ids?: string[];
-              // #fix-intro-mode-roundtrip：编辑回填时读取 intro_ids / intro_mode / intro_contents / intro_topics
-              intro_ids?: string[]; intro_mode?: 'list' | 'manual';
-              intro_contents?: string[]; intro_topics?: string[];
-            }[]
+            const pp = (detail.project_snapshots || []) as ProjectDraftSnapshot[]
             const matched: ProjectRow[] = []
             const draftMap: Record<string, ProjectDraftState> = {}
-            for (const p of pp) {
-              const row = projects.find((x) => x.id === p.project_id)
+            for (const proj of pp) {
+              const row = projects.find((x) => x.id === proj.id)
               if (!row) continue
               matched.push(row)
-              const shops = (p.shop_ids || []).map((sid, i) => {
-              const name = p.shop_names?.[i] || ''
-              return {
-                  id: sid,
-                  name,
-                  city: p.shop_cities?.[i] || '',
-                  poi_id: p.shop_poi_ids?.[i] || '',
-                }
-              })
-              // #fix-intro-mode-roundtrip：先填 placeholder + 空两个数组，
-              // 异步 IIFE 读完 DB intros 后按 intro_ids 命中情况再回填。
-              draftMap[p.project_id] = {
-                project_id: p.project_id,
+              // #publish-contract：编辑回填读新形态 proj.shops[]（ShopDraftEntry：id/name/city/poi_id）。
+              // 后端 get_task_detail_ro → _projects_payload_to_snapshots 与 duplicate_task 均返回该新形态，
+              // 字段稳定为 id（=shop_id），无需 s.shop_id 兜底。
+              const shops = (proj.shops || []).map((s) => ({
+                id: s.id, name: s.name,
+                city: s.city, poi_id: s.poi_id,
+              }))
+              // 异步 IIFE 读完 DB intros 后按 intro.id 命中再回填
+              draftMap[proj.id] = {
+                project_id: proj.id,
                 selectedShops: shops,
                 selectedIntrosList: [],
                 selectedIntrosManual: [],
-                introMode: (p.intro_mode === 'manual' ? 'manual' : 'list'),
+                introMode: (proj.introMode === 'manual' ? 'manual' : 'list'),
               }
             }
             if (matched.length > 0) setSelProjects(matched)
             setProjectDraft(draftMap)
 
             // #fix-intro-mode-roundtrip：异步加载项目已绑定 intros，
-            // 按 intro_ids 是否命中 DB 决定 list/manual 模式（list 模式从 DB 拉 content/topics）
+            // 按 intro.id 是否命中 DB 决定 list/manual 模式（list 模式从 DB 拉 content/topics）
             void (async () => {
-              for (const p of pp) {
-                const iids = p.intro_ids || []
-                if (iids.length === 0) continue  // 没选简介，保持 placeholder
-                const row = projects.find((x) => x.id === p.project_id)
+              for (const proj of pp) {
+                const intros = proj.intros || []
+                if (intros.length === 0) continue  // 没选简介，保持 placeholder
+                const row = projects.find((x) => x.id === proj.id)
                 if (!row) continue
                 try {
                   const dbIntros: VideoIntro[] = await publishIntroApi.listIntros(row.id)
                   const dbMap = new Map(dbIntros.map((it) => [it.id, it]))
                   let allHit = true
-                  const items = iids.map((iid, i) => {
-                    const hit = dbMap.get(iid)
+                  const items = intros.map((intro) => {
+                    const hit = dbMap.get(intro.id)
                     if (!hit) {
                       allHit = false
-                      let topics: string[] = []
-                      const raw = p.intro_topics?.[i]
-                      if (raw) {
-                        try {
-                          const parsed = JSON.parse(raw)
-                          if (Array.isArray(parsed)) topics = parsed
-                        } catch { /* 静默失败 → 空 topics */ }
-                      }
                       return {
-                        id: iid,
-                        content: p.intro_contents?.[i] || '',
-                        topics,
+                        id: intro.id,
+                        content: intro.content || '',
+                        topics: intro.topics ?? [],
                       }
                     }
                     return {
@@ -371,13 +355,13 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                     }
                   })
                   setProjectDraft((prev) => {
-                    const cur = prev[p.project_id]
+                    const cur = prev[proj.id]
                     if (!cur) return prev
                     // #fix-intro-mode-independent：根据 cur.introMode 选对应数组
                     const isManual = cur.introMode === 'manual' || !allHit
                     return {
                       ...prev,
-                      [p.project_id]: {
+                      [proj.id]: {
                         ...cur,
                         // introMode 已由源数据决定；不命中 DB 时保守取 manual（保留 manual 文本）
                         introMode: isManual ? 'manual' : cur.introMode,
@@ -386,7 +370,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                     }
                   })
                 } catch (e) {
-                  console.warn(`[Wizard] 编辑模式视频简介回填失败 ${p.project_id}:`, e)
+                  console.warn(`[Wizard] 编辑模式视频简介回填失败 ${proj.id}:`, e)
                 }
               }
             })()
@@ -485,47 +469,37 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         const introTexts: Record<string, string> = {}
         for (const v of vds) introTexts[v.id] = (introsMap[v.id] || []).join('\n')
         setManualIntroTexts(introTexts)
-        const accountIds = p.account_ids || []
-        const selAccs = accounts.filter((a) => accountIds.includes(a.id))
+        const accSnaps = p.account_snapshots || []
+        const selAccs = accounts.filter((a) => accSnaps.some((s) => s.id === a.id))
         if (selAccs.length > 0) setSelAccounts(selAccs)
       } catch (e) {
         console.warn('[Wizard] 复制模式 video_dir 回填失败:', e)
       }
     } else {
       try {
-        const accountIds = p.account_ids || []
-        const selAccs = accounts.filter((a) => accountIds.includes(a.id))
+        const accSnaps = p.account_snapshots || []
+        const selAccs = accounts.filter((a) => accSnaps.some((s) => s.id === a.id))
         if (selAccs.length > 0) setSelAccounts(selAccs)
-        const pp = (p.projects || []) as {
-          project_id: string; shop_ids?: string[];
-          shop_names?: string[]; shop_cities?: string[]; shop_poi_ids?: string[];
-          // #fix-intro-mode-roundtrip：复制回填时读取 intro_ids / intro_mode / intro_contents / intro_topics
-          intro_ids?: string[]; intro_mode?: 'list' | 'manual';
-          intro_contents?: string[]; intro_topics?: string[];
-        }[]
+        const pp = (p.project_snapshots || []) as ProjectDraftSnapshot[]
         const matched: ProjectRow[] = []
         const draftMap: Record<string, ProjectDraftState> = {}
         for (const proj of pp) {
-          const row = projects.find((x) => x.id === proj.project_id)
+          const row = projects.find((x) => x.id === proj.id)
           if (!row) continue
           matched.push(row)
-          const shops = (proj.shop_ids || []).map((sid, i) => {
-            const name = proj.shop_names?.[i] || ''
-            return {
-              id: sid,
-              name,
-              city: proj.shop_cities?.[i] || '',
-              poi_id: proj.shop_poi_ids?.[i] || '',
-            }
-          })
+          // #publish-contract：复制回填同编辑，读新形态 proj.shops[] 的 id/name/city/poi_id。
+          const shops = (proj.shops || []).map((s) => ({
+            id: s.id, name: s.name,
+            city: s.city, poi_id: s.poi_id,
+          }))
           // #fix-intro-mode-roundtrip：placeholder + 空两个数组
-          // 异步 IIFE 读完 DB intros 后按 intro_ids 命中再回填
-          draftMap[proj.project_id] = {
-            project_id: proj.project_id,
+          // 异步 IIFE 读完 DB intros 后按 intro.id 命中再回填
+          draftMap[proj.id] = {
+            project_id: proj.id,
             selectedShops: shops,
             selectedIntrosList: [],
             selectedIntrosManual: [],
-            introMode: (proj.intro_mode === 'manual' ? 'manual' : 'list'),
+            introMode: (proj.introMode === 'manual' ? 'manual' : 'list'),
           }
         }
         if (matched.length > 0) setSelProjects(matched)
@@ -538,30 +512,22 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         // - intro_ids 全部没选 → 保持默认 list 模式 + 空 selectedIntros
         void (async () => {
           for (const proj of pp) {
-            const iids = proj.intro_ids || []
-            if (iids.length === 0) continue
-            const row = projects.find((x) => x.id === proj.project_id)
+            const intros = proj.intros || []
+            if (intros.length === 0) continue
+            const row = projects.find((x) => x.id === proj.id)
             if (!row) continue
             try {
               const dbIntros: VideoIntro[] = await publishIntroApi.listIntros(row.id)
               const dbMap = new Map(dbIntros.map((it) => [it.id, it]))
               let allHit = true
-              const items = iids.map((iid, i) => {
-                const hit = dbMap.get(iid)
+              const items = intros.map((intro) => {
+                const hit = dbMap.get(intro.id)
                 if (!hit) {
                   allHit = false
-                  let topics: string[] = []
-                  const raw = proj.intro_topics?.[i]
-                  if (raw) {
-                    try {
-                      const parsed = JSON.parse(raw)
-                      if (Array.isArray(parsed)) topics = parsed
-                    } catch { /* 静默失败 → 空 topics */ }
-                  }
                   return {
-                    id: iid,
-                    content: proj.intro_contents?.[i] || '',
-                    topics,
+                    id: intro.id,
+                    content: intro.content || '',
+                    topics: intro.topics ?? [],
                   }
                 }
                 return {
@@ -571,13 +537,13 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                 }
               })
               setProjectDraft((prev) => {
-                const cur = prev[proj.project_id]
+                const cur = prev[proj.id]
                 if (!cur) return prev
                 // #fix-intro-mode-independent：根据 cur.introMode 选对应数组
                 const isManual = cur.introMode === 'manual' || !allHit
                 return {
                   ...prev,
-                  [proj.project_id]: {
+                  [proj.id]: {
                     ...cur,
                     // introMode 已由源数据决定；不命中 DB 时保守取 manual（保留 manual 文本）
                     introMode: isManual ? 'manual' : cur.introMode,
@@ -586,7 +552,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
                 }
               })
             } catch (e) {
-              console.warn(`[Wizard] 复制模式视频简介回填失败 ${proj.project_id}:`, e)
+              console.warn(`[Wizard] 复制模式视频简介回填失败 ${proj.id}:`, e)
             }
           }
         })()
@@ -612,20 +578,24 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
 
   // 监听 selProjects，加载每个项目已绑定的门店快照（step3 候选店源）
   // #451：加 in-flight 锁 + alive 标志，防止 selProjects 快速切换时同一 pid 多次请求 + 过期 setState
+  // inFlight 跨 effect 持久（用 useRef 挂在组件上），否则 useEffect 闭包内 const Set 每次重置，
+  // 异步回调里 setProjShops 也无人查 inFlight → 等同无去重。原写法仅靠 projShops 已有值防重，
+  // 但首次连选多个项目时仍会并发发同一请求——改 useRef 后语义正确（add 放 has 之前）。
+  const inFlightShopsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     let alive = true
-    const inFlight: Set<string> = new Set()
     for (const p of selProjects) {
       // 已加载过（projShops 已有值）→ 跳过，避免重复请求
       if (projShops[p.id] !== undefined) continue
-      if (inFlight.has(p.id)) continue
-      inFlight.add(p.id)
+      if (inFlightShopsRef.current.has(p.id)) continue
+      inFlightShopsRef.current.add(p.id)
       publishIntroApi.listProjectShops(p.id)
         .then((rows) => {
           if (!alive) return
           setProjShops((prev) => ({ ...prev, [p.id]: rows }))
         })
         .catch((e) => { if (alive) console.warn('[Wizard] 加载项目门店失败:', e) })
+        .finally(() => { inFlightShopsRef.current.delete(p.id) })
     }
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -702,7 +672,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
       const dropped = sel.filter((s) => !availMap.has(s.id))
       const kept = sel.filter((s) => availMap.has(s.id))
       // #fix-name-authoritative：以候选列表（projShops）为权威补全 name/city/poi_id。
-      // 背景：编辑/复制回填的 selectedShops.name 来自 projects_payload_json.shop_names，
+      // 背景：编辑/复制回填的 selectedShops.name 来自 project_snapshots.shops（结构化快照，name 已随快照带回），
       // 而保存分支（publish_service L1591）漏存该字段 → 回填 name 为空；原 effect 仅在存在失效店（dropped>0）
       // 时才重建，无失效店时空 name 会一路带进 preview-direct 入参。改为：只要已选门店存在空 meta 项就用候选项补全。
       const hasEmptyMeta = sel.some((s) => !s.name || !s.city || !s.poi_id)
@@ -784,7 +754,7 @@ export function PublishWizardDialog({ open, onOpenChange, onCreated, editingTask
         shops: draft.selectedShops,
         intros,
         // #fix-intro-mode-roundtrip：把 wizard state 的 introMode 塞入 snapshot；
-        // 后端 model_validator 透传到 ProjectDraftEntry.intro_mode，落 projects_payload_json。
+        // 后端把 wizard state 的 introMode 透传进 project_snapshots，service 内部落 projects_payload_json。
         introMode: draft.introMode,
       }
     })

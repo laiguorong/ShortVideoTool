@@ -102,7 +102,7 @@ export function PublishDetailDialog({ open, onOpenChange, taskId, onDuplicatePay
               <span className="text-muted-foreground">计算模式：</span>
               {task.schedule_mode === 'fixed'
                 ? `固定间隔 ${task.fixed_interval_min ?? 10} 分钟`
-                : `均衡间隔 ${task.balanced_step_min ?? task.same_project_interval_min ?? 60} 分钟`}
+                : `均衡间隔 ${task.balanced_step_min ?? 60} 分钟`}
             </div>
             <div><span className="text-muted-foreground">自主声明：</span>
               {task.declaration === 'ai_generated' ? '内容由 AI 生成' : '无需添加'}</div>

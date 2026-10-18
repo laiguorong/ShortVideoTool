@@ -123,6 +123,117 @@ app.add_middleware(
 )
 
 
+# ============ #publish-contract：全局异常处理器（错误响应也走 ApiResp 信封）============
+# 价值：
+# 1. 路由层无需 try/except ValueError（50+ 处重复样板消失）—— ValueError 自动转 400 + 信封
+# 2. 任何未捕获异常自动 500 + 信封（不漏）+ 走 loguru logger.exception 落 traceback
+# 3. 前后端契约彻底统一：成功 / 失败响应都走 {code, message, data} 形态
+# 4. HTTPException 仍可用（404 资源不存在 / 409 冲突等具体业务状态），但 detail 字符串被映射到 message
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi import HTTPException as _HTTPException
+from starlette.exceptions import HTTPException as _StarletteHTTPException
+from app.models.common import ApiResp
+
+
+@app.exception_handler(_HTTPException)
+async def http_exception_handler(request: Request, exc: _HTTPException):
+    """HTTPException → 同 status_code + ApiResp 信封。
+
+    之前：路由层 raise HTTPException(404, "xxx") 走 FastAPI 默认处理，返 {detail:"xxx"} 旧形态
+    现在：所有 HTTPException 都包成 {code:status, message:detail, data:null} ApiResp 信封
+    让错误响应契约与成功响应完全统一（前端 client.ts 优先取 body.message）。
+
+    注意：HTTPException(204 No Content) detail 为 None 时跳过 message（避免 "None" 字符串）。
+    """
+    # detail 可以是 str / list / dict（FastAPI 内部对 422 用 list/dict）；统一转 str 简化契约
+    detail = exc.detail
+    if detail is None:
+        message = ""
+    elif isinstance(detail, str):
+        message = detail
+    else:
+        message = str(detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ApiResp(code=exc.status_code, message=message, data=None).model_dump(),
+    )
+
+
+@app.exception_handler(_StarletteHTTPException)
+async def starlette_http_exception_handler(request: Request, exc: _StarletteHTTPException):
+    """Starlette 抛的 HTTPException（路由不存在 404 / 方法不允许 405 等）也走 ApiResp 信封。
+
+    FastAPI 自身的 HTTPException handler 不会拦截 starlette.exceptions.HTTPException
+    （不同的类），需要单独注册。HTTPException 子类会优先匹配更具体的 handler。
+    """
+    detail = exc.detail
+    if detail is None:
+        message = ""
+    elif isinstance(detail, str):
+        message = detail
+    else:
+        message = str(detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ApiResp(code=exc.status_code, message=message, data=None).model_dump(),
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    """业务 ValueError → 400 + ApiResp 信封。
+
+    路由层 raise ValueError("xxx") 即可，不必再手动 try/except 转 HTTPException。
+    错误字符串直接放到 message（前端 client.ts 走 body.message 提取）。
+    """
+    from loguru import logger
+    # logger.debug 而非 warning：业务 ValueError 是正常预期路径，频繁打 warn 会污染日志
+    logger.debug("[API] {} {} → 400 ValueError: {}", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=400,
+        content=ApiResp(code=400, message=str(exc), data=None).model_dump(),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """Pydantic 入参校验失败 → 422 + ApiResp 信封（data 含字段级 errors 数组）。
+
+    与 HTTPException({detail:[...]}) 兼容：前端 client.ts 优先取 body.message（业务提示），
+    字段级 errors 放 body.data.errors（高级 UI 用）。
+    """
+    return JSONResponse(
+        status_code=422,
+        content=ApiResp(
+            code=422,
+            message="参数校验失败",
+            data={"errors": exc.errors()},
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """兜底：未捕获异常 → 500 + ApiResp 信封（不向用户泄漏内部信息）。
+
+    logger.exception 自动带 traceback，落日志便于排查。
+    """
+    from loguru import logger
+    logger.exception(
+        "[API] {} {} → 500 Unhandled: {}",
+        request.method, request.url.path, exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=ApiResp(code=500, message="服务异常，请稍后重试", data=None).model_dump(),
+    )
+
+
+# ============ on_event ============
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     """启动初始化链（精简版）。

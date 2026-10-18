@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, type ApiResp } from './client'
 
 /** 工作台聚合（#500 数据中心移除后去掉 today 速览） */
 export interface DashboardSummary {
@@ -20,5 +20,8 @@ export interface DashboardSummary {
 
 export const dashboardApi = {
   /** 工作台聚合 */
-  dashboard: () => request<DashboardSummary>('/dashboard'),
+  dashboard: async (): Promise<DashboardSummary> => {
+    const r = await request<ApiResp<DashboardSummary>>('/dashboard')
+    return r.data!
+  },
 }

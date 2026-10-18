@@ -202,7 +202,7 @@ def test_duplicate_returns_payload_no_db_write() -> None:
     assert payload["task_name"].endswith("_副本")
     assert payload["declaration"] == "none"
     assert payload["allow_download"] is True
-    assert payload["account_ids"] == ["accA"]
+    assert [a["id"] for a in payload["account_snapshots"]] == ["accA"]
     assert payload["start_time"] == "2026-09-22 07:00:00"
     assert payload["end_time"] == "2026-09-22 22:00:00"
     assert payload["project_source"] == "project"
@@ -480,17 +480,13 @@ def test_save_draft_fixed_mode_persists() -> None:
 
 # ===== #normalize-self：DraftRequest 自归一化为旧形态字段 =====
 
-def test_draft_request_normalizes_snapshots_to_legacy_fields() -> None:
-    """#normalize-self：发新形态 snapshot（前端 wizard 实际形态），
-    DraftRequest 构造后 self.account_ids / self.projects / self.account_labels 自动归一好。
-    下游不管从 req.xxx 还是 req.model_dump() 后的 payload.get(...) 读，都能拿到值。
-
-    之前 #fix-save-draft-empty-projects 的根因是：normalize 是 dict mutation，
-    不写回 Pydantic 字段——本测试用 model 自归一一次性根除此类契约破裂。
-    """
-    from app.models.publish import DraftRequest
-    req = DraftRequest.model_validate({
-        "task_name": "normalize-test",
+def test_draft_payload_parses_snapshots() -> None:
+    """#publish-contract：向导请求只发对象数组形态（project_snapshots/account_snapshots），
+    SaveDraftRequest / PreviewRequest / ConfirmRequest 均正确解析，且 model_dump 不再含
+    旧形态 projects / account_ids / account_labels 字段（消除双形态契约破裂）。"""
+    from app.models.publish import SaveDraftRequest, PreviewRequest, ConfirmRequest
+    payload = {
+        "task_name": "unify-test",
         "account_snapshots": [
             {"id": "accA", "nickname": "A", "remark": "A"},
             {"id": "accB", "nickname": None, "remark": "备注B"},
@@ -498,45 +494,60 @@ def test_draft_request_normalizes_snapshots_to_legacy_fields() -> None:
         "project_snapshots": [
             {
                 "id": "projA", "title": "项目A",
-                "shops": [
-                    {"id": "shop_A1", "name": "A门店1", "city": "广州", "poi_id": "poi_1"},
-                ],
-                "intros": [
-                    {"id": "manual_intro_0", "content": "简介0", "topics": ["#A0"]},
-                ],
+                "shops": [{"id": "shop_A1", "name": "A门店1", "city": "广州", "poi_id": "poi_1"}],
+                "intros": [{"id": "manual_intro_0", "content": "简介0", "topics": ["#A0"]}],
             },
         ],
         "daily_limit_mode": "global",
         "daily_limit_global": 5,
-    })
-    # model 自归一后，Pydantic 字段都能直接读到
-    assert req.account_ids == ["accA", "accB"]
-    assert req.account_labels == ["A", "备注B"]
-    assert len(req.projects) == 1
-    assert req.projects[0].project_id == "projA"
-    assert req.projects[0].shop_ids == ["shop_A1"]
-    assert req.projects[0].intro_ids == ["manual_intro_0"]
-    assert req.projects[0].intro_topics == ['["#A0"]']
-    # model_dump 后 payload 同样带归一化字段（路由层从 payload 读也正常）
-    payload = req.model_dump()
-    assert payload["account_ids"] == ["accA", "accB"]
-    assert len(payload["projects"]) == 1
-    assert payload["projects"][0]["project_id"] == "projA"
+    }
+    for cls in (SaveDraftRequest, PreviewRequest, ConfirmRequest):
+        req = cls.model_validate(payload)
+        assert len(req.project_snapshots) == 1
+        assert req.project_snapshots[0].id == "projA"
+        assert req.account_snapshots[0].id == "accA"
+        dumped = req.model_dump()
+        # 旧双形态字段不再出现在契约里
+        assert "projects" not in dumped
+        assert "account_ids" not in dumped
+        assert "account_labels" not in dumped
 
 
-def test_draft_request_legacy_projects_not_overwritten_by_snapshots() -> None:
-    """#normalize-self：旧形态 projects 不会被 snapshots 覆盖（双形态兼容）。"""
-    from app.models.publish import DraftRequest
-    req = DraftRequest.model_validate({
+def test_draft_request_rejects_legacy_fields() -> None:
+    """#publish-contract：旧形态字段（projects/account_ids）不再被接受，
+    传入后被忽略（Pydantic 默认丢弃多余字段），model_dump 不含它们。"""
+    from app.models.publish import SaveDraftRequest
+    req = SaveDraftRequest.model_validate({
         "task_name": "legacy",
         "account_ids": ["accX"],
         "projects": [{"project_id": "projA", "shop_ids": ["shop_A1"]}],
         "daily_limit_mode": "global",
         "daily_limit_global": 5,
     })
-    assert req.account_ids == ["accX"]  # 旧值不被空 snapshots 覆盖
-    assert len(req.projects) == 1
-    assert req.projects[0].project_id == "projA"
+    dumped = req.model_dump()
+    assert "account_ids" not in dumped
+    assert "projects" not in dumped
+
+
+def test_draft_time_normalization() -> None:
+    """#publish-contract：入参时间宽松归一化为 yyyy-MM-dd HH:mm:ss；非法格式被拒。"""
+    from app.models.publish import PreviewRequest
+    req = PreviewRequest.model_validate({
+        "task_name": "t",
+        "start_time": "2026-10-19 07:00",
+        "end_time": "2026-10-19 22:00",
+        "daily_limit_mode": "global",
+    })
+    assert req.start_time == "2026-10-19 07:00:00"
+    assert req.end_time == "2026-10-19 22:00:00"
+    # 非法格式应被 Pydantic 校验拒绝
+    try:
+        PreviewRequest.model_validate({
+            "task_name": "t", "start_time": "2026-13-40 99:99",
+            "daily_limit_mode": "global"})
+        raise AssertionError("expected validation error for bad time")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

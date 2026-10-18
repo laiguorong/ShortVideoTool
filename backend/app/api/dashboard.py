@@ -3,10 +3,12 @@
 
 #500 数据中心功能移除后，/dashboard 从原 stats 路由迁出独立挂载，
 返回结构去掉 today（今日播放/GMV/佣金）速览。
+#publish-contract：成功响应统一包 ApiResp[data] 信封（与全项目 publish 域对齐）。
 """
 
 from fastapi import APIRouter
 
+from app.models.common import ok
 from app.services import dashboard_service
 
 router = APIRouter(tags=["工作台"])
@@ -15,4 +17,4 @@ router = APIRouter(tags=["工作台"])
 @router.get("/dashboard", summary="工作台聚合")
 def dashboard():
     """指标卡 + 待处理事项。"""
-    return dashboard_service.dashboard_summary()
+    return ok(dashboard_service.dashboard_summary())

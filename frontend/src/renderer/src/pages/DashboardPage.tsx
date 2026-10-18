@@ -8,7 +8,7 @@ export function DashboardPage() {
   const [data, setData] = useState<DashboardSummary | null>(null)
   const setPage = useAppStore((s) => s.setPage)
 
-  const load = () => dashboardApi.dashboard().then(setData).catch((e) => console.warn('[Dashboard] 请求失败:', e))
+  const load = () => dashboardApi.dashboard().then((r) => setData(r)).catch((e) => console.warn('[Dashboard] 请求失败:', e))
   useEffect(() => {
     load()
     const t = window.setInterval(load, 10000)

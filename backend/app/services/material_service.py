@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, List, NamedTuple, Optional
 
+from fastapi import HTTPException
+from fastapi import HTTPException
 from loguru import logger
 
 from app.core import task_scheduler, notifier
@@ -265,7 +267,7 @@ def create_category(name: str, material_type: str, parent_id: str = "") -> dict:
     while pid:
         row = d.query_one("SELECT parent_id FROM material_category WHERE id=? AND deleted=0", (pid,))
         if not row:
-            raise ValueError("父分类不存在")
+            raise HTTPException(status_code=404, detail="父分类不存在")
         pid = row["parent_id"]
         depth += 1
         if depth >= 4:
@@ -285,7 +287,12 @@ def rename_category(category_id: str, name: str) -> None:
     """重命名分类。"""
     if category_id == UNCATEGORIZED_ID:
         raise ValueError("系统分类「未分类」不可重命名")
-    get_db().update_by_id("material_category", category_id, {"name": name})
+    d = get_db()
+    # 存在性校验（#fix-update-missing-check）：update_by_id 找不到 id 时静默返 0 行
+    if not d.query_one(
+            "SELECT id FROM material_category WHERE id=? AND deleted=0", (category_id,)):
+        raise HTTPException(status_code=404, detail="分类不存在")
+    d.update_by_id("material_category", category_id, {"name": name})
 
 
 def move_category(category_id: str, new_parent_id: str, sort_order: int = 0) -> None:
@@ -315,7 +322,7 @@ def delete_category(category_id: str, strategy: str = "to_parent") -> None:
     d = get_db()
     row = d.query_one("SELECT * FROM material_category WHERE id=? AND deleted=0", (category_id,))
     if not row:
-        raise ValueError("分类不存在")
+        raise HTTPException(status_code=404, detail="分类不存在")
     if d.query_one("SELECT COUNT(*) AS c FROM material_category WHERE parent_id=? AND deleted=0",
                    (category_id,))["c"] > 0:
         raise ValueError("请先删除或移出子分类")
@@ -640,7 +647,7 @@ def create_pull_task(task_name: str, conditions: dict, account_id: str,
     task_scheduler.parse_interval_config(interval_json)
     d = get_db()
     if not d.query_one("SELECT id FROM account WHERE id=? AND deleted=0", (account_id,)):
-        raise ValueError("拉取账号不存在")
+        raise HTTPException(status_code=404, detail="拉取账号不存在")
     # 允许 UNCATEGORIZED_ID 作为入库目标（虚拟分类）；其他必须存在且为视频类型
     if category_id != UNCATEGORIZED_ID and not d.query_one(
             "SELECT id FROM material_category WHERE id=? AND type='video' AND deleted=0",
@@ -665,8 +672,9 @@ def update_pull_task(task_id: str, task_name: str | None, conditions: dict | Non
                      interval_config: dict | None) -> dict:
     """编辑视频拉取任务（下一轮生效）。"""
     d = get_db()
+    # 存在性预检（#fix-status-404）：缺资源返 404
     if not d.query_one("SELECT id FROM video_pull_task WHERE id=? AND deleted=0", (task_id,)):
-        raise ValueError("任务不存在")
+        raise HTTPException(status_code=404, detail="任务不存在")
     fields: dict = {}
     if task_name is not None:
         fields["task_name"] = task_name
@@ -699,6 +707,9 @@ def toggle_pull_task(task_id: str, enabled: bool) -> dict:
     阶梯进度跨启用/停用保留。
     """
     d = get_db()
+    # 存在性预检（#fix-status-404）：缺资源返 404（resource_toggle 之前漏查，会对不存在的任务静默返 None）
+    if not d.query_one("SELECT id FROM video_pull_task WHERE id=? AND deleted=0", (task_id,)):
+        raise HTTPException(status_code=404, detail="任务不存在")
     fields: dict = {"status": "enabled" if enabled else "disabled"}
     if enabled:
         # 手动启用：清掉 'manual'/'auto_max' 标记（auto_max 在 restart 路径会被 restart_pull_task 清）
@@ -728,8 +739,9 @@ def restart_pull_task(task_id: str) -> dict:
     """
     d = get_db()
     task = d.query_one("SELECT * FROM video_pull_task WHERE id=? AND deleted=0", (task_id,))
+    # 存在性预检（#fix-status-404）：不存在返 404；状态不对返 400（业务校验）
     if not task:
-        raise ValueError("任务不存在")
+        raise HTTPException(status_code=404, detail="任务不存在")
     if task["status"] != "disabled":
         raise ValueError(f"任务当前状态为 {task['status']}，仅停用任务可重新启用")
     d.update_by_id("video_pull_task", task_id, {
@@ -751,8 +763,9 @@ def delete_pull_task(task_id: str) -> None:
     边界 raise_for_cancel 处退出循环，避免已飞轮次继续入库。
     """
     d = get_db()
+    # 存在性预检（#fix-status-404）：缺资源返 404
     if not d.query_one("SELECT id FROM video_pull_task WHERE id=? AND deleted=0", (task_id,)):
-        raise ValueError("任务不存在")
+        raise HTTPException(status_code=404, detail="任务不存在")
     # 1) 取消 in-flight worker（如果有）。request_cancel 对已完成/不存在任务返 False，幂等。
     bg_task_id = d.query_one(
         "SELECT bg_task_id FROM video_pull_task WHERE id=?", (task_id,))
@@ -808,7 +821,7 @@ def delete_pull_log(log_id: str) -> None:
     d = get_db()
     row = d.query_one("SELECT id FROM video_pull_log WHERE id=?", (log_id,))
     if not row:
-        raise ValueError("日志不存在")
+        raise HTTPException(status_code=404, detail="日志不存在")
     d.execute("DELETE FROM video_pull_log WHERE id=?", (log_id,))
 
 
@@ -2174,7 +2187,7 @@ def _upload_single_file(raw: str, category_id: str) -> dict:
     if category_id != UNCATEGORIZED_ID:
         cat = d.query_one("SELECT * FROM material_category WHERE id=? AND deleted=0", (category_id,))
         if not cat:
-            raise ValueError("分类不存在")
+            raise HTTPException(status_code=404, detail="分类不存在")
         material_type = cat["type"]
     else:
         # 未分类入库：按文件扩展名推断类型
@@ -2303,10 +2316,15 @@ def update_material(material_id: str, title: str | None, category_id: str | None
             if not d.query_one(
                     "SELECT id FROM material_category WHERE id=? AND deleted=0",
                     (category_id,)):
-                raise ValueError("分类不存在")
+                raise HTTPException(status_code=404, detail="分类不存在")
         fields["category_id"] = category_id
     if fields:
-        get_db().update_by_id("material", material_id, fields)
+        d = get_db()
+        # 存在性校验（#fix-update-missing-check）：update_by_id 找不到 id 时静默返 0 行
+        if not d.query_one(
+                "SELECT id FROM material WHERE id=? AND deleted=0", (material_id,)):
+            raise HTTPException(status_code=404, detail="素材不存在")
+        d.update_by_id("material", material_id, fields)
 
 
 def delete_material(material_id: str, keep_file: bool = False) -> None:
@@ -2319,7 +2337,7 @@ def delete_material(material_id: str, keep_file: bool = False) -> None:
         "SELECT file_path, cover_url, author_avatar FROM material WHERE id=? AND deleted=0",
         (material_id,))
     if not row:
-        raise ValueError("素材不存在")
+        raise HTTPException(status_code=404, detail="素材不存在")
     # 片段/BGM 引用处置：引用记录保留（生成时校验文件存在性，缺失跳过）
     d.soft_delete_by_id("material", material_id)
     if not keep_file:
@@ -2331,7 +2349,7 @@ def relocate_material(material_id: str, new_abs_path: str) -> None:
     d = get_db()
     p = Path(new_abs_path)
     if not p.exists():
-        raise ValueError("新路径文件不存在")
+        raise HTTPException(status_code=404, detail="新路径文件不存在")
     try:
         rel = str(p.relative_to(get_data_dir())).replace("\\", "/")
     except ValueError:

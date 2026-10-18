@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-"""账号管理路由（F-01）。"""
+"""账号管理路由（F-01）。
 
+#publish-contract：成功响应统一包 ApiResp[data] 信封。
+"""
 import json
 
 from fastapi import APIRouter, HTTPException
@@ -8,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 from app.models.account import (AddAccountRequest, ReloginRequest,
                                 ToggleDisableRequest, UpdateRemarkRequest,
                                 LoginWindowRequest)
+from app.models.common import ok
 from app.services import account_service
 
 # 顶层 import：让 patch app.api.accounts.get_db / get_data_dir 可达（单测用）
@@ -29,12 +32,10 @@ def add_account(req: AddAccountRequest):
         "douyin_id": req.douyin_id,
         "avatar": req.avatar,
     }
-    try:
-        return account_service.add_account(
-            req.cookie, req.remark, profile=profile, profile_dir=req.profile_dir,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    # 业务 ValueError 走 main.py 全局 handler → 400 + ApiResp 信封
+    return ok(account_service.add_account(
+    req.cookie, req.remark, profile=profile, profile_dir=req.profile_dir,
+    ))
 
 
 @router.post("/login-window", summary="弹浏览器登录窗抓 Cookie（用于添加/重新登录）")
@@ -45,7 +46,7 @@ def open_login_window(req: LoginWindowRequest = LoginWindowRequest()):
     storage.json 同步备份（API 校验用）。
 
     参数（body 可选）:
-        account_id: 已知账号 ID（重新登录场景）→ profile + storage.json 都写到账号目录
+    account_id: 已知账号 ID（重新登录场景）→ profile + storage.json 都写到账号目录
                     不传（添加账号场景）→ 用临时路径，cookie 串由前端拿走后自行管理
 
     返回:
@@ -82,15 +83,17 @@ def open_login_window(req: LoginWindowRequest = LoginWindowRequest()):
         )
         # result: dict | None（None = 超时/失败）
         if result is None:
-            return {"cookie": None, "nickname": "", "douyin_id": "", "avatar": "",
-                    "profile_dir": str(profile_dir) if tmp_path is not None else ""}
+            return ok({
+                "cookie": None, "nickname": "", "douyin_id": "", "avatar": "",
+                "profile_dir": str(profile_dir) if tmp_path is not None else "",
+            })
         # #fix-profile-dir-move：添加账号场景把临时 profile_dir 路径返给前端，
         # 前端调 /accounts 时一并传过来，后端 add_account 负责搬移到 accounts/{id}/profile/
         # （否则发布/搜索用 launch_persistent_context 会读到空 profile，无登录态）。
         # 重新登录场景 profile_dir 已是 accounts/{id}/profile/，不返（前端不需要处理）。
         if tmp_path is not None:
             result["profile_dir"] = str(profile_dir)
-        return result
+        return ok(result)
     finally:
         if tmp_path is not None:
             try:
@@ -102,7 +105,7 @@ def open_login_window(req: LoginWindowRequest = LoginWindowRequest()):
 @router.get("", summary="账号分页列表")
 def list_accounts(status: str = "", keyword: str = "", page: int = 1, page_size: int = 20):
     """账号分页列表（不含 Cookie）。"""
-    return account_service.list_accounts(status, keyword, page, page_size)
+    return ok(account_service.list_accounts(status, keyword, page, page_size))
 
 
 @router.get("/available", summary="可选账号列表（选品拉取可用）")
@@ -126,9 +129,9 @@ def list_available_accounts():
             "remark": r["remark"],
             "status": r["status"],
         }
-        for r in rows
+    for r in rows
     ]
-    return {"list": out, "total": len(out)}
+    return ok({"list": out, "total": len(out)})
 
 
 @router.post("/{account_id}/relogin", summary="重新登录（登录窗抓 cookie + 页面身份）")
@@ -139,47 +142,33 @@ def relogin(account_id: str, req: ReloginRequest):
         "douyin_id": req.douyin_id,
         "avatar": req.avatar,
     }
-    try:
-        return account_service.relogin(account_id, req.new_cookie, profile=profile)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    return ok(account_service.relogin(account_id, req.new_cookie, profile=profile))
 
 
 @router.post("/{account_id}/check", summary="检测账号登录态")
 def check_account_status(account_id: str):
     """手动触发单个账号的会话有效性检测，失效时返回 status='invalid'。
     检测逻辑与定时任务一致（调 account_service.check_account）。"""
-    try:
-        return account_service.check_account(account_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    return ok(account_service.check_account(account_id))
 
 
 @router.put("/{account_id}/remark", summary="编辑备注名")
 def update_remark(account_id: str, req: UpdateRemarkRequest):
     """编辑备注名。"""
-    try:
-        account_service.update_remark(account_id, req.remark)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    # 业务 ValueError(账号不存在) 走 service raise HTTPException(404) → 全局 handler → 404 信封
+    account_service.update_remark(account_id, req.remark)
+    return ok({"ok": True})
 
 
 @router.post("/{account_id}/toggle-disable", summary="账号启停")
 def toggle_disable(account_id: str, req: ToggleDisableRequest):
     """停用/恢复账号。"""
-    try:
-        account_service.toggle_disable(account_id, req.disabled)
-        return {"ok": True}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    account_service.toggle_disable(account_id, req.disabled)
+    return ok({"ok": True})
 
 
 @router.delete("/{account_id}", summary="删除账号")
 def delete_account(account_id: str):
     """删除账号（二次确认由前端承担；后端逻辑删除+留痕通知）。"""
-    try:
-        account_service.delete_account(account_id)
-        return {"ok": True}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    account_service.delete_account(account_id)
+    return ok({"ok": True})

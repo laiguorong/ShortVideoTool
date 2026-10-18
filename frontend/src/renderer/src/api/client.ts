@@ -89,23 +89,40 @@ export async function request<T>(path: string, options?: RequestInit): Promise<T
   const duration = (performance.now() - start).toFixed(1)
   if (!res.ok) {
     const raw = await res.text()
-    let detail: unknown = null
+    let body: Record<string, unknown> | null = null
     try {
-      detail = JSON.parse(raw).detail
+      const parsed = JSON.parse(raw)
+      // #publish-contract：错误响应两种形态兼容：
+      // - 新：ApiResp 信封 {code: 4xx/5xx, message: "...", data: null|{errors:[...]}}
+      // - 旧：FastAPI HTTPException {detail: "..."}（路由层手动 raise）
+      // 优先取 message（业务提示），fallback 到 detail（旧契约）。
+      body = parsed
     } catch {
       // 非 JSON 响应（如后端 panic 时返回 HTML），保留原文便于排查
       console.warn(`[API] ${method} ${path} 响应非 JSON status=${res.status}: ${raw.slice(0, 200)}`)
     }
-    console.error(`[API] ${method} ${path} ${res.status} ${duration}ms:`, detail ?? raw.slice(0, 200))
+    // 422 Pydantic 校验错误：message 是统一文案"参数校验失败"，字段级信息在 data.errors
+    // （[ApiResp] 形态）；旧的 HTTPException 形态字段级在 detail 数组
+    const dataObj = body?.data as Record<string, unknown> | null | undefined
+    const pydanticErrors = dataObj?.errors
+    const fieldMsg = Array.isArray(pydanticErrors)
+      ? formatApiError(pydanticErrors, '')
+      : ''
+    const errorMsg = fieldMsg
+      || (body?.message as string)
+      || (body?.detail as string)
+      || raw.slice(0, 200)
+    console.error(`[API] ${method} ${path} ${res.status} ${duration}ms:`, errorMsg)
     // 错误分类：401/403 → auth（应跳登录）；429 → throttle（应静默重试）；422 → validation；5xx → system；其他 4xx → business
+    // 优先用后端 ApiResp.code（如果有），否则按 HTTP status 推断
+    const backendCode = typeof body?.code === 'number' ? body.code : res.status
     const kind: ApiErrorKind =
       res.status === 401 || res.status === 403 ? 'auth'
       : res.status === 429 ? 'throttle'
-      : res.status === 422 ? 'validation'
-      : res.status >= 500 ? 'system'
+      : res.status === 422 || backendCode === 422 ? 'validation'
+      : res.status >= 500 || backendCode >= 500 ? 'system'
       : 'business'
-    const msg = formatApiError(detail, `请求失败（HTTP ${res.status}）`)
-    throw new ApiError(friendlyHttpHint(res.status, path, msg), res.status, kind)
+    throw new ApiError(friendlyHttpHint(res.status, path, errorMsg), res.status, kind)
   }
   // dev 调试：成功请求打 console.log 便于 trace API 流程（prod 不打以免污染）
   if (import.meta.env.DEV) {
@@ -120,4 +137,11 @@ export interface PageResult<T = Record<string, unknown>> {
   page: number
   page_size: number
   list: T[]
+}
+
+/** 统一响应信封（发布中心成功响应包此结构；code=0 成功，data 为业务数据） */
+export interface ApiResp<T = unknown> {
+  code: number
+  message: string
+  data: T | null
 }

@@ -70,7 +70,8 @@ def test_list_available_accounts_returns_normal_only():
     ]
     patches = _patch_db(rows, tmp)
     try:
-        result = accounts_module.list_available_accounts()
+        # #publish-contract：路由层返 ApiResp 信封，业务数据在 .data
+        result = accounts_module.list_available_accounts().data
     finally:
         _stop_patches(patches)
 
@@ -89,7 +90,7 @@ def test_list_available_accounts_does_not_require_profile_dir():
     ]
     patches = _patch_db(rows, tmp)
     try:
-        result = accounts_module.list_available_accounts()
+        result = accounts_module.list_available_accounts().data
     finally:
         _stop_patches(patches)
 
@@ -110,7 +111,7 @@ def test_list_available_accounts_no_storage_json_dependency():
     (storage_dir / "storage.json").write_text("{not valid json", encoding="utf-8")
     patches = _patch_db(rows, tmp)
     try:
-        result = accounts_module.list_available_accounts()
+        result = accounts_module.list_available_accounts().data
     finally:
         _stop_patches(patches)
 
