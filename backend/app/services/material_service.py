@@ -1020,6 +1020,19 @@ def _run_pull_round(task_id: str, info) -> str:
     search_session = None
     aweme_ids: list[str] = []
     try:
+        # #偶发登录态 兜底层 1（2026-10-19）：profile 物理完整性预校验。
+        # 与发布路径 client.py:549-555 / 账号检测 account_service.py:206-216 对齐——
+        # profile 物理 cookies 文件缺失（账号添加时 _move_profile_dir 静默失败 /
+        # data_dir 漂移 / 系统 Temp 清理 / 异常关机损坏）时，chromium 启动后访问
+        # douyin.com 永远未登录，但 DB status='normal' → 拉取反复失败但不感知。
+        # 缺则走现有 except LoginInvalidError 分支：账号置 invalid + notifier 通知前端。
+        has_cookies = (profile_dir / "Default" / "Network" / "Cookies").exists() or \
+                      (profile_dir / "Default" / "Cookies").exists()
+        if not has_cookies:
+            raise LoginInvalidError(
+                f"账号 {account['id']} profile 缺失或 cookies 为空，请先登录"
+            )
+
         # ==================== 阶段 A：搜索 + 筛选 + 翻页 ====================
         # 复用 search_all_for_ids（v5 wheel + 筛选面板 UI 化），不再逐页遍历。
         # _searched_keyword 由 BrowserSearchSession 内部维护：同 keyword 跨任务复用。

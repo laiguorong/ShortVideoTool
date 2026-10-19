@@ -174,6 +174,12 @@ class BrowserSearchSession:
         # 2026-09-30 v2：导航到抖音首页（建立登录态 + 搜索框 DOM），
         # 后续 search_page 通过 fill + Enter 在站内触发搜索。
         # 直跳 search/<keyword> 会被风控识别为爬虫（缺 keyboard event 指纹）。
+        # #偶发登录态：chromium launch_persistent_context 启动成功返回 ctx 后，
+        # profile 文件（cookies/IndexedDB）是异步加载到 chromium 内存的——偶发场景下
+        # chromium "已启动" 但 cookies 还没真的加载完。访问 douyin.com 时服务端
+        # 看不到 sessionid → 重定向到登录页 / 触发风控 → goto 链长 → timeout。
+        # 异常不再静默吞掉：跳转 SearchBlockedError（material_service 现有 except 兜底
+        # 自动置账号 invalid + 通知前端重新登录），跟登录窗 / 账号检测 / 发布路径对齐。
         try:
             self._page.goto(
                 "https://www.douyin.com/", wait_until="load", timeout=40_000,
@@ -182,8 +188,38 @@ class BrowserSearchSession:
                 "[搜索] 已加载抖音首页 url={}", self._page.url,
             )
         except Exception as e:  # noqa: BLE001
-            # 首页加载失败不影响后续搜索（可能 profile 已带登录态），仅留痕
-            logger.warning("[搜索] 抖音首页加载异常：{}（继续走搜索）", e)
+            # 跟登录窗 open_login_window (browser.py:702-704) 不同：登录窗是用户手动操作本来就有
+            # 容错；素材拉取是 headless 全自动场景，goto 失败 = cookies 真的没加载成功，
+            # 继续走搜索只会反复风控。改为抛 SearchBlockedError 由 material_service 兜底。
+            logger.warning("[搜索] 抖音首页加载异常（登录态可能未生效）：{}", e)
+            raise SearchBlockedError(
+                f"抖音首页加载失败，登录态可能未生效：{str(e)[:80]}"
+            ) from e
+
+        # #偶发登录态 纵深防御：即便 goto 没抛异常（chromium cookies 异步加载但碰巧及时到位），
+        # 也主动校验 context.cookies() 含 sessionid——这是登录窗（browser.py:718）
+        # 和 check_account（DOM 渲染判定）的同源硬判据。sessionid 缺失 = 登录态真的没生效，
+        # 后续搜索 XHR 拦不到是必然结果，提前失败避免浪费 ~30s/页的翻页时间。
+        try:
+            cookies = self._ctx.cookies()
+            cookie_names = {c['name'] for c in cookies}
+            if 'sessionid' not in cookie_names:
+                logger.warning(
+                    "[搜索] 启动后 cookies 未含 sessionid，登录态失效（profile={}, cookies={}）",
+                    self._profile_dir,
+                    sorted(cookie_names),
+                )
+                raise SearchBlockedError(
+                    "账号登录态失效（sessionid 未加载），请重新登录"
+                )
+        except SearchBlockedError:
+            raise
+        except Exception as e:
+            # cookies() 自身异常（极少见）按登录态失效处理——避免静默放过
+            logger.warning("[搜索] 读取 context.cookies() 异常：{}", e)
+            raise SearchBlockedError(
+                f"登录态校验异常：{str(e)[:80]}"
+            ) from e
 
     def _on_response(self, r) -> None:
         """统一响应拦截：匹配抖音搜索结果 XHR 写入 _captured。
