@@ -41,11 +41,14 @@ class PageQuery(BaseModel):
 
 
 def normalize_naive_datetime(value: str | None) -> str | None:
-    """入参时间宽松归一化：接受 `yyyy-MM-dd HH:mm` 与 `yyyy-MM-dd HH:mm:ss`，
+    """入参时间宽松归一化：接受 `yyyy-MM-dd HH:mm`、`yyyy-MM-dd HH:mm:ss`、
+    `yyyy-MM-ddTHH:mm`、`yyyy-MM-ddTHH:mm:ss`（datetime-local 形态），
     统一输出 `yyyy-MM-dd HH:mm:ss`；空值原样返回。非法格式抛 ValueError。"""
     if value is None or value == "":
         return value
     v = value.strip()
+    # #597 兼容 datetime-local input 的 'T' 分隔（前端 <input type=datetime-local> 直接回填）
+    v = v.replace("T", " ")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             return datetime.strptime(v, fmt).strftime("%Y-%m-%d %H:%M:%S")

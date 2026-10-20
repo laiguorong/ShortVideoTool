@@ -69,3 +69,8 @@ backend/.pytest_cache/
 /backend/seed_*.sql
 /backend/v33_ddl.txt
 /backend/data_test/
+
+# ============ 营销 / 推广材料（不进库；本地用） ============
+# 推广文案 / 截图采集 SOP / 营销用截图（本地迭代快，对外发布时单独打包）
+# 注：docs/images/ 仍然进库（用户操作手册引用的是这里）
+docs/marketing/
