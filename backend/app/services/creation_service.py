@@ -1907,7 +1907,8 @@ def _pick_combinations(project_id: str, count: int,
     算法定义见 docs/视频组合算法约束.md：
       约束 1：同源率 ≤ 50%（同一 source_index 片段不超过半数）
       约束 2：位置重叠 ≤ 50%（与已生成组合比，全部位置）
-      约束 3：按权重 max(0, 10000 - used_count) 采样，同分镜下权重最高片段被选
+      约束 3：按权重 max(0, 10000 - used_count - batch_used) 采样，同分镜下权重最高片段被选
+          （batch_used 为批内内存增量，每次采样即 +1，保证批内采样点轮转）
       约束 4：同分镜下权重相同的片段 random.choice 均匀随机
 
     不再做笛卡尔积全量枚举——每轮每个分镜按权重采样 1 片段，
@@ -2002,12 +2003,43 @@ def _pick_combinations(project_id: str, count: int,
                     return True
         return False
 
+    # 批内采样增量：clip_id -> 本次 _pick_combinations 调用中被采样的次数。
+    #
+    # 为什么需要它（v25 防死锁）：
+    #   pools 里的 used_count 是 list_shots() 一次性读出的 DB 快照，整个批内不变。
+    #   若只用它算权重，某分镜一旦出现唯一最高权重片段，采样点就被钉死：
+    #   每轮都重抽同一组合 → 该组合被约束拒 → 采样点仍不动 → 连续失败触顶
+    #   max_consecutive_fail → 本批 0 条，且下一批同样锁死（自我强化死锁）。
+    #   叠加 batch_used 后，每次采样都把该片段权重压低 1，top 集合自动漂移到其他片段。
+    #   源码级 A/B 实测（4镜×10片 / 4批，唯一变量 = 下面这行的累加）：
+    #       有 batch_used -> [20, 20, 20, 20]
+    #       无 batch_used -> [20,  0,  0,  0]      第 2 批起必然全 0
+    #
+    # 为什么用独立 dict 而不直接改 pools 里的 used_count：
+    #   pools 的 clip dict 是 list_shots() 的返回值，改它等于把内存采样量
+    #   混入持久化口径——渲染失败的组合不该拉高 DB 计数（_run_generate 只在
+    #   渲染成功的事务里 +1），混在一起会让 used_count 虚高且无法回退。
+    #
+    # 作用域：仅本批次（函数返回即丢弃）。跨批次均衡由 DB used_count 承担。
+    _batch_used: dict[str, int] = {}
+
     def pick_one_by_weight(shot_clips: list[dict]) -> dict:
-        """约束 3+4：按权重 max(0, 10000 - used_count) 采样，同权重 random.choice。"""
-        weights = [max(0, 10000 - (c.get("used_count") or 0)) for c in shot_clips]
+        """约束 3+4：按权重 max(0, 10000 - used_count - batch_used) 采样，同权重随机。
+
+        算法（argmax + 平局随机，**不是**按权重比例抽样）：
+            weights[i] = max(0, 10000 - used_count_i - batch_used_i)
+            top        = 所有权重等于 max(weights) 的片段
+            chosen     = random.choice(top)
+        """
+        weights = [max(0, 10000 - (c.get("used_count") or 0) - _batch_used.get(c["id"], 0))
+                   for c in shot_clips]
         max_w = max(weights)
         top = [c for c, w in zip(shot_clips, weights) if w == max_w]
-        return _random.choice(top)
+        chosen = _random.choice(top)
+        # 每次采样即轮转（含被后续约束拒绝的），保证重抽时采样点会移动；
+        # 只在成功收下时才 +1 会把 top 宽度锁死为 1，造成自我强化的死锁。
+        _batch_used[chosen["id"]] = _batch_used.get(chosen["id"], 0) + 1
+        return chosen
 
     # 接受-拒绝采样循环
     picked: list[list[dict]] = []
