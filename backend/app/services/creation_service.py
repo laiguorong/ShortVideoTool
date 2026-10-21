@@ -51,6 +51,68 @@ from app.db import get_db
 from app.db.utils import new_id, now_str
 from app.services import material_service
 from app.services.setting_service import get_data_dir
+
+# ---------- 素材引用次数（material.ref_count，v129） ----------
+
+def _recount_refs(d, material_ids: list[str]) -> None:
+    """按「引用该素材的项目数」重算 material.ref_count。
+
+    语义（用户拍板 2026-10-21）：同一项目多次添加同一素材算一次，
+    不同项目添加同一素材算多次。即 ref_count = COUNT(DISTINCT 引用项目数)。
+
+    为什么用重算而非增量累加：
+      - 重算是幂等操作，任何时候调都对；增量累加一旦某条增删路径漏改就永久漂移
+      - 天然处理"同源片段删到最后一个才递减"——不需要手工判断删光没删光
+      - JOIN project WHERE deleted=0 使**软删项目自动排除**，delete_project
+        只需软删后调本函数，引用数即正确归零
+
+    统计口径：片段（project_shot_clip → project_shot → project）
+      ∪ 项目 BGM 池（project_bgm → project）两路合并。
+      视频素材只会进片段池、音乐素材只会进 BGM 池，material_id 天然不重叠，
+      但仍用 UNION 去重以防将来放开类型限制。
+
+    参数:
+        d: 数据库句柄（复用调用方的连接，避免重复 get_db）
+        material_ids: 需要重算的素材 ID 列表（内部去重；空列表直接返回）
+    """
+    ids = [m for m in {mid for mid in material_ids if mid}]
+    if not ids:
+        return
+    # 分批 500：SQLite 单语句变量数上限 999
+    BATCH = 500
+    for start in range(0, len(ids), BATCH):
+        chunk = ids[start:start + BATCH]
+        placeholders = ",".join("?" * len(chunk))
+        params = tuple(chunk)
+        # 两路引用合并：片段引用 + BGM 池引用，各自 DISTINCT 项目后取并集
+        n = d.query_one(
+            f"""SELECT COUNT(*) AS n FROM (
+                    SELECT DISTINCT p.id
+                      FROM project_shot_clip c
+                      JOIN project_shot s ON c.shot_id = s.id
+                      JOIN project p ON s.project_id = p.id
+                     WHERE p.deleted = 0 AND c.material_id IN ({placeholders})
+                    UNION
+                    SELECT DISTINCT p.id
+                      FROM project_bgm b
+                      JOIN project p ON b.project_id = p.id
+                     WHERE p.deleted = 0 AND b.material_id IN ({placeholders})
+                )""",
+            params + params,
+        )
+        count = int(n["n"]) if n else 0
+        # 双重保险：COUNT(*) 本身恒 >= 0，这里再 max(0, ...) 并在 SQL 里套
+        # MAX(0, ?)，确保**任何情况下** ref_count 都不会被写成负数——
+        # 即使将来有人改动统计逻辑、或复用本 helper 做递减式维护。
+        count = max(0, count)
+        # 同步 update_time，保持与项目其它写操作一致的时间戳习惯
+        d.execute(
+            f"UPDATE material SET ref_count=MAX(0, ?), update_time=? "
+            f"WHERE id IN ({placeholders})",
+            (count, now_str(), *chunk),
+        )
+
+
 from app.services.task_service import task_service, raise_for_cancel, _TaskCancelled, _fmt_hms, TaskInfo
 
 # 上限（F-04-R1）
@@ -199,6 +261,18 @@ def delete_project(project_id: str, delete_files: bool) -> None:
     d = get_db()
     if not d.query_one("SELECT id FROM project WHERE id=? AND deleted=0", (project_id,)):
         raise HTTPException(status_code=404, detail="项目不存在")
+    # v129：先取出该项目引用的全部素材（片段 + BGM），软删后重算 ref_count。
+    # 片段行在软删后仍留在表里，靠 _recount_refs 里的 `p.deleted=0` 自动排除。
+    used_mids = [
+        r["material_id"] for r in d.query_all(
+            """SELECT DISTINCT c.material_id FROM project_shot_clip c
+               JOIN project_shot s ON c.shot_id=s.id
+               WHERE s.project_id=?""", (project_id,))
+    ]
+    used_mids += [
+        r["material_id"] for r in d.query_all(
+            "SELECT material_id FROM project_bgm WHERE project_id=?", (project_id,))
+    ]
     if delete_files:
         finished_dir = get_data_dir() / "finished" / project_id
         if finished_dir.exists():
@@ -208,6 +282,8 @@ def delete_project(project_id: str, delete_files: bool) -> None:
     if project_dir.exists():
         shutil.rmtree(project_dir, ignore_errors=True)
     d.soft_delete_by_id("project", project_id)
+    # v129：软删后重算——p.deleted=0 过滤生效，该项目的引用不再计入
+    _recount_refs(d, used_mids)
 
 
 def copy_project(project_id: str, new_title: str) -> dict:
@@ -259,6 +335,17 @@ def copy_project(project_id: str, new_title: str) -> dict:
     for bgm in d.query_all("SELECT * FROM project_bgm WHERE project_id=?", (project_id,)):
         d.insert("project_bgm", {"project_id": new_id_, "material_id": bgm["material_id"],
                                   "sort_order": bgm["sort_order"]})
+    # v129：复制 = 新项目引用同一批素材 → 这些素材的 ref_count 应 +1
+    #（若原素材还被其它项目引用，则是 N→N+1）
+    _recount_refs(d, [
+        r["material_id"] for r in d.query_all(
+            """SELECT DISTINCT c.material_id FROM project_shot_clip c
+               JOIN project_shot s ON c.shot_id=s.id
+               WHERE s.project_id=?""", (new_id_,))
+    ] + [
+        r["material_id"] for r in d.query_all(
+            "SELECT material_id FROM project_bgm WHERE project_id=?", (new_id_,))
+    ])
     return get_project(new_id_)
 
 
@@ -416,6 +503,9 @@ def delete_shot(shot_id: str) -> None:
     d.execute("DELETE FROM project_shot_clip WHERE shot_id=?", (shot_id,))
     d.execute("DELETE FROM project_shot WHERE id=?", (shot_id,))
     _cleanup_clip_files(clip_rows)
+    # v129：分镜片段连带删除 → 重算受影响素材的 ref_count。
+    # 用 clip_rows 里的 material_id（可能多行同素材，去重由 helper 处理）。
+    _recount_refs(d, [r["material_id"] for r in clip_rows])
     # 重排剩余分镜顺序
     shots = d.query_all(
         "SELECT id FROM project_shot WHERE project_id=? ORDER BY sort_order", (shot["project_id"],))
@@ -780,6 +870,19 @@ def add_clips_from_materials(project_id: str, material_ids: list[str],
             "last_source_index": src_index_start + video_count})
 
     _safe_refresh_project_legal_total(project_id)
+    # v129：片段已入库 → 重算被引用素材的 ref_count。
+    # 从**新建的片段**反查 material_id，而不是用入参 material_ids——
+    #   1) 入参含被画幅/切割跳过的，不该算成已引用；
+    #   2) src_of 只在 target_shot_ids 分支定义，另两条分支是标量 src_index，
+    #      引用它会 NameError。
+    if new_clip_ids:
+        ph = ",".join("?" * len(new_clip_ids))
+        used_mids = [
+            r["material_id"] for r in d.query_all(
+                f"SELECT DISTINCT material_id FROM project_shot_clip WHERE id IN ({ph})",
+                tuple(new_clip_ids))
+        ]
+        _recount_refs(d, used_mids)
     return {"clip_count": len(new_clip_ids), "skipped": skipped,
             "per_shot": counts, "render_queued": len(new_clip_ids),
             "bg_task_id": bg_task_id}
@@ -1477,6 +1580,9 @@ def delete_clip(clip_id: str) -> None:
         return
     d.execute("DELETE FROM project_shot_clip WHERE id=?", (clip_id,))
     _cleanup_clip_files([clip])
+    # v129：删除后重算该素材 ref_count——同源片段删到最后一个时自然归零，
+    # 删到一半不动（重算而非累减，故无需判断"是否删光"）。
+    _recount_refs(d, [clip["material_id"]])
     if clip.get("_pid"):
         _safe_refresh_project_legal_total(clip["_pid"])
 
@@ -1514,6 +1620,8 @@ def delete_clips_by_material(project_id: str, material_ids: list[str]) -> int:
     d.execute(
         f"DELETE FROM project_shot_clip WHERE id IN ({clip_placeholders})",
         tuple(clip_ids))
+    # v129：批删后重算受影响素材（仅当前项目内的引用变化，跨项目不受影响）
+    _recount_refs(d, list(ids))
     # 仅 refresh 限定项目（理论只一个，循环兼容历史脏数据）
     for pid in {r["_pid"] for r in rows if r.get("_pid")}:
         _safe_refresh_project_legal_total(pid)
@@ -1712,6 +1820,9 @@ def add_bgms(project_id: str, material_ids: list[str]) -> int:
                                   "sort_order": order})
         order += 1
         added += 1
+    # v129：BGM 入池 → 重算被引用音乐素材的 ref_count
+    if added:
+        _recount_refs(d, material_ids)
     return added
 
 
@@ -1719,6 +1830,8 @@ def remove_bgm(project_id: str, material_id: str) -> None:
     """移除 BGM。"""
     get_db().execute("DELETE FROM project_bgm WHERE project_id=? AND material_id=?",
                      (project_id, material_id))
+    # v129：移出 BGM 池 → 重算该音乐素材 ref_count
+    _recount_refs(get_db(), [material_id])
 
 
 def list_bgms(project_id: str) -> list[dict]:

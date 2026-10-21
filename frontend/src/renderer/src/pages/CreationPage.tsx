@@ -15,9 +15,7 @@ import { cn } from '@/lib/utils'
 import { ProjectShopsDrawer } from './ProjectShopsDrawer'
 import { ProjectIntrosDrawer } from './ProjectIntrosDrawer'
 
-// 「未分类」虚拟分类 ID（与后端 UNCATEGORIZED_ID 保持一致）
-const UNCATEGORIZED_ID = '-'
-
+// v129：UNCATEGORIZED_ID 随 catName 一起移除（MaterialPicker 不再渲染分类列）
 /** 素材选择器：待选列表每页条数（#87/#89 服务端分页，默认 1000） */
 const PICKER_PAGE_SIZE = 1000
 /** 素材选择器：已选素材数量上限（#87） */
@@ -259,6 +257,8 @@ function MaterialPicker({ open, onOpenChange, type, multi, initialSelected, exis
   // 已加载过的素材详情缓存：跨分类、跨页累积，确保已选列表在切走分类后仍能展示标题/时长
   const [loadedMap, setLoadedMap] = useState<Map<string, Material>>(new Map())
   const [loadingPage, setLoadingPage] = useState(false)
+  // v129：「批量添加未选中」进行中（可能翻多页，按钮显示进行态防重复点击）
+  const [selectingAll, setSelectingAll] = useState(false)
   // 搜索关键词（#91）：输入即时反馈，debounce 后才触发请求
   const [keywordInput, setKeywordInput] = useState('')
   const [keyword, setKeyword] = useState('')
@@ -346,10 +346,7 @@ function MaterialPicker({ open, onOpenChange, type, multi, initialSelected, exis
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyword])
 
-  const catName = (id: string) => {
-    if (id === UNCATEGORIZED_ID) return '未分类'
-    return categories.find((c) => c.id === id)?.name ?? ''
-  }
+  // v129：待选列表不再显示分类列（原 w-20 那格已移除），catName 一并删除
   const childrenOf = (pid: string) => categories.filter((c) => c.parent_id === pid)
 
   // 当前页内未选的素材（分页只翻服务端返回的当前页，跨页全选通过翻页累积）
@@ -394,6 +391,92 @@ function MaterialPicker({ open, onOpenChange, type, multi, initialSelected, exis
     }
     if (hitLimit) toast(`最多只能选择 ${PICKER_MAX_SELECTED} 个素材，已选满`, 'error')
     setSelectedIds(next)
+  }
+
+  /** v129：批量添加"当前项目还不存在"的素材（跨页，保持当前分类/搜索/画幅过滤）。
+   *
+   * 「未选」= **不在当前项目里**（existingIds，即该项目的分镜片段 / BGM 池），
+   * 而不是"本次弹窗没勾选"。两者是不同的集合：
+   *   - existingSet：项目已存在（待选行上有灰勾 ✓，#389）
+   *   - selectedSet：本次弹窗已勾选（右侧「已选」列表）
+   * 用户点这个按钮的意图是"把这个项目还没有的素材都补进来"，
+   * 所以筛选用 existingSet；selectedSet 只用于去重（别重复勾已勾的）。
+   *
+   * 与「全选当前页」的区别：后者只处理已加载到内存的当前页（1000 条/页），
+   * 这个按剩余配额向后翻页取。单页不够填满配额时才翻页，常见情况不额外请求。
+   */
+  const selectAllUnselected = async () => {
+    if (!multi) return
+    if (selectedIds.length >= PICKER_MAX_SELECTED) {
+      toast(`最多只能选择 ${PICKER_MAX_SELECTED} 个素材，已选满`, 'error')
+      return
+    }
+    setSelectingAll(true)
+    try {
+      const base = (p: number, size: number): Record<string, string> => {
+        const params: Record<string, string> = {
+          type, page: String(p), page_size: String(size),
+        }
+        if (activeCat) params.category_id = activeCat
+        if (keyword) params.keyword = keyword
+        if (type === 'video' && projectOrientation) params.orientation = projectOrientation
+        return params
+      }
+      // 快照：点击瞬间的"项目已存在"集合（闭包内保持一致即可，见下方函数式更新注释）
+      const inProject = new Set(existingSet)
+      const picked: Material[] = []
+      let total = 0
+      const seen = new Set(selectedIds)
+      const take = (list: Material[]) => {
+        for (const m of list) {
+          // 每次重算配额：等待期间用户可能又加了别的（合并时还会再夹一次）
+          if (picked.length + selectedIds.length >= PICKER_MAX_SELECTED) break
+          // 已在当前项目里 → 跳过（这才是"未选"的语义）
+          if (inProject.has(m.id)) continue
+          // 本次弹窗已勾选 → 不重复加
+          if (seen.has(m.id)) continue
+          seen.add(m.id)
+          picked.push(m)
+        }
+      }
+      // 第一页（顺带拿 total：决定翻页数 + 提示还剩多少）
+      const first = await materialApi.list(base(1, PICKER_PAGE_SIZE))
+      total = first.total
+      take(first.list)
+      // 当前页没填满配额 → 继续翻页补齐
+      const totalPages = Math.max(1, Math.ceil(total / PICKER_PAGE_SIZE))
+      for (let p = 2; p <= totalPages && picked.length < PICKER_MAX_SELECTED; p++) {
+        const r = await materialApi.list(base(p, PICKER_PAGE_SIZE))
+        take(r.list)
+      }
+      if (picked.length === 0) {
+        toast('当前筛选下的素材都已在当前项目中', 'info')
+        return
+      }
+      // 补detail 缓存，保证右侧「已选」列表立刻显示标题/时长
+      setLoadedMap((prev) => {
+        const next = new Map(prev)
+        picked.forEach((m) => next.set(m.id, m))
+        return next
+      })
+      // 函数式更新：基于最新 prev 合并，避免闭包旧值覆盖用户等待期间的改动
+      setSelectedIds((prev) => {
+        const cur = new Set(prev)
+        const room = PICKER_MAX_SELECTED - prev.length
+        const add = picked.filter((m) => !cur.has(m.id)).slice(0, Math.max(0, room))
+        return add.length ? [...prev, ...add.map((m) => m.id)] : prev
+      })
+      // 达上限时明确告知，避免用户以为全加完了
+      if (total > picked.length) {
+        toast(`已选满 ${PICKER_MAX_SELECTED} 个（当前筛选下共 ${total} 条，可先移除部分再批量添加）`, 'info')
+      } else {
+        toast(`已添加 ${picked.length} 个当前项目尚无的素材`, 'success')
+      }
+    } catch (e) {
+      toast(`批量添加失败：${(e as Error).message}`, 'error')
+    } finally {
+      setSelectingAll(false)
+    }
   }
   /** 从已选移除 */
   const removeMaterial = (id: string) => setSelectedIds((prev) => prev.filter((x) => x !== id))
@@ -467,15 +550,44 @@ function MaterialPicker({ open, onOpenChange, type, multi, initialSelected, exis
             )}
             <div className="flex items-center gap-2">
               <span className="text-xs font-medium whitespace-nowrap">待选（共 {pageTotal} 条）</span>
-              <button type="button" className="ml-auto text-xs text-accent disabled:text-muted-foreground"
-                disabled={candidates.length === 0}
-                onClick={selectAllCandidates}>全选当前页</button>
+              <div className="ml-auto flex items-center gap-2">
+                <button type="button" className="text-xs text-accent disabled:text-muted-foreground"
+                  disabled={candidates.length === 0}
+                  onClick={selectAllCandidates}>全选当前页</button>
+                {/* v129：批量添加当前项目尚不存在的素材（跨页，保持当前分类/搜索条件）。
+                    四个禁用条件（任一满足即禁用）：
+                      1. selectingAll：请求进行中
+                      2. !multi：单选模式无"批量"可言
+                      3. 当前页没有「本项目还没用过」的素材（some 对空数组返回 false，
+                         列表为空时天然禁用——不能写 length > 0 && some，空数组会
+                         短路成不禁用）
+                      4. 当前页素材已全部加入已选（candidates 为空），点它不会有任何
+                         新增，纯属无效点击 */}
+                <button type="button"
+                  className="text-xs text-accent disabled:text-muted-foreground"
+                  disabled={selectingAll || !multi
+                    || !pageList.some((m) => !existingSet.has(m.id))
+                    || candidates.length === 0}
+                  onClick={selectAllUnselected}
+                  title="把当前筛选条件下、本项目还没用过的素材批量加入（最多 50 个）">
+                  {selectingAll ? '添加中…' : '全选未选'}
+                </button>
+              </div>
             </div>
             <input type="text" placeholder="搜索素材名称…" value={keywordInput}
               onChange={(e) => setKeywordInput(e.target.value)}
               className="h-7 w-full rounded-md border border-border bg-white px-2 text-xs" />
           </div>
           <div className="min-h-0 flex-1 overflow-auto">
+            {/* v129：列表列名（此前无表头，用户不知道右侧数字各是什么） */}
+            <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-muted/40 px-2 py-1 text-[10px] font-medium text-muted-foreground">
+              {/* 与数据行的条件渲染 ✓ 标记同宽，保证列对齐 */}
+              <span className="w-3 shrink-0" aria-hidden />
+              <span className="min-w-0 flex-1">素材名称</span>
+              <span className="w-10 shrink-0 text-right">引用</span>
+              <span className="w-10 shrink-0 text-right">时长</span>
+              <span className="w-14 shrink-0 text-right">大小</span>
+            </div>
             {loadingPage && pageList.length === 0 ? (
               <div className="py-10 text-center text-xs text-muted-foreground">加载中…</div>
             ) : pageCandidates.map((m) => (
@@ -485,11 +597,19 @@ function MaterialPicker({ open, onOpenChange, type, multi, initialSelected, exis
                 {/* #389：当前项目已用过的素材 → 标题前灰勾，hover 提示，不拦截勾选/确认 */}
                 {existingSet.has(m.id) && (
                   <Tooltip content="已存在当前项目（仅警示，可正常选择）">
-                    <span aria-label="已存在当前项目" className="shrink-0 text-muted-foreground/60">✓</span>
+                    {/* w-3 与表头占位同宽，保证有无标记时列都不错位 */}
+                    <span aria-label="已存在当前项目"
+                      className="w-3 shrink-0 text-center text-muted-foreground/60">✓</span>
                   </Tooltip>
                 )}
                 <span className="min-w-0 flex-1 truncate">{m.title}</span>
-                <span className="w-20 shrink-0 truncate text-muted-foreground">{catName(m.category_id)}</span>
+                {/* v129：引用次数（被几个项目引用），0 用淡化显示便于扫读 */}
+                <Tooltip content={`被 ${m.ref_count} 个项目引用`}>
+                  <span className={cn('w-10 shrink-0 text-right tabular-nums',
+                    m.ref_count > 0 ? 'text-foreground' : 'text-muted-foreground/50')}>
+                    {m.ref_count}
+                  </span>
+                </Tooltip>
                 <span className="w-10 shrink-0 text-right text-muted-foreground">
                   {m.duration_ms ? `${(m.duration_ms / 1000).toFixed(0)}s` : '-'}
                 </span>
@@ -1936,6 +2056,8 @@ function ProjectEditor({ projectId, onClose, resolutionPresets }: {
           ref_count: 0,
           create_time: '',
         } as Material))}
+        // v129：当前项目 BGM 池已有的素材（供「全选未选」判"项目里不存在"）
+        existingIds={bgms.map((b) => b.material_id)}
         onConfirm={async (ids) => {
           try {
             // #91：diff 增删（picker 内部状态即"目标全集"，提交时算差集）
