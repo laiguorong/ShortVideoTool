@@ -284,6 +284,22 @@ npm run dist                     # electron-builder → release/ShortVideoTool S
 
 **ffmpeg 必须含 libx264**——否则后端启动时 `check_ffmpeg_env` 抛 RuntimeError，主进程会弹错误框提示。
 
+> **`win.artifactName` 不能删（自动更新 404 的坑）**
+>
+> electron-builder 有两套命名，对「含空格」的处理不一致：
+> - 磁盘实际产出走默认模板 `${productName} Setup ${version}.${ext}` → `ShortVideoTool Setup 1.0.5.exe`
+> - 写进 `latest.yml` 的名字走 `computeSafeArtifactNameIfNeeded()`，发现含空格（GitHub 不允许）
+>   会**只把空格换成 `-`** → `ShortVideoTool-Setup-1.0.5.exe`
+>
+> 它改了 yml 里的名字，却**不重命名磁盘文件**，上传时也不会用改名后的名字 →
+> electron-updater 按 yml 里的连字符名去下载 → **404，自动更新永久失败**。
+> 实测 v1.0.3 / v1.0.4 / v1.0.5 全部踩中（`generateGithubInstallerName()` 那条 fallback 分支没走，
+> 因为空格替换后就已合法，不会再 fallback）。
+>
+> 修法：`win.artifactName` 显式钉成无空格模板 `${productName}-Setup-${version}.${ext}`，
+> 于是 `computeSafeArtifactNameIfNeeded()` 直接返回 `null`（沿用磁盘原名），两边天然一致。
+> **改版本号 / 改 productName 时别把这个字段删掉。**
+
 ### 跨平台可行性
 
 | 目标安装包 | 在 Windows 打 | 在 macOS 打 | 在 Linux 打 |
