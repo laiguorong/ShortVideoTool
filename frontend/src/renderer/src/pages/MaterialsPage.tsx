@@ -3,7 +3,7 @@ import { materialApi, type Category, type Material, type VideoPullTask } from '@
 import { accountApi, type AvailableAccount } from '@/api/account'
 import { fileUrl, request } from '@/api/client'
 import { Button } from '@/components/ui/button'
-import { PullTaskDialog, PullTaskPanel } from '@/components/shared/PullTaskManager'
+import { PullTaskDialog, PullTaskPanel, UserPullTaskDialog } from '@/components/shared/PullTaskManager'
 import { Dialog, ConfirmDialog } from '@/components/ui/dialog'
 import { Pagination } from '@/components/shared/Pagination'
 import { StatusBadge } from '@/components/shared/StatusBadge'
@@ -1177,6 +1177,8 @@ export function MaterialsPage() {
   const [shareOpen, setShareOpen] = useState(false)
   // 拉取任务：panelOpen=列表浮窗；editOpen=创建/编辑弹窗（叠上层，关闭后回浮窗）
   const [pullEditOpen, setPullEditOpen] = useState(false)
+  // v128 主页来源弹窗：与搜索弹窗互斥（任一时刻只开一个）
+  const [homeEditOpen, setHomeEditOpen] = useState(false)
   const [editPullTask, setEditPullTask] = useState<VideoPullTask | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Material | null>(null)
   const [detailTarget, setDetailTarget] = useState<Material | null>(null)
@@ -1468,8 +1470,17 @@ export function MaterialsPage() {
               <Button size="sm" onClick={() => { setManageMode(false); setCheckedIds(new Set()) }}>退出管理</Button>
             </>
           ) : tab === 'task' ? (
-            // 任务 tab：仅"创建拉取任务"按钮
-            <Button variant="outline" size="sm" onClick={() => { setEditPullTask(null); setPullEditOpen(true) }}>创建拉取任务</Button>
+            // 任务 tab：搜索来源 + 主页来源两个创建入口
+            <>
+              <Button variant="outline" size="sm"
+                onClick={() => { setEditPullTask(null); setHomeEditOpen(false); setPullEditOpen(true) }}>
+                创建拉取任务
+              </Button>
+              <Button size="sm"
+                onClick={() => { setEditPullTask(null); setPullEditOpen(false); setHomeEditOpen(true) }}>
+                通过抖音用户创建
+              </Button>
+            </>
           ) : (
             <>
               {/* 任务 #132：分享链接导入在音乐页签也显示（视频/原声 URL 都支持） */}
@@ -1491,7 +1502,14 @@ export function MaterialsPage() {
               await Promise.all([loadCategories(), loadAccounts()])
             } catch { /* 让弹窗照常开+select 显示加载提示 */ }
             setEditPullTask(t)
-            setPullEditOpen(true)
+            // v128：按来源开对应弹窗。用搜索弹窗编辑主页任务会静默抹掉
+            // homepage_urls（提交时 conditions 不含该字段 → 主页配置丢失）。
+            let isHome = false
+            try {
+              isHome = JSON.parse(t.conditions_json).source_mode === 'user_homepage'
+            } catch { /* JSON 异常按搜索任务处理 */ }
+            setPullEditOpen(!isHome)
+            setHomeEditOpen(isHome)
           }}
           onCreated={doRefresh}
           refreshTrigger={refreshTrigger}
@@ -1806,6 +1824,16 @@ export function MaterialsPage() {
           // #fix-pull-task-double-load：编辑保存后单独 setRefreshTrigger(+1) 让 PullTaskPanel 重载
           // （doRefresh 不再统一 setRefreshTrigger，避免切 tab 时多次请求）
           setPullEditOpen(false)
+          setEditPullTask(null)
+          doRefresh()
+          setRefreshTrigger((t) => t + 1)
+        }} />
+      {/* v128 主页来源弹窗：与搜索弹窗互斥，同一套 onDone 刷新逻辑 */}
+      <UserPullTaskDialog open={homeEditOpen}
+        onOpenChange={(v) => { if (!v) { setHomeEditOpen(false); setEditPullTask(null) } }}
+        categories={categories} accounts={accounts} editTarget={editPullTask}
+        onDone={() => {
+          setHomeEditOpen(false)
           setEditPullTask(null)
           doRefresh()
           setRefreshTrigger((t) => t + 1)

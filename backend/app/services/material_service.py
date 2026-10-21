@@ -106,6 +106,33 @@ def _progress_phase_a_done(total_ids: int, elapsed_s: int) -> str:
     )
 
 
+# ---------- 主页来源（v128）专用进度模板 ----------
+# 与搜索模板分家：用户看到"搜索阶段"会困惑（主页任务根本没搜索）。
+
+def _progress_home_idle(idx: int, total: int, elapsed_s: int) -> str:
+    """主页来源阶段 A 空闲模板：正在加载第 i/n 个主页。"""
+    return (
+        f"主页采集：正在加载第 {idx}/{total} 个主页..., 用时 {_fmt_hms(elapsed_s)}"
+    )
+
+
+def _progress_home_scrolling(idx: int, total: int, pages: int,
+                             videos: int, elapsed_s: int) -> str:
+    """主页来源阶段 A 翻页模板：第 i/n 个主页已抓到 X 页 / 累计 Y 条。"""
+    return (
+        f"主页采集（第 {idx}/{total} 个）：已抓到 {pages} 页 / 累计 {videos} 条视频，"
+        f"用时 {_fmt_hms(elapsed_s)}"
+    )
+
+
+def _progress_home_done(total_ids: int, skipped: int, elapsed_s: int) -> str:
+    """主页来源阶段 A→B 切换模板：新增候选 N 个（跳过已入库 M 个）。"""
+    return (
+        f"主页采集完成：新增候选 {total_ids} 个（跳过已入库 {skipped} 个），"
+        f"准备进入下载阶段，用时 {_fmt_hms(elapsed_s)}"
+    )
+
+
 def _progress_phase_b(new_count: int, skip_count: int, elapsed_s: int) -> str:
     """阶段 B 拉取中模板：与 DB 字段同源（已入库 / 跳过）。"""
     return (
@@ -640,6 +667,28 @@ def _duplicate_check(source_ref: str | None, md5: str) -> dict | None:
 
 # ---------- 视频拉取任务（F-03.2 / F-03.7） ----------
 
+def _attach_homepage_sec_uids(conditions: dict) -> dict:
+    """主页来源：创建/编辑时预解析 sec_uid 缓存进 conditions（返回新 dict）。
+
+    只在 source_mode=user_homepage 时动手；解析不出 sec_uid 的行不阻断创建
+    （执行时 _resolve_homepage_sec_uids 会再解析一次并逐行 warning），
+    避免用户填错一行链接就建不出任务。
+
+    homepage_urls 才是回填权威，本函数只写 homepage_sec_uids（派生数据）。
+    """
+    out = dict(conditions)
+    if (out.get("source_mode") or "search") != "user_homepage":
+        out.pop("homepage_urls", None)
+        out.pop("homepage_sec_uids", None)
+        return out
+    urls = [u.strip() for u in (out.get("homepage_urls") or []) if u and u.strip()]
+    if not urls:
+        raise ValueError("抖音用户主页链接不能为空（至少填一个，一行一个）")
+    out["homepage_urls"] = urls
+    out["homepage_sec_uids"] = _resolve_homepage_sec_uids(out)
+    return out
+
+
 def create_pull_task(task_name: str, conditions: dict, account_id: str,
                      category_id: str, interval_config: dict) -> dict:
     """创建视频拉取任务（定时）。"""
@@ -653,6 +702,7 @@ def create_pull_task(task_name: str, conditions: dict, account_id: str,
             "SELECT id FROM material_category WHERE id=? AND type='video' AND deleted=0",
             (category_id,)):
         raise ValueError("入库分类必须为视频类型分类")
+    conditions = _attach_homepage_sec_uids(conditions)
     task_id = d.insert("video_pull_task", {
         "task_name": task_name,
         "conditions_json": json.dumps(conditions, ensure_ascii=False),
@@ -679,7 +729,9 @@ def update_pull_task(task_id: str, task_name: str | None, conditions: dict | Non
     if task_name is not None:
         fields["task_name"] = task_name
     if conditions is not None:
-        fields["conditions_json"] = json.dumps(conditions, ensure_ascii=False)
+        fields["conditions_json"] = json.dumps(
+            _attach_homepage_sec_uids(conditions), ensure_ascii=False,
+        )
     if account_id is not None:
         fields["account_id"] = account_id
     if category_id is not None:
@@ -889,6 +941,10 @@ def _run_pull_round(task_id: str, info) -> str:
     # 一轮跑完才发现"为什么所有 title_regex 都没生效"。
     # 通俗日志：只输出非默认条件。
     filters = []
+    # v128：主页来源先打来源摘要，让用户一眼确认这轮爬的是哪几个主页
+    if (conditions.get("source_mode") or "search") == "user_homepage":
+        urls = [u for u in (conditions.get("homepage_urls") or []) if u and u.strip()]
+        filters.append(f"来源=抖音用户主页 × {len(urls)}")
     if conditions.get("title_regex"):
         filters.append(f"标题包含「{conditions['title_regex']}」")
     if conditions.get("orientation"):
@@ -944,6 +1000,13 @@ def _run_pull_round(task_id: str, info) -> str:
     # client.search_videos 内部用 _derive_search_keyword 派生，worker 不持有。
     # 这里派生一次，阶段 A + 早退重试共用。
     keyword = _derive_search_keyword(conditions)
+    # v128 作品来源分流：source_mode 缺省 = search（老任务 JSON 无此键，行为不变）。
+    # 主页模式不需要 keyword / 筛选面板 / 视频 tab 切换——那是搜索结果页专有能力。
+    source_mode = (conditions.get("source_mode") or "search").strip()
+    is_home_mode = source_mode == "user_homepage"
+    homepage_sec_uids = (
+        _resolve_homepage_sec_uids(conditions) if is_home_mode else []
+    )
     # 阶段 B 实际处理视频计数（外层作用域，供 finally 后的日志使用）。
     # 507 改造后已无逐页 page 计数（搜索阶段一次拿完 + 阶段 B 按 aweme_id 循环），
     # 日志「拉取完成 第 X 页」改用阶段 B 处理数代替。
@@ -968,7 +1031,13 @@ def _run_pull_round(task_id: str, info) -> str:
         elapsed = int(time.time() - round_start)
         if _search_phase_active.is_set():
             # 阶段 A：写入「翻页采集中」模板（含已用时）
-            info.progress = _progress_phase_a_idle(elapsed)
+            # v128：主页来源用「主页采集」模板（用户看到"搜索阶段"会困惑）
+            if _home_state["active"]:
+                info.progress = _progress_home_idle(
+                    _home_state["idx"], _home_state["total"], elapsed,
+                )
+            else:
+                info.progress = _progress_phase_a_idle(elapsed)
         # 阶段 B：不覆盖 _fmt_progress 写入的详细模板
         # 兜底：info.progress 为空时写入拉取中模板（防止前端显示空 progress）
         elif not info.progress:
@@ -982,6 +1051,19 @@ def _run_pull_round(task_id: str, info) -> str:
     # associated with a value in enclosing scope"。
     _search_phase_active = threading.Event()
     _search_phase_active.set()  # 默认搜索阶段（_run_pull_round 入口）
+
+    # v128 主页来源状态：active=False 表示搜索来源（进度走搜索模板）。
+    # 用 dict 而非 nonlocal：_write_progress / _on_home_progress 都是闭包，
+    # dict 原地改最省事（idx 由采集进度回调实时更新）。
+    # idx 初始为 1（不是 0）：keepalive 首次 tick 可能早于首个主页回调，
+    # 否则用户会看到"正在加载第 0/N 个主页"。
+    # total 用 max(1, N) 是为了主页链接全解析失败时仍走主页模板，
+    # 让用户看到"第 1/1 个主页"再拿到 fail_reason，而不是错看成搜索模板。
+    _home_state: dict = {
+        "active": is_home_mode,
+        "idx": 1,
+        "total": max(1, len(homepage_sec_uids)),
+    }
 
     # 入循环前先写一次初始 progress——首轮 search_videos 期间（约 5-20s，
     # 含 XHR + 风控握手）状态栏才能看到「拉取第 1/N 页」而不是空白，
@@ -1033,76 +1115,125 @@ def _run_pull_round(task_id: str, info) -> str:
                 f"账号 {account['id']} profile 缺失或 cookies 为空，请先登录"
             )
 
-        # ==================== 阶段 A：搜索 + 筛选 + 翻页 ====================
-        # 复用 search_all_for_ids（v5 wheel + 筛选面板 UI 化），不再逐页遍历。
-        # _searched_keyword 由 BrowserSearchSession 内部维护：同 keyword 跨任务复用。
-        search_session = BrowserSearchSession(profile_dir, headless=None)
-        # 进度模板：搜索阶段（B2: 单点 helper 维护）
-        info.progress = _progress_phase_a_idle(int(time.time() - round_start))
-        # A4: 阶段 A 启动日志改 DEBUG。用户已从 progress「搜索阶段：翻页采集中...」
-        # + task_service 状态感知任务在跑，避免「开始搜索」INFO 与 search_api 内部
-        # 「[搜索] 启动浏览器」+「已发起搜索」三连刷屏。debug 留 trace 供排障。
-        logger.debug("[拉取] 任务「{}」阶段 A 启动关键词={}", task["task_name"], keyword)
-
-        # 任务 #589：实时翻页进度回调，每抓到一页 XHR 调一次刷新 info.progress
-        def _on_scroll_progress(total_pages: int, total_videos: int) -> None:
-            info.progress = _progress_phase_a_scrolling(
-                total_pages, total_videos, int(time.time() - round_start),
+        # ==================== 阶段 A：搜索 / 主页采集 ====================
+        # v128：按 conditions.source_mode 分流作品来源。
+        # - search（缺省，老任务）→ 原搜索逻辑，本块内容逐字不变
+        # - user_homepage         → goto 用户主页 + wheel 滚动拿 aweme_id
+        # 两条分支汇合后共用阶段 B（详情/过滤/下载/入库），B 不区分来源。
+        if is_home_mode:
+            from app.core.douyin.user_post_api import BrowserUserPostSession
+            search_session = BrowserUserPostSession(profile_dir, headless=None)
+            home_total = max(1, len(homepage_sec_uids))
+            info.progress = _progress_home_idle(
+                1, home_total, int(time.time() - round_start),
+            )
+            logger.debug(
+                "[拉取] 任务「{}」阶段 A 启动，主页来源，{} 个主页",
+                task["task_name"], len(homepage_sec_uids),
             )
 
-        aweme_ids = search_session.search_all_for_ids(
-            keyword=keyword, conditions=conditions,
-            idle_timeout=60, max_pages=page_budget,
-            debug=load_settings().get("pull_debug", False),
-            progress_cb=_on_scroll_progress,
-        )
-        _write_progress()
-        if not aweme_ids:
-            # 507 改造：搜索阶段 0 数据 → 早退重试整轮搜索
-            # 重试 2 次（30s/45s），仍无数据 → fail_reason 走 B
-            logger.info("[拉取] 没搜到任何视频，准备重试")
-            retried_with_data = False
-            for retry in range(2):
-                wait_sec = 30 + retry * 15
-                logger.warning(
-                    "[拉取] 没搜到内容，{}s 后再试一次（共{}次）",
-                    wait_sec, 2,
+            # 实时进度回调：签名 (当前主页序号, 主页总数, 累计页数, 累计作品数)
+            def _on_home_progress(idx: int, total: int, pages: int, videos: int) -> None:
+                _home_state["idx"] = idx
+                info.progress = _progress_home_scrolling(
+                    idx, total, pages, videos, int(time.time() - round_start),
                 )
-                # #审查 #3 修复：原版 _time.sleep(5) 循环阻塞主线程 + 不响应
-                # 取消信号，30+45s 累计 75s 长 sleep 在 video_pull 池（单 worker）
-                # 里直接占住调度线程，其他任务调度延迟叠加。改用 interruptible_sleep
-                # 支持取消信号立即唤醒，同时让 progress 模板反映倒计时。
-                from app.services.task_service import interruptible_sleep
-                import time as _time
-                # 顶层 cancel-friendly sleep（切片前先做一次整体等待；cancel 时立即唤醒）
-                interruptible_sleep(wait_sec, info)
-                _wait_start = _time.time()
-                while _time.time() - _wait_start < wait_sec:
-                    _remaining = int(wait_sec - (_time.time() - _wait_start))
-                    info.progress = _progress_phase_a_retry(
-                        retry + 1, _remaining, int(_time.time() - round_start),
-                    )
-                    # interruptible_sleep 收到 cancel_requested 会抛 _TaskCancelled，
-                    # 由外层 raise_for_cancel 一致处理；sleep 切片 1s 保持 progress 频率
-                    interruptible_sleep(min(1, wait_sec - (_time.time() - _wait_start)), info)
-                aweme_ids = search_session.search_all_for_ids(
-                    keyword=keyword, conditions=conditions,
-                    idle_timeout=60, max_pages=page_budget,
-                    debug=load_settings().get("pull_debug", False),
-                    progress_cb=_on_scroll_progress,
-                )
-                if aweme_ids:
-                    retried_with_data = True
-                    break
-            if not retried_with_data:
+
+            aweme_ids = search_session.collect_homepage_ids(
+                homepage_sec_uids, page_budget, progress_cb=_on_home_progress,
+            )
+            _write_progress()
+            if not aweme_ids:
+                # 主页来源不做 30s+45s 整轮重试：单个主页 0 数据通常是该博主没作品
+                # 或链接失效，重试同一条链接没有意义（搜索的无结果才可能是风控抖动）。
                 fail_reason = (
-                    "搜索阶段未获取到任何视频（疑似风控或关键词无结果），"
-                    "建议放宽过滤或重新启用任务"
+                    "主页采集未获取到任何作品（请检查主页链接是否有效、"
+                    "账号是否已登录、该博主是否公开了作品）"
                 )
+            else:
+                # 已入库预过滤（仅主页模式）：博主作品固定，第 2 轮起全是老作品，
+                # 而阶段 B 每条详情要 5-10s。搜索靠阶梯翻页每轮有新内容，不受影响。
+                candidate_total = len(aweme_ids)
+                aweme_ids, dup_count = _filter_existing_aweme_ids(aweme_ids)
+                logger.info(
+                    "[拉取] 主页采集到 {} 个作品，已入库跳过 {} 个，本轮待处理 {} 个",
+                    candidate_total, dup_count, len(aweme_ids),
+                )
+                info.progress = _progress_home_done(
+                    len(aweme_ids), dup_count, int(time.time() - round_start),
+                )
+        else:
+            # 复用 search_all_for_ids（v5 wheel + 筛选面板 UI 化），不再逐页遍历。
+            # _searched_keyword 由 BrowserSearchSession 内部维护：同 keyword 跨任务复用。
+            search_session = BrowserSearchSession(profile_dir, headless=None)
+            # 进度模板：搜索阶段（B2: 单点 helper 维护）
+            info.progress = _progress_phase_a_idle(int(time.time() - round_start))
+            # A4: 阶段 A 启动日志改 DEBUG。用户已从 progress「搜索阶段：翻页采集中...」
+            # + task_service 状态感知任务在跑，避免「开始搜索」INFO 与 search_api 内部
+            # 「[搜索] 启动浏览器」+「已发起搜索」三连刷屏。debug 留 trace 供排障。
+            logger.debug("[拉取] 任务「{}」阶段 A 启动关键词={}", task["task_name"], keyword)
+
+            # 任务 #589：实时翻页进度回调，每抓到一页 XHR 调一次刷新 info.progress
+            def _on_scroll_progress(total_pages: int, total_videos: int) -> None:
+                info.progress = _progress_phase_a_scrolling(
+                    total_pages, total_videos, int(time.time() - round_start),
+                )
+
+            aweme_ids = search_session.search_all_for_ids(
+                keyword=keyword, conditions=conditions,
+                idle_timeout=60, max_pages=page_budget,
+                debug=load_settings().get("pull_debug", False),
+                progress_cb=_on_scroll_progress,
+            )
+            _write_progress()
+            if not aweme_ids:
+                # 507 改造：搜索阶段 0 数据 → 早退重试整轮搜索
+                # 重试 2 次（30s/45s），仍无数据 → fail_reason 走 B
+                logger.info("[拉取] 没搜到任何视频，准备重试")
+                retried_with_data = False
+                for retry in range(2):
+                    wait_sec = 30 + retry * 15
+                    logger.warning(
+                        "[拉取] 没搜到内容，{}s 后再试一次（共{}次）",
+                        wait_sec, 2,
+                    )
+                    # #审查 #3 修复：原版 _time.sleep(5) 循环阻塞主线程 + 不响应
+                    # 取消信号，30+45s 累计 75s 长 sleep 在 video_pull 池（单 worker）
+                    # 里直接占住调度线程，其他任务调度延迟叠加。改用 interruptible_sleep
+                    # 支持取消信号立即唤醒，同时让 progress 模板反映倒计时。
+                    from app.services.task_service import interruptible_sleep
+                    import time as _time
+                    # 顶层 cancel-friendly sleep（切片前先做一次整体等待；cancel 时立即唤醒）
+                    interruptible_sleep(wait_sec, info)
+                    _wait_start = _time.time()
+                    while _time.time() - _wait_start < wait_sec:
+                        _remaining = int(wait_sec - (_time.time() - _wait_start))
+                        info.progress = _progress_phase_a_retry(
+                            retry + 1, _remaining, int(_time.time() - round_start),
+                        )
+                        # interruptible_sleep 收到 cancel_requested 会抛 _TaskCancelled，
+                        # 由外层 raise_for_cancel 一致处理；sleep 切片 1s 保持 progress 频率
+                        interruptible_sleep(min(1, wait_sec - (_time.time() - _wait_start)), info)
+                    aweme_ids = search_session.search_all_for_ids(
+                        keyword=keyword, conditions=conditions,
+                        idle_timeout=60, max_pages=page_budget,
+                        debug=load_settings().get("pull_debug", False),
+                        progress_cb=_on_scroll_progress,
+                    )
+                    if aweme_ids:
+                        retried_with_data = True
+                        break
+                if not retried_with_data:
+                    fail_reason = (
+                        "搜索阶段未获取到任何视频（疑似风控或关键词无结果），"
+                        "建议放宽过滤或重新启用任务"
+                    )
         # 阶段 A→B 切换标记（主路径 + retry 路径退出后统一刷一次）：
         # 避免 frontend 在阶段切换瞬间读到陈旧的"翻页采集中..."或"重试等待中..."残留，
         # 也避免 _run_detail_phase 第一帧"下载第 1/N 个 准备中"被误以为是阶段 A 的输出。
-        if aweme_ids:
+        # v128：主页来源已在本分支内写过 _progress_home_done（含已入库跳过数），
+        # 这里不再覆盖。
+        if aweme_ids and not is_home_mode:
             info.progress = _progress_phase_a_done(
                 len(aweme_ids), int(time.time() - round_start),
             )
@@ -1410,6 +1541,72 @@ def _which_blocked(video: dict, conditions: dict) -> str:
                 if under:
                     return f"duration_range(需要 {dr}, 时长 {dms / 1000:.1f}s)"
     return ""
+
+
+def _filter_existing_aweme_ids(aweme_ids: list[str]) -> tuple[list[str], int]:
+    """按 material.source_ref 过滤已入库作品 ID，返回 (新候选列表, 已入库数)。
+
+    v128 主页来源专用。阶段 B 每条详情抓取要 5-10s，而一个博主的作品是固定的
+    ——第 2 轮开始阶段 A 扫到的全是已入库的老作品，不预过滤等于每次调度都在
+    重复抓同一批视频。搜索来源靠阶梯翻页（100→90→80 页）每轮能翻到新内容，
+    所以这个优化**只挂在主页分支**，不改变搜索任务的任何行为。
+
+    分批 500 查：SQLite 单条语句变量数上限（默认 999），主页作品多的博主
+    一次 IN 可能超限。
+
+    入库时 source_ref 存的就是 aweme_id（见 _download_and_ingest），
+    且表上有 UNIQUE 索引兜底跨进程并发，这里只做"减少无效详情抓取"的优化，
+    不是幂等保证。
+    """
+    if not aweme_ids:
+        return [], 0
+    d = get_db()
+    existing: set[str] = set()
+    batch_size = 500
+    for start in range(0, len(aweme_ids), batch_size):
+        chunk = aweme_ids[start:start + batch_size]
+        placeholders = ",".join("?" * len(chunk))
+        rows = d.query_all(
+            f"SELECT source_ref FROM material "
+            f"WHERE deleted=0 AND source_ref IN ({placeholders})",
+            tuple(chunk),
+        )
+        for row in rows:
+            ref = row.get("source_ref")
+            if ref:
+                existing.add(ref)
+    fresh = [aid for aid in aweme_ids if aid not in existing]
+    return fresh, len(existing)
+
+
+def _resolve_homepage_sec_uids(conditions: dict) -> list[str]:
+    """解析拉取条件里的主页 sec_uid 列表（优先用缓存，为空才实时解析）。
+
+    - `homepage_sec_uids` 是创建/编辑任务时算好的缓存（派生数据）；
+    - `homepage_urls` 是用户原始输入行，回填权威，链接改了就重新解析；
+    - 缓存为空或与 urls 不匹配 → 实时解析一次。
+    """
+    from app.core.douyin.user_post_api import extract_sec_uid
+    urls = [u.strip() for u in (conditions.get("homepage_urls") or []) if u and u.strip()]
+    if not urls:
+        return []
+    cached = [s for s in (conditions.get("homepage_sec_uids") or []) if s]
+    if len(cached) == len(urls):
+        return cached
+    sec_uids: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        sec_uid = extract_sec_uid(url)
+        if not sec_uid:
+            logger.warning(
+                "[拉取] 主页链接无法解析 sec_uid，已跳过该行：{!r:.80}", url,
+            )
+            continue
+        if sec_uid in seen:
+            continue
+        seen.add(sec_uid)
+        sec_uids.append(sec_uid)
+    return sec_uids
 
 
 def _parse_publish_ts(value) -> int | None:

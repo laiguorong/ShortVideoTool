@@ -32,6 +32,7 @@ interface TreeNode extends Category {
   path: string
 }
 
+/** 视频分类下拉选项（未分类虚拟节点 + 视频类型树，两个弹窗共用） */
 /** 平铺分类组树 */
 function buildTree(rows: Category[]): TreeNode[] {
   const map = new Map<string, TreeNode>()
@@ -58,6 +59,84 @@ function flattenTree(nodes: TreeNode[], depth = 0): { node: TreeNode; depth: num
   })
   return out
 }
+
+function videoCategoryOptions(categories: Category[]) {
+  return flattenTree(buildTree(categories.filter((c) => c.type === 'video')))
+}
+
+/** 拉取账号下拉选项（两个弹窗共用） */
+function accountOptions(accounts: AvailableAccount[]) {
+  return accounts.map((a) => (
+    <option key={a.id} value={a.id}>
+      {a.remark || a.nickname}（{accountStatusLabel(a.status)}）
+    </option>
+  ))
+}
+
+/** 执行间隔选择器（两个弹窗共用，避免两处漂移） */
+function IntervalPicker({ intervalType, intervalValue, intervalTime, onChange }: {
+  intervalType: 'minute' | 'hour' | 'daily'
+  intervalValue: number
+  intervalTime: string
+  onChange: (v: { intervalType: 'minute' | 'hour' | 'daily'; intervalValue: number; intervalTime: string }) => void
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-sm font-medium">执行时间间隔</label>
+      <div className="flex items-center gap-2">
+        <select className="h-9 rounded-md border border-border bg-white px-2 text-sm"
+          value={intervalType} onChange={(e) => onChange({ ...{ intervalType, intervalValue, intervalTime }, intervalType: e.target.value as any })}>
+          <option value="minute">每 N 分钟</option>
+          <option value="hour">每 N 小时</option>
+          <option value="daily">每天固定时刻</option>
+        </select>
+        {intervalType === 'daily' ? (
+          <input type="time" className="h-9 rounded-md border border-border bg-white px-3 text-sm"
+            value={intervalTime} onChange={(e) => onChange({ intervalType, intervalValue, intervalTime: e.target.value })} />
+        ) : (
+          <input type="number" min={intervalType === 'minute' ? 10 : 1}
+            className="h-9 w-24 rounded-md border border-border bg-white px-3 text-sm"
+            value={intervalValue}
+            onChange={(e) => onChange({ intervalType, intervalValue: Number(e.target.value), intervalTime })} />
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** 三个行为开关（拉取背景音乐 / 过滤有字幕 / 过滤主播人脸），两个弹窗共用 */
+function BehaviorSwitches({ fetchBgm, filterSubtitle, filterFace, onChange }: {
+  fetchBgm: boolean; filterSubtitle: boolean; filterFace: boolean
+  onChange: (v: { fetchBgm: boolean; filterSubtitle: boolean; filterFace: boolean }) => void
+}) {
+  return (
+    <>
+      <div className="grid grid-cols-3 gap-3 pt-1">
+        <label className="flex cursor-pointer items-center gap-2 text-sm">
+          <input type="checkbox" className="h-4 w-4" checked={fetchBgm}
+            onChange={(e) => onChange({ fetchBgm: e.target.checked, filterSubtitle, filterFace })} />
+          <span>拉取背景音乐</span>
+        </label>
+        <label className="flex cursor-pointer items-center gap-2 text-sm">
+          <input type="checkbox" className="h-4 w-4" checked={filterSubtitle}
+            onChange={(e) => onChange({ fetchBgm, filterSubtitle: e.target.checked, filterFace })} />
+          <span>过滤有字幕</span>
+        </label>
+        <label className="flex cursor-pointer items-center gap-2 text-sm">
+          <input type="checkbox" className="h-4 w-4" checked={filterFace}
+            onChange={(e) => onChange({ fetchBgm, filterSubtitle, filterFace: e.target.checked })} />
+          <span>过滤主播人脸</span>
+        </label>
+      </div>
+      {(filterSubtitle || filterFace) && (
+        <div className="text-xs text-muted-foreground">
+          提示：开启过滤后会下载视频并抽帧检测字幕/人脸，可能显著拉长每条入库耗时；检测依赖缺失时默认放行。
+        </div>
+      )}
+    </>
+  )
+}
+
 
 /** 创建/编辑视频拉取任务弹窗
  *  #fix-edit-cat-echo：accounts 与 categories 都由父组件传入复用，弹窗打开时不再异步 fetch——
@@ -246,11 +325,7 @@ export function PullTaskDialog({ open, onOpenChange, categories, accounts, editT
               {accounts.length === 0 && (
                 <option value="" disabled>暂无可用账号（请先在账号管理页登录）</option>
               )}
-              {accounts.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.remark || a.nickname}（{accountStatusLabel(a.status)}）
-                </option>
-              ))}
+              {accountOptions(accounts)}
             </select>
           </Field>
           <Field label="入库分类">
@@ -260,7 +335,7 @@ export function PullTaskDialog({ open, onOpenChange, categories, accounts, editT
               {categories.filter((c) => c.type === 'video').length === 0 && (
                 <option value="" disabled>分类加载中…</option>
               )}
-              {flattenTree(buildTree(categories.filter((c) => c.type === 'video'))).map(({ node, depth }) => (
+              {videoCategoryOptions(categories).map(({ node, depth }) => (
                 <option key={node.id} value={node.id}>{'　'.repeat(depth)}{node.name}</option>
               ))}
             </select>
@@ -318,49 +393,246 @@ export function PullTaskDialog({ open, onOpenChange, categories, accounts, editT
                 onChange={(e) => setMaxCount(Math.min(1000, Math.max(1, Number(e.target.value) || 0)))} />
             </Field>
           </div>
-          <div className="grid grid-cols-3 gap-3 pt-1">
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input type="checkbox" className="h-4 w-4" checked={fetchBgm}
-                onChange={(e) => setFetchBgm(e.target.checked)} />
-              <span>拉取背景音乐</span>
-            </label>
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input type="checkbox" className="h-4 w-4" checked={filterSubtitle}
-                onChange={(e) => setFilterSubtitle(e.target.checked)} />
-              <span>过滤有字幕</span>
-            </label>
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input type="checkbox" className="h-4 w-4" checked={filterFace}
-                onChange={(e) => setFilterFace(e.target.checked)} />
-              <span>过滤主播人脸</span>
-            </label>
-          </div>
-          {(filterSubtitle || filterFace) && (
-            <div className="text-xs text-muted-foreground">
-              提示：开启过滤后会下载视频并抽帧检测字幕/人脸，可能显著拉长每条入库耗时；检测依赖缺失时默认放行。
-            </div>
-          )}
+          <BehaviorSwitches fetchBgm={fetchBgm} filterSubtitle={filterSubtitle} filterFace={filterFace}
+            onChange={({ fetchBgm, filterSubtitle, filterFace }) => {
+              setFetchBgm(fetchBgm); setFilterSubtitle(filterSubtitle); setFilterFace(filterFace)
+            }} />
         </div>
-        <div>
-          <label className="mb-1 block text-sm font-medium">执行时间间隔</label>
-          <div className="flex items-center gap-2">
-            <select className="h-9 rounded-md border border-border bg-white px-2 text-sm"
-              value={intervalType} onChange={(e) => setIntervalType(e.target.value as any)}>
-              <option value="minute">每 N 分钟</option>
-              <option value="hour">每 N 小时</option>
-              <option value="daily">每天固定时刻</option>
+        <IntervalPicker intervalType={intervalType} intervalValue={intervalValue} intervalTime={intervalTime}
+          onChange={({ intervalType, intervalValue, intervalTime }) => {
+            setIntervalType(intervalType); setIntervalValue(intervalValue); setIntervalTime(intervalTime)
+          }} />
+      </div>
+    </Dialog>
+  )
+}
+
+/** 主页来源的拉取任务弹窗（抖音用户主页 → 爬作品列表）
+ *
+ *  与 PullTaskDialog 分开的理由：用搜索弹窗编辑主页任务会静默抹掉
+ *  homepage_urls（数据丢失）。父组件按 conditions.source_mode 决定开哪个弹窗。
+ *
+ *  回填权威是 homepage_urls（用户原文），不是 homepage_sec_uids（后端派生缓存）——
+ *  否则用户改了链接，保存后爬的还是旧主页。
+ */
+export function UserPullTaskDialog({ open, onOpenChange, categories, accounts, editTarget, onDone }: {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  categories: Category[]
+  /** 父组件统一传入的有 profile 账号列表（必传；新建/编辑都要） */
+  accounts: AvailableAccount[]
+  editTarget: VideoPullTask | null
+  onDone: () => void
+}) {
+  const [name, setName] = useState('')
+  const [accountId, setAccountId] = useState('')
+  const [categoryId, setCategoryId] = useState('')
+  // 主页链接：一行一个。存 textarea 原文，提交时 split 行
+  const [homepageUrls, setHomepageUrls] = useState('')
+  // 过滤条件
+  const [titleRegex, setTitleRegex] = useState('')
+  const [orientation, setOrientation] = useState('')
+  const [maxCount, setMaxCount] = useState(100)
+  const [fetchBgm, setFetchBgm] = useState(false)
+  const [filterSubtitle, setFilterSubtitle] = useState(false)
+  const [filterFace, setFilterFace] = useState(false)
+  // 调度间隔
+  const [intervalType, setIntervalType] = useState<'minute' | 'hour' | 'daily'>('hour')
+  const [intervalValue, setIntervalValue] = useState(6)
+  const [intervalTime, setIntervalTime] = useState('09:00')
+  const [busy, setBusy] = useState(false)
+
+  // 回填守卫：同 PullTaskDialog（open 一直 true 且 editTarget 引用未变时跳过）
+  const lastInitRef = useRef<{ open: boolean; targetId: string | null; ref: VideoPullTask | null | undefined }>(
+    { open: false, targetId: null, ref: undefined },
+  )
+  useEffect(() => {
+    if (!open) {
+      lastInitRef.current = { open: false, targetId: null, ref: undefined }
+      return
+    }
+    const targetId = editTarget?.id ?? null
+    const last = lastInitRef.current
+    if (last.open && last.targetId === targetId && last.ref === editTarget) return
+    lastInitRef.current = { open: true, targetId, ref: editTarget }
+    if (editTarget) {
+      setName(editTarget.task_name)
+      setAccountId(editTarget.account_id)
+      setCategoryId(editTarget.category_id === UNCATEGORIZED_ID ? '' : editTarget.category_id)
+      try {
+        const c = JSON.parse(editTarget.conditions_json)
+        // 回填权威：homepage_urls（用户原文），不是 homepage_sec_uids
+        const urls: string[] = Array.isArray(c.homepage_urls) ? c.homepage_urls : []
+        setHomepageUrls(urls.join('\n'))
+        setTitleRegex(c.title_regex || '')
+        setOrientation(c.orientation || '')
+        const mc = Number(c.max_count)
+        setMaxCount(Number.isFinite(mc) && mc > 0 ? Math.min(1000, Math.max(1, mc)) : 100)
+        setFetchBgm(!!c.fetch_bgm)
+        setFilterSubtitle(!!c.filter_subtitle)
+        setFilterFace(!!c.filter_face)
+      } catch { /* ignore */ }
+      try {
+        const iv = JSON.parse(editTarget.interval_config)
+        setIntervalType(iv.type || 'hour')
+        setIntervalValue(iv.value || 6)
+        setIntervalTime(iv.time || '09:00')
+      } catch { /* ignore */ }
+    } else {
+      setName(''); setHomepageUrls(''); setTitleRegex(''); setOrientation('')
+      setMaxCount(100)
+      setFetchBgm(false); setFilterSubtitle(false); setFilterFace(false)
+      setIntervalType('hour'); setIntervalValue(6); setIntervalTime('09:00')
+    }
+  }, [open, editTarget])
+
+  useEffect(() => {
+    if (open && !editTarget && !categoryId && categories[0]) setCategoryId(categories[0].id)
+  }, [open, editTarget, categories, categoryId])
+
+  useEffect(() => {
+    if (open && !editTarget && !accountId && accounts[0]) setAccountId(accounts[0].id)
+  }, [open, editTarget, accountId, accounts])
+
+  const urlList = homepageUrls.split('\n').map((s) => s.trim()).filter(Boolean)
+
+  const submit = async () => {
+    if (!name.trim() || !accountId || !categoryId) {
+      toast('请填写任务名、账号与入库分类', 'error')
+      return
+    }
+    if (urlList.length === 0) {
+      toast('请至少填写一个抖音用户主页链接', 'error')
+      return
+    }
+    if (intervalType === 'minute' && intervalValue < 10) {
+      toast('最小间隔 10 分钟', 'error')
+      return
+    }
+    if (maxCount < 1 || maxCount > 1000) {
+      toast('最大数量需在 1-1000 之间', 'error')
+      return
+    }
+    setBusy(true)
+    const interval: IntervalConfig = intervalType === 'daily'
+      ? { type: 'daily', time: intervalTime }
+      : { type: intervalType, value: intervalValue }
+    const body = {
+      task_name: name.trim(),
+      conditions: {
+        source_mode: 'user_homepage' as const,
+        homepage_urls: urlList,
+        title_regex: titleRegex.trim(),
+        orientation,
+        max_count: maxCount,
+        fetch_bgm: fetchBgm,
+        filter_subtitle: filterSubtitle,
+        filter_face: filterFace,
+      },
+      account_id: accountId,
+      category_id: categoryId,
+      interval,
+    }
+    try {
+      if (editTarget) {
+        await materialApi.updatePullTask(editTarget.id, body)
+        toast('任务已更新（下一轮生效）', 'success')
+      } else {
+        await materialApi.createPullTask(body)
+        toast('任务已创建并启用', 'success')
+      }
+      onOpenChange(false)
+      onDone()
+    } catch (e) {
+      toast((e as Error).message, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const inputCls = 'h-9 w-full rounded-md border border-border bg-white px-3 text-sm'
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}
+      title={editTarget ? '编辑主页拉取任务' : '通过抖音用户创建拉取任务'} width={680}
+      footer={
+        <>
+          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>取消</Button>
+          <Button size="sm" disabled={busy} onClick={submit}>
+            {busy ? '提交中…' : editTarget ? '保存' : '创建并启用'}
+          </Button>
+        </>
+      }>
+      <div className="space-y-3.5">
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="任务名称">
+            <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)}
+              placeholder="如：某探店博主作品" />
+          </Field>
+          <Field label="拉取账号">
+            <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+              <option value="">请选择已登录账号</option>
+              {accounts.length === 0 && (
+                <option value="" disabled>暂无可用账号（请先在账号管理页登录）</option>
+              )}
+              {accountOptions(accounts)}
             </select>
-            {intervalType === 'daily' ? (
-              <input type="time" className="h-9 rounded-md border border-border bg-white px-3 text-sm"
-                value={intervalTime} onChange={(e) => setIntervalTime(e.target.value)} />
-            ) : (
-              <input type="number" min={intervalType === 'minute' ? 10 : 1}
-                className="h-9 w-24 rounded-md border border-border bg-white px-3 text-sm"
-                value={intervalValue}
-                onChange={(e) => setIntervalValue(Number(e.target.value))} />
+          </Field>
+          <Field label="入库分类">
+            <select className={inputCls} value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
+              {categories.filter((c) => c.type === 'video').length === 0 && (
+                <option value="" disabled>分类加载中…</option>
+              )}
+              {videoCategoryOptions(categories).map(({ node, depth }) => (
+                <option key={node.id} value={node.id}>{'　'.repeat(depth)}{node.name}</option>
+              ))}
+            </select>
+          </Field>
+        </div>
+        <div className="rounded-md border border-border bg-muted/30 p-3 space-y-3">
+          <div className="text-sm font-semibold">拉取条件（留空 = 不限）</div>
+          <Field label="抖音用户主页链接"
+            hint="一行一个，支持主页链接 / v.douyin.com 短链 / 直接粘 sec_uid；建议不超过 20 个">
+            <textarea
+              className="w-full rounded-md border border-border bg-white px-3 py-2 text-sm"
+              rows={4}
+              value={homepageUrls}
+              onChange={(e) => setHomepageUrls(e.target.value)}
+              placeholder={'https://www.douyin.com/user/MS4wLjABAAAA...\nhttps://v.douyin.com/ixxxxx/'}
+            />
+            {urlList.length > 0 && (
+              <div className="mt-1 text-xs text-muted-foreground">已识别 {urlList.length} 个链接</div>
             )}
+          </Field>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="标题正则" hint="对作品标题二次过滤，如：探店|测评">
+              <input className={inputCls} value={titleRegex} onChange={(e) => setTitleRegex(e.target.value)} />
+            </Field>
+            <Field label="画面方向">
+              <select className={inputCls} value={orientation} onChange={(e) => setOrientation(e.target.value)}>
+                <option value="">不限</option>
+                <option value="vertical">竖屏</option>
+                <option value="horizontal">横屏</option>
+              </select>
+            </Field>
+            <Field label="最大数量" hint="1-1000；达到上限任务自动停用">
+              <input type="number" className={inputCls} value={maxCount}
+                min={1} max={1000}
+                onChange={(e) => setMaxCount(Math.min(1000, Math.max(1, Number(e.target.value) || 0)))} />
+            </Field>
+          </div>
+          <BehaviorSwitches fetchBgm={fetchBgm} filterSubtitle={filterSubtitle} filterFace={filterFace}
+            onChange={({ fetchBgm, filterSubtitle, filterFace }) => {
+              setFetchBgm(fetchBgm); setFilterSubtitle(filterSubtitle); setFilterFace(filterFace)
+            }} />
+          <div className="text-xs text-muted-foreground">
+            爬取该主页「作品」tab 的视频（图文作品不入库）。已入库的作品会自动跳过，只处理新作品。
           </div>
         </div>
+        <IntervalPicker intervalType={intervalType} intervalValue={intervalValue} intervalTime={intervalTime}
+          onChange={({ intervalType, intervalValue, intervalTime }) => {
+            setIntervalType(intervalType); setIntervalValue(intervalValue); setIntervalTime(intervalTime)
+          }} />
       </div>
     </Dialog>
   )
@@ -412,18 +684,26 @@ export function PullTaskPanel({ onEdit, onCreated, onShowLogs, refreshTrigger, o
     try {
       const c = JSON.parse(json)
       const parts: string[] = []
-      if (c.keyword) parts.push(`关键词:${c.keyword}`)
+      // v128：主页来源在最前标识（与搜索任务混排，靠这个区分）
+      if (c.source_mode === 'user_homepage') {
+        const n = Array.isArray(c.homepage_urls) ? c.homepage_urls.length : 0
+        parts.push(`主页:${n}个`)
+      } else if (c.keyword) {
+        parts.push(`关键词:${c.keyword}`)
+      }
       if (c.title_regex) parts.push(`标题正则:${c.title_regex}`)
       if (c.orientation) parts.push(c.orientation === 'vertical' ? '竖屏' : '横屏')
       if (c.shop_name) parts.push(`门店:${c.shop_name}`)
-      // 发布时间档位
-      const prMap: Record<string, string> = { any: '不限', '1d': '一天内', '7d': '一周内', '180d': '半年内' }
-      const pr = c.publish_range || 'any'
-      if (pr !== 'any') parts.push(`发布:${prMap[pr] || pr}`)
-      // 时长档位
-      const drMap: Record<string, string> = { any: '不限', lt1m: '1分钟内', '1to5m': '1-5分钟', gt5m: '5分钟以上' }
-      const dr = c.duration_range || 'any'
-      if (dr !== 'any') parts.push(`时长:${drMap[dr] || dr}`)
+      // 发布时间档位（主页来源不展示：搜索筛选面板专属能力）
+      if (c.source_mode !== 'user_homepage') {
+        const prMap: Record<string, string> = { any: '不限', '1d': '一天内', '7d': '一周内', '180d': '半年内' }
+        const pr = c.publish_range || 'any'
+        if (pr !== 'any') parts.push(`发布:${prMap[pr] || pr}`)
+        // 时长档位
+        const drMap: Record<string, string> = { any: '不限', lt1m: '1分钟内', '1to5m': '1-5分钟', gt5m: '5分钟以上' }
+        const dr = c.duration_range || 'any'
+        if (dr !== 'any') parts.push(`时长:${drMap[dr] || dr}`)
+      }
       // 数量与开关
       const mc = Number(c.max_count)
       if (Number.isFinite(mc) && mc > 0) parts.push(`上限${mc}`)

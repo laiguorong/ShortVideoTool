@@ -93,7 +93,24 @@ class VideoPullConditions(BaseModel):
       仅用于兼容老 JSON 数据，前端不再展示。
     - v127 新增 `sort_type`：抖音服务端排序方式（0 综合 / 1 最多点赞 / 2 最新发布），
       拉取场景推荐 2（最新发布），与"拉新素材"诉求一致。
+    - v128 新增 `source_mode`：作品来源（search 关键词搜索 / user_homepage 用户主页）。
+      缺省 = "search"，老任务 JSON 无此键时行为完全不变。
+      `homepage_urls` 存用户原始输入行（回填权威），`homepage_sec_uids` 存解析后的
+      sec_uid 缓存（派生数据，仅用于省每轮重复解析，不可用于回填）。
     """
+    # 作品来源（v128）
+    source_mode: str = Field(
+        default="search",
+        description="作品来源 search=关键词搜索 / user_homepage=抖音用户主页",
+    )
+    homepage_urls: list[str] = Field(
+        default_factory=list,
+        description="抖音用户主页链接列表（一行一个，可含分享文本）。仅 source_mode=user_homepage 时生效",
+    )
+    homepage_sec_uids: list[str] = Field(
+        default_factory=list,
+        description="homepage_urls 解析出的 sec_uid 缓存（派生数据，勿用于回填）",
+    )
     # 搜索词与内容关键词
     keyword: str = Field(default="", description="抖音搜索主关键词")
     title_regex: str = Field(default="", description="标题正则（对搜索结果标题二次过滤，如：探店|测评）")

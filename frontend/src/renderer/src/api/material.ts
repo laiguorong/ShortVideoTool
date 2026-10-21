@@ -104,6 +104,12 @@ export interface PullConditions {
   filter_face?: boolean
   /** 单轮最大入库数量（1-1000，默认 100，达到上限任务自动停用） */
   max_count?: number
+  /** 作品来源：search=关键词搜索（缺省） / user_homepage=抖音用户主页 */
+  source_mode?: 'search' | 'user_homepage'
+  /** 抖音用户主页链接（一行一个，可含分享文本）。仅 user_homepage 生效，回填权威 */
+  homepage_urls?: string[]
+  /** homepage_urls 解析出的 sec_uid 缓存（后端派生，只读，勿用于回填） */
+  homepage_sec_uids?: string[]
   /** [已废弃] 旧版发布时间起，仅为兼容老 JSON */
   publish_after?: string | null
   /** [已废弃] 旧版发布时间止，仅为兼容老 JSON */
