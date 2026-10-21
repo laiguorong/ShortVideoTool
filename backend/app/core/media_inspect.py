@@ -906,8 +906,17 @@ def _init_face_detector(model_name: str):
     """
     try:
         import mediapipe as mp
-    except ImportError:
-        logger.warning("[人脸检测] mediapipe 未安装，跳过人脸检测（pip install mediapipe==1.0.1 可启用）")
+    except ImportError as e:
+        # 这里只捕 ImportError，不吞其它异常（OSError/DLL 加载失败走下面那个 except）。
+        # 提示必须带上原始异常：`import mediapipe` 失败绝大多数情况**不是**没装，
+        # 而是打包时依赖链被砍（历史真因：build.spec excludes=['matplotlib']，
+        # 而 mediapipe.vision.drawing_utils 在模块级 import matplotlib.pyplot）。
+        # 报「未安装」会把人往 pip install 方向带偏，实际该查 build.spec 的 excludes。
+        logger.warning(
+            "[人脸检测] import mediapipe 失败，跳过人脸检测：{}: {}"
+            "（若是打包环境，优先查 build.spec 的 excludes 是否误排 matplotlib/absl/flatbuffers）",
+            type(e).__name__, e,
+        )
         return None
     try:
         filename = _FACE_MODEL_SHORT if model_name == "short" else _FACE_MODEL_FULL

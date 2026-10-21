@@ -108,7 +108,17 @@ a = Analysis(
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib'],
+    # 只排 tkinter，**不要**排 matplotlib。
+    # 排 matplotlib 会静默打死 mediapipe（不是「人脸检测降级」，是整条链路 ImportError）：
+    #   mediapipe/__init__ → mediapipe.tasks.python → vision/__init__ →
+    #   drawing_styles → drawing_utils → `import matplotlib.pyplot`（模块级，非 lazy）
+    # drawing_utils 只用于可视化绘制，本项目不画图，但 import 语句照样在模块顶层执行。
+    # 实测（PyInstaller 6.22.3 + mediapipe 1.0.1，excludes 带/不带 matplotlib 的 A/B）：
+    #   带 matplotlib → ModuleNotFoundError: No module named 'matplotlib' → 人脸检测全失效
+    #   不带        → MP_OK 1.0.1（matplotlib.pyplot 不依赖 tkinter，tkinter 仍可安全排除）
+    # 代价：_internal 多 ~33MB matplotlib（安装包已 500MB+，可接受）。
+    # 症状对照：启动日志刷「[人脸检测] mediapipe 未安装」×2（short/full 各一次）。
+    excludes=['tkinter'],
     cipher=block_cipher,
 )
 
