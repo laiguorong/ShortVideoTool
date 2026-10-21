@@ -89,6 +89,17 @@ def _safe_wait_or_raise(page, ms: int, where: str) -> None:
 
 _SEARCH_URL = "https://www.douyin.com/aweme/v1/web/search/item/"
 
+# Playwright 动作类 API（evaluate / click / is_visible / wait_for_selector）的
+# 显式超时。默认 30s auto-wait 在抖音 UI 改版、selector 失效时会白等——尤其
+# 遍历 selector 链时耗时是 30s × 链长。实测线上切视频 tab 卡了 84s
+# （2026-10-21，用户反馈"搜完就不动了"），表现为任务看起来挂住。
+# 这里选 3s：元素要么已在 DOM 里，要么就是不存在，多等无意义。
+_ACTION_TIMEOUT_MS = 3_000
+
+# 轮询类 evaluate 的超时（配合 range(N) 循环用）。N × 该值必须仍是"用户可接受"
+# 的量级——例如等选中态是 range(10)，用 1s 上限 → 最坏 10s，不会白等数分钟。
+_POLL_TIMEOUT_MS = 1_000
+
 
 class BrowserSearchSession:
     """单页搜索会话：每次构造自带同步 playwright context + persistent context。
@@ -559,13 +570,18 @@ class BrowserSearchSession:
         try:
             loc = page.locator(primary_sel).first
             if loc.count() > 0:
+                # timeout=_ACTION_TIMEOUT_MS：locator.evaluate / click 对元素不存在会
+                # auto-wait 到 Playwright 默认 30s 才抛 TimeoutError。抖音 UI 改版时
+                # tab 选择器可能整体失效，不设短超时会白等 30s × selector 链长度
+                # （实测线上卡了 84s，表现为"搜完就不动了"）。
                 already = loc.evaluate(
                     "(el) => el && ("
                     "(el.className || '').split(/\\s+/).some("
                     "c => c === 'cur' || c === 'active'"
                     ")"
                     "|| el.getAttribute('aria-selected') === 'true'"
-                    ")"
+                    ")",
+                    timeout=_ACTION_TIMEOUT_MS,
                 )
                 if already:
                     logger.debug("[Tab] 已在视频tab，跳过切换")
@@ -674,7 +690,7 @@ class BrowserSearchSession:
         for sel in self._FILTER_BTN_SELECTORS:
             try:
                 loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
+                if loc.count() > 0 and loc.is_visible(timeout=_ACTION_TIMEOUT_MS):
                     btn = loc
                     break
             except Exception:
@@ -683,7 +699,7 @@ class BrowserSearchSession:
             logger.info("[筛选] 抖音筛选按钮找不到，本次按无筛选拉取")
             return False
         try:
-            btn.hover()
+            btn.hover(timeout=_ACTION_TIMEOUT_MS)
         except Exception as e:
             # #fix-browser-closed-stop：浏览器关闭时中断，不再走「按无筛选拉取」
             _raise_if_browser_closed(e, "筛选按钮 hover")
@@ -737,10 +753,14 @@ class BrowserSearchSession:
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
+                # is_visible / click 都传 timeout：Playwright 默认 30s auto-wait，
+                # selector 失效时会把整条 selector 链拖成 30s × len(selectors)
+                # （切视频 tab 实测白等 84s）。这里 3s 足够命中 —— 元素要么
+                # 已在 DOM 里，要么就是不存在，等再久也没用。
+                if loc.count() > 0 and loc.is_visible(timeout=_ACTION_TIMEOUT_MS):
                     if expect_visible_only:
                         return True
-                    loc.click()
+                    loc.click(timeout=_ACTION_TIMEOUT_MS)
                     return True
             except Exception:
                 continue
@@ -770,8 +790,12 @@ class BrowserSearchSession:
                         loc = page.locator(sel).first
                         if loc.count() == 0:
                             continue
+                        # timeout=_POLL_TIMEOUT_MS：外层是 range(10) 的轮询循环，
+                        # 这里若走 Playwright 默认 30s auto-wait，最坏 10×30=300s。
+                        # 设计意图是"最多等 1s"，给 1s 上限（元素中途消失也不至于拖死）。
                         ok = loc.evaluate(
-                            "(el) => el && el.classList && el.classList.contains('HjptjtzN')"
+                            "(el) => el && el.classList && el.classList.contains('HjptjtzN')",
+                            timeout=_POLL_TIMEOUT_MS,
                         )
                         if ok:
                             page.wait_for_timeout(settle_ms)
@@ -939,8 +963,8 @@ class BrowserSearchSession:
         for sel in input_selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
-                    box = loc.bounding_box()
+                if loc.count() > 0 and loc.is_visible(timeout=_ACTION_TIMEOUT_MS):
+                    box = loc.bounding_box(timeout=_ACTION_TIMEOUT_MS)
                     if box:
                         used_selector = sel
                         break
