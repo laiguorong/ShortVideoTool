@@ -796,13 +796,18 @@ function ClipPlayDialog({ clip, open, onOpenChange }: {
 
   useEffect(() => {
     let alive = true
-    if (open && clip?.file_status === 'ready') {
-      fileUrl(clip.file_path!).then((u) => { if (alive) setSrc(u) })
+    if (open && clip?.file_status === 'ready' && clip?.file_path) {
+      fileUrl(clip.file_path).then((u) => {
+        // 与 ThumbImg 对齐：rev 变化时挂 ?v=rev 破 Chromium mp4 缓存，
+        // 否则镜像/重渲染后 `os.replace` 替换文件但 URL 不变，
+        // <video src> 会一直复用磁盘缓存里的旧版本（封面图正常是因为加了 ?v）。
+        if (alive) setSrc(clip.rev ? `${u}?v=${clip.rev}` : u)
+      })
     } else {
       setSrc('')
     }
     return () => { alive = false }
-  }, [open, clip?.file_status])
+  }, [open, clip?.file_status, clip?.rev, clip?.file_path])
 
   const status = clip?.file_status
   const loading = status === 'pending'
