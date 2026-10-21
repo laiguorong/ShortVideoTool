@@ -14,6 +14,11 @@ const accountStatusLabel = (status: string): string => STATUS_LABEL[status] || s
 // 系统固定"未分类"分类 ID（虚拟节点，后端 list API 注入）
 const UNCATEGORIZED_ID = '-'
 
+/** 「最大数量」上限（单轮入库条数，达到后任务自动停用）。
+ *  必须与后端 VideoPullConditions.max_count 的 le= 保持一致，
+ *  改动需同步 models/selection.py 与 material_service 的防御性 clamp。 */
+const MAX_COUNT_LIMIT = 9999
+
 /** 表单字段容器：定义在模块顶部（不在组件函数体内）以避免每次 render 时引用变化，
  *  防止 React 按组件 type 不匹配而卸载 children（含 input），导致输入框焦点丢失。 */
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
@@ -212,7 +217,7 @@ export function PullTaskDialog({ open, onOpenChange, categories, accounts, editT
         setPublishRange(c.publish_range || 'any')
         setDurationRange(c.duration_range || 'any')
         const mc = Number(c.max_count)
-        setMaxCount(Number.isFinite(mc) && mc > 0 ? Math.min(1000, Math.max(1, mc)) : 100)
+        setMaxCount(Number.isFinite(mc) && mc > 0 ? Math.min(MAX_COUNT_LIMIT, Math.max(1, mc)) : 100)
         setFetchBgm(!!c.fetch_bgm)  // 缺省 false，v121 改为按需勾选
         setFilterSubtitle(!!c.filter_subtitle)
         setFilterFace(!!c.filter_face)
@@ -256,8 +261,8 @@ export function PullTaskDialog({ open, onOpenChange, categories, accounts, editT
       toast('最小间隔 10 分钟', 'error')
       return
     }
-    if (maxCount < 1 || maxCount > 1000) {
-      toast('最大数量需在 1-1000 之间', 'error')
+    if (maxCount < 1 || maxCount > MAX_COUNT_LIMIT) {
+      toast(`最大数量需在 1-${MAX_COUNT_LIMIT} 之间`, 'error')
       return
     }
     setBusy(true)
@@ -387,10 +392,10 @@ export function PullTaskDialog({ open, onOpenChange, categories, accounts, editT
                 <option value="gt5m">5 分钟以上</option>
               </select>
             </Field>
-            <Field label="最大数量" hint="1-1000；达到上限任务自动停用">
+            <Field label="最大数量" hint={`1-${MAX_COUNT_LIMIT}；达到上限任务自动停用`}>
               <input type="number" className={inputCls} value={maxCount}
-                min={1} max={1000}
-                onChange={(e) => setMaxCount(Math.min(1000, Math.max(1, Number(e.target.value) || 0)))} />
+                min={1} max={MAX_COUNT_LIMIT}
+                onChange={(e) => setMaxCount(Math.min(MAX_COUNT_LIMIT, Math.max(1, Number(e.target.value) || 0)))} />
             </Field>
           </div>
           <BehaviorSwitches fetchBgm={fetchBgm} filterSubtitle={filterSubtitle} filterFace={filterFace}
@@ -467,7 +472,7 @@ export function UserPullTaskDialog({ open, onOpenChange, categories, accounts, e
         setTitleRegex(c.title_regex || '')
         setOrientation(c.orientation || '')
         const mc = Number(c.max_count)
-        setMaxCount(Number.isFinite(mc) && mc > 0 ? Math.min(1000, Math.max(1, mc)) : 100)
+        setMaxCount(Number.isFinite(mc) && mc > 0 ? Math.min(MAX_COUNT_LIMIT, Math.max(1, mc)) : 100)
         setFetchBgm(!!c.fetch_bgm)
         setFilterSubtitle(!!c.filter_subtitle)
         setFilterFace(!!c.filter_face)
@@ -509,8 +514,8 @@ export function UserPullTaskDialog({ open, onOpenChange, categories, accounts, e
       toast('最小间隔 10 分钟', 'error')
       return
     }
-    if (maxCount < 1 || maxCount > 1000) {
-      toast('最大数量需在 1-1000 之间', 'error')
+    if (maxCount < 1 || maxCount > MAX_COUNT_LIMIT) {
+      toast(`最大数量需在 1-${MAX_COUNT_LIMIT} 之间`, 'error')
       return
     }
     setBusy(true)
@@ -615,10 +620,10 @@ export function UserPullTaskDialog({ open, onOpenChange, categories, accounts, e
                 <option value="horizontal">横屏</option>
               </select>
             </Field>
-            <Field label="最大数量" hint="1-1000；达到上限任务自动停用">
+            <Field label="最大数量" hint={`1-${MAX_COUNT_LIMIT}；达到上限任务自动停用`}>
               <input type="number" className={inputCls} value={maxCount}
-                min={1} max={1000}
-                onChange={(e) => setMaxCount(Math.min(1000, Math.max(1, Number(e.target.value) || 0)))} />
+                min={1} max={MAX_COUNT_LIMIT}
+                onChange={(e) => setMaxCount(Math.min(MAX_COUNT_LIMIT, Math.max(1, Number(e.target.value) || 0)))} />
             </Field>
           </div>
           <BehaviorSwitches fetchBgm={fetchBgm} filterSubtitle={filterSubtitle} filterFace={filterFace}

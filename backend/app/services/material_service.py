@@ -927,7 +927,7 @@ def register_task_job(task_row: dict) -> None:
 def _run_pull_round(task_id: str, info) -> str:
     """执行一轮视频拉取：搜索 → 逐条条件校验 → 下载入库。
 
-    单轮入库数量达到 `conditions.max_count`（默认 100，上限 1000）后自动停用任务：
+    单轮入库数量达到 `conditions.max_count`（默认 100，上限 9999）后自动停用任务：
     - 调度器移除该任务的下一次执行（remove_job）
     - 数据库 status 置为 disabled / next_run_time 清空
     - 用户可手动重新启用并按需调整 max_count
@@ -964,12 +964,13 @@ def _run_pull_round(task_id: str, info) -> str:
         logger.info("[拉取] 任务「{}」应用过滤：{}", task["task_name"], "，".join(filters))
     else:
         logger.info("[拉取] 任务「{}」无过滤条件，全量拉取", task["task_name"])
-    # max_count 边界：Pydantic 已限制 1-1000；防御性 clamp
+    # max_count 边界：Pydantic 已限制 1-9999；防御性 clamp
+    # 上限常量与 VideoPullConditions.max_count 的 le= 保持一致，改一处要同步另一处
     try:
         max_count = int(conditions.get("max_count") or 100)
     except (TypeError, ValueError):
         max_count = 100
-    max_count = max(1, min(1000, max_count))
+    max_count = max(1, min(9999, max_count))
     account = d.query_one("SELECT * FROM account WHERE id=? AND deleted=0", (task["account_id"],))
     account_id=account["id"]  # 缓存供阶段 B 详情抓取走 storage_state
     if not account or account["status"] in ("invalid", "disabled"):

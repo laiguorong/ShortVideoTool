@@ -138,7 +138,7 @@ class VideoPullConditions(BaseModel):
     fetch_bgm: bool = Field(default=False, description="是否拉取视频背景音乐（原声）入音乐库")
     filter_subtitle: bool = Field(default=False, description="是否过滤带字幕的视频（按 OCR 检测画面文字判断）")
     filter_face: bool = Field(default=False, description="是否过滤含主播人脸的视频（按 OpenCV 人脸检测判断）")
-    max_count: int = Field(default=100, ge=1, le=1000, description="单轮最大入库数量，达到上限后任务自动停用")
+    max_count: int = Field(default=100, ge=1, le=9999, description="单轮最大入库数量，达到上限后任务自动停用")
     # 兼容字段：仅用于兼容老 JSON 数据，前端不再写入与展示
     publish_after: str | None = Field(default=None, description="[已废弃] 发布时间起，旧版字段")
     publish_before: str | None = Field(default=None, description="[已废弃] 发布时间止，旧版字段")

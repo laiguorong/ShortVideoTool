@@ -102,7 +102,7 @@ export interface PullConditions {
   filter_subtitle?: boolean
   /** 是否过滤含主播人脸的视频（按 OpenCV 人脸检测判断） */
   filter_face?: boolean
-  /** 单轮最大入库数量（1-1000，默认 100，达到上限任务自动停用） */
+  /** 单轮最大入库数量（1-9999，默认 100，达到上限任务自动停用） */
   max_count?: number
   /** 作品来源：search=关键词搜索（缺省） / user_homepage=抖音用户主页 */
   source_mode?: 'search' | 'user_homepage'
