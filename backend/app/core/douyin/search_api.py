@@ -324,12 +324,26 @@ class BrowserSearchSession:
     def _poll_captured_until(self, predicate, timeout: int) -> dict:
         """轮询 _captured 直到 predicate() 为真或超时，返回 _captured 最后一条。
 
+        **timeout 单位是「秒」**（不是 Playwright 惯用的毫秒）。内部
+        `deadline = time.time() + timeout` 直接按秒累加，误传毫秒会让等待
+        放大 1000 倍——历史上 `timeout=15_000` 被当成 15 秒、实则 15000 秒
+        （4.2 小时），导致抖音首屏不发预期 XHR 时死等不退出，后续流程
+        （如 _switch_to_video_tab）永远执行不到。传值请写 `timeout=15`。
+
         race fix：page.expect_response 是注册后才监听，click+type+Enter 触发的 XHR
         比 expect_response 注册更早，会漏抓。改用 _on_response 在 _ensure_open
         一次性注册的累积监听器，poll _captured 拿到响应。
 
         防御：page 异常断开（chromium 崩溃 / asyncio loop 关闭）让 wait_for_timeout
         抛 Error: Page closed，包 try/except 转 SearchBlockedError（与超时同语义）。
+
+        参数:
+            predicate: 无参可调用，返回 bool
+            timeout: **秒**。超时抛 SearchBlockedError
+        返回:
+            _captured 最后一条（dict）
+        异常:
+            SearchBlockedError: 超时 / page 断开（wait_for_timeout 抛错）
         """
         import time as _time
         deadline = _time.time() + timeout
@@ -853,8 +867,8 @@ class BrowserSearchSession:
             # 之前 wait_for_selector('[data-e2e="search-card"]') 等 DOM 渲染，
             # 用户实际看到搜索结果页出来好几秒才开始切 tab，体验卡顿。
             # 改用 XHR 落库作为「响应开始」信号——比 DOM 早 1-3s。
-            # 1) 等综合 tab 首个搜索 XHR 落库
-            self._poll_captured_until(lambda: bool(self._captured), timeout=15_000)
+            # 1) 等综合 tab 首个搜索 XHR 落库（timeout 单位=秒，见 _poll_captured_until docstring）
+            self._poll_captured_until(lambda: bool(self._captured), timeout=15)
             # 2) XHR 一回立即切到「视频」tab（默认抖音落在「综合」tab，
             #    含图文/直播混排；不切则结果混入图文直播，后续过滤规则全部失效）。
             self._switch_to_video_tab(page)
@@ -869,7 +883,7 @@ class BrowserSearchSession:
             if baseline == 0:
                 self._poll_captured_until(
                     lambda: len(self._captured) > baseline,
-                    timeout=15_000,
+                    timeout=15,          # 单位=秒（历史误传 15_000 → 实等 4.2 小时）
                 )
             else:
                 logger.debug(
