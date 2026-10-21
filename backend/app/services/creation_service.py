@@ -1944,19 +1944,19 @@ def _pick_combinations(project_id: str, count: int,
     if any(len(pool) == 0 for pool in pools):
         raise ValueError("存在无可用片段的分镜,无法生成")
 
-    # 扩容隔离: 若项目当前 shot_count < 实际分镜数,清空已生成
-    # （避免扩容后 K/N > 50% 时大部分组合被约束 2 拒，无法生成新视频）
-    # 同步清 generated_total 字段（#413：累计数与 generated_video 行数保持一致）
+    # 读取项目标题 + 上次记录的分镜数（仅用于下方日志/stale 标记；不再做 DELETE 清空）
+    # 删除历史 #扩容隔离 块（if prev_shot_count > 0 and prev_shot_count < n_shots）的理由：
+    #   1. project.shot_count 已在 add_shot / add_clips_... / _run_generate 三处同步写，
+    #      "prev_shot_count < n_shots" 基本永远不触发——只在并发/脏数据边界才进 if；
+    #      一旦进 if 会硬 DELETE 占用中的成品（无视 status='occupied'），让
+    #      publish_record.video_id 悬挂；并 reset generated_total 与 #413 的
+    #      "删除成品不减累计"语义冲突；文件未 unlink 也与单条 delete_generated_video 不一致。
+    #   2. 真扩容场景由约束 2 的 K<N 扩容分支按 same/n > 0.5 兜底
+    #      （K=3 N=5 时临界是前 3 段全同），拒多只是 sample 不够 count，无数据丢失。
+    # 如未来需要"扩容重置"，改 #约束 2 扩容分支 而非 DELETE——禁止复活此处。
     project = d.query_one("SELECT title, shot_count FROM project WHERE id=?", (project_id,))
     title = (project or {}).get("title", project_id)
-    prev_shot_count = (project or {}).get("shot_count", 0) or 0
-    if prev_shot_count > 0 and prev_shot_count < n_shots:
-        # execute() 返 rowcount（删除行数）
-        cleared = d.execute("DELETE FROM generated_video WHERE project_id=?", (project_id,))
-        d.execute("UPDATE project SET generated_total=0 WHERE id=?", (project_id,))
-        logger.info(
-            f"[生成视频] 项目名称：{title}，视频数：0 / {count}"
-            f"（扩容 {prev_shot_count}→{n_shots}，清空 {cleared} 条历史）")
+    prev_shot_count = int((project or {}).get("shot_count", 0) or 0)
 
     # 已生成组合键集合 + 列表（集合用于"完全相同直接跳过"，列表用于约束 2 位置重叠比对）
     generated_set = {
