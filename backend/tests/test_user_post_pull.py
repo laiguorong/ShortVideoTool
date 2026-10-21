@@ -92,6 +92,88 @@ def test_extract_short_url_unresolvable_returns_none(monkeypatch):
     assert extract_sec_uid("https://v.douyin.com/iRabc123/") is None
 
 
+# ============ 主页加载时序（goto → load → 静置 2s → 才滚动）============
+
+class _FakePage:
+    """记录 wait_for_timeout 调用的假 page。"""
+
+    def __init__(self, url="https://www.douyin.com/user/MS4wLjABAAAAa",
+                 redirect_to: str | None = None):
+        self.url = url
+        # goto 后被重定向到的 URL（模拟风控跳验证页）
+        self.redirect_to = redirect_to
+        self.waits: list[int] = []
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.url = self.redirect_to or url
+        return None
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+    def title(self):
+        return "主页"
+
+
+def test_collect_one_waits_after_load_before_scroll(monkeypatch):
+    """goto 返回后必须静置 _HOMEPAGE_SETTLE_MS 才进滚动逻辑。
+
+    抖音主页是 React SPA：load 事件触发时作品卡片还没渲染完、
+    IntersectionObserver 尚未绑定，此刻 wheel 推不动列表。
+    删掉这一步的症状是"主页采集只拿到首屏几条，滚不动"。
+    """
+    from app.core.douyin import user_post_api as mod
+    assert mod._HOMEPAGE_SETTLE_MS == 2000
+
+    session = BrowserUserPostSession.__new__(BrowserUserPostSession)  # 不走 __init__（不启浏览器）
+    session._captured = []
+    session._page = _FakePage()
+    session._searched_keyword = ""
+    # stub 首屏等待为立即命中（否则测试会真等 15s）
+    monkeypatch.setattr(BrowserUserPostSession, "_poll_first_screen",
+                        lambda self, idx, total, sec_uid: True)
+    # _collect_one 入口会 _captured.clear()，必须在 poll 命中后再放数据
+    def _fake_poll(self, idx, total, sec_uid):
+        self._captured = [{"aweme_list": [{"aweme_id": "1", "aweme_type": 0}], "has_more": 0}]
+        return True
+    monkeypatch.setattr(BrowserUserPostSession, "_poll_first_screen", _fake_poll)
+    monkeypatch.setattr(mod, "_safe_wait_or_raise",
+                        lambda page, ms, where: page.wait_for_timeout(ms))
+
+    scroll_calls = []
+    monkeypatch.setattr(BrowserUserPostSession, "_scroll_until",
+                        lambda self, **kw: scroll_calls.append(kw) or 1)
+
+    ids, seen = [], set()
+    BrowserUserPostSession._collect_one(
+        session, "MS4wLjABAAAAa", 1, 1, 5, None, seen, ids,
+    )
+    assert ids == ["1"], "首屏作品应入库候选"
+    assert scroll_calls, "首屏命中后应进入滚动"
+    assert mod._HOMEPAGE_SETTLE_MS in session._page.waits, (
+        "滚动前必须静置 _HOMEPAGE_SETTLE_MS"
+    )
+
+
+def test_collect_one_skips_settle_on_captcha(monkeypatch):
+    """被重定向到验证页时不该白等 2s，直接抛错中止本轮。"""
+    from app.core.douyin import user_post_api as mod
+    from app.core.douyin.user_post_api import SearchBlockedError, _is_captcha_url
+    session = BrowserUserPostSession.__new__(BrowserUserPostSession)
+    session._captured = []
+    session._page = _FakePage(redirect_to="https://verify.snssdk.com/captcha?x=1")
+    assert _is_captcha_url(session._page.redirect_to) is True
+
+    waited = []
+    monkeypatch.setattr(mod, "_safe_wait_or_raise",
+                        lambda page, ms, where: waited.append(ms))
+    with pytest.raises(SearchBlockedError):
+        BrowserUserPostSession._collect_one(
+            session, "MS4wLjABAAAAa", 1, 1, 5, None, set(), [],
+        )
+    assert waited == [], "验证页不应触发静置等待"
+
+
 # ============ 图文识别（阶段 B 固定 url_kind=video，图文会 404）============
 
 def test_is_note_aweme_variants():

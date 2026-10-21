@@ -35,6 +35,7 @@ from app.core.douyin.search_api import (
     BrowserSearchSession,
     SearchBlockedError,
     _raise_if_browser_closed,
+    _safe_wait_or_raise,
 )
 
 # 主页作品列表接口（抖音 web 端路径）
@@ -68,6 +69,12 @@ _MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
+
+# goto 返回（load 事件触发）后的静置时长，再开始滚动。
+# 用户决策（2026-10-21）：抖音主页是 React SPA，load 事件触发时作品卡片 DOM
+# 还没渲染完、IntersectionObserver 尚未绑定，此刻 wheel 推不动列表。静置 2s
+# 让首屏渲染完成，后续 _scroll_until 的 wheel 才有效。
+_HOMEPAGE_SETTLE_MS = 2000
 
 
 def _is_captcha_url(url: str) -> bool:
@@ -308,6 +315,11 @@ class BrowserUserPostSession(BrowserSearchSession):
                 f"主页被重定向到验证页（风控），请到任务页手动执行过验证码后重试"
                 f"（sec_uid={sec_uid}，url={final_url}）"
             )
+
+        # load 事件后再静置 2s 才滚动：抖音主页是 React SPA，load 触发时作品卡片
+        # 还没渲染完、IntersectionObserver 未绑定，此刻 wheel 推不动列表。
+        # 放在验证码检查之后 —— 被重定向到验证页的页面没必要等。
+        _safe_wait_or_raise(page, _HOMEPAGE_SETTLE_MS, "主页加载后静置")
 
         # 等首屏作品 XHR（15s）。主页首屏可能走 SSR 不发 XHR → 超时走 DOM 兜底。
         first_screen = self._poll_first_screen(idx, total, sec_uid)
