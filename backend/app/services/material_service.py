@@ -26,6 +26,13 @@ from app.db.utils import now_str
 from app.services.setting_service import get_data_dir, load_settings
 from app.services import account_service
 from app.services.task_service import task_service, raise_for_cancel, _fmt_hms, interruptible_sleep
+# 取消异常必须单独穿透：_TaskCancelled 继承 Exception，会被 _run_pull_round 的
+# `except Exception` 接住 → 阶段 B 的返回值解包（1251 行）永不执行，
+# new_count / skip_count / detail_processed 全部停在初始值 0，
+# 且 fail_reason = str(_TaskCancelled()) = "" → 写库成 NULL。
+# 症状：用户手动取消（或任一环节触发取消信号）后，任务执行记录里
+# 「入库/拦截」全是 0，日志却打"处理 0 个"，看起来像什么都没干。
+from app.services.task_service import _TaskCancelled
 
 _JOB_PREFIX = "video_pull:"
 # #96：跨调用去重 set——同一 (pattern, error) 已打过 WARNING 就跳过，
@@ -1278,6 +1285,17 @@ def _run_pull_round(task_id: str, info) -> str:
         logger.warning("[拉取任务] 任务「{}」搜索风控 keyword={} reason={}",
                        task["task_name"], kw, e)
         _write_progress()
+    except _TaskCancelled:
+        # 取消信号：必须让异常继续冒泡到 task_service，由它统一置 status=cancelled。
+        # 若在这里 return/吞掉，本轮已处理的部分（new_count/skip_count/detail_processed
+        # 在阶段 B 内部的累加）会随函数栈一起丢掉 → 统计归零假象。
+        # 这里只补一行日志说明是取消，并让 finally 正常清理（remove_job /
+        # 清 bg_task_id / pull_round 累加都在 finally 里）。
+        logger.info(
+            "[拉取] 任务「{}」收到取消信号（本轮已处理 {} 个）",
+            task["task_name"], detail_processed,
+        )
+        raise
     except Exception as e:  # noqa: BLE001
         fail_reason = str(e)
         _write_progress()
